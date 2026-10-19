@@ -2,10 +2,15 @@ import fs from "node:fs";
 import { RELAY_STATE_FILE, readJson, writeJsonAtomic } from "../daemon/state";
 
 // only known keyless upstream origins may be targeted via the relay
+// must match each upstream's base-URL origin: LLM7_BASE_URL is
+// https://api.llm7.io/v1, so the allowlist entry has to be the api host —
+// a bare "https://llm7.io" silently routes llm7 direct (relayFetch's
+// origin check misses and falls through to fetch). test/relay-targets.test.ts
+// asserts this invariant against the real base URLs.
 export const ALLOWED_TARGETS = [
   "https://opencode.ai",
   "https://api.kilo.ai",
-  "https://llm7.io",
+  "https://api.llm7.io",
 ];
 
 export interface KnownRelay {
