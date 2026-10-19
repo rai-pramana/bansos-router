@@ -65,10 +65,19 @@ export function harnessStatuses(): HarnessStatus[] {
   return ADAPTERS.map((adapter) => {
     const found = adapter.configPaths.map(expandHome).find((p) => fs.existsSync(p));
     if (!found) return { id: adapter.id, status: "missing" };
+    // bansos-opt4: 9router keeps its registry in SQLite. Never read a blob as
+    // text — parseJsonc on the 27MB data.sqlite wedged the event loop.
+    if (found.endsWith(".sqlite")) {
+      const ok = adapter.undoKeys ? sqliteHasKeys(found, adapter.undoKeys) : false;
+      return { id: adapter.id, status: ok ? "configured" : "unconfigured", path: found };
+    }
     let content = "";
     try {
       content = fs.readFileSync(found, "utf8");
     } catch {
+      return { id: adapter.id, status: "unconfigured", path: found };
+    }
+    if (content.length > TEXT_CONFIG_LIMIT || content.includes("\u0000")) {
       return { id: adapter.id, status: "unconfigured", path: found };
     }
     const configured = adapter.undoKeys ? hasKeys(content, adapter.undoKeys) : content.includes(START_MARKER);
@@ -76,15 +85,28 @@ export function harnessStatuses(): HarnessStatus[] {
   });
 }
 
-function hasKeys(content: string, keys: string[]): boolean {
-  // bansos-opt4: 9router keeps its registry in SQLite, so `configPaths` can point
-  // at binary. parseJsonc is a per-char scanner whose brace-trim replace is O(n^2):
-  // slurping the 27MB data.sqlite wedged the event loop and the daemon stopped
-  // answering /healthz. Binary or oversized payloads fall back to a leaf-id
-  // substring hit (the ids appear verbatim in both db.json and the sqlite blob).
-  if (content.length > TEXT_CONFIG_LIMIT || content.slice(0, 4096).includes("\u0000")) {
-    return keys.some((k) => content.includes((k.split(".").pop() ?? k).replace(/\*$/, "")));
+// keys look like "<table>.<id>"; a row hit means the harness is set up
+function sqliteHasKeys(dbPath: string, keys: string[]): boolean {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sqliteMod = (globalThis as any).process?.getBuiltinModule?.("node:sqlite");
+    if (!sqliteMod?.DatabaseSync) return false;
+    const db = new sqliteMod.DatabaseSync(dbPath, { readOnly: true });
+    try {
+      return keys.some((k) => {
+        const [table, id] = k.split(".");
+        if (!table || !id || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) return false;
+        return Boolean(db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id));
+      });
+    } finally {
+      db.close();
+    }
+  } catch {
+    return false;
   }
+}
+
+function hasKeys(content: string, keys: string[]): boolean {
   try {
     const obj = parseJsonc(content);
     const first = keys[0];
