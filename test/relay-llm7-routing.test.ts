@@ -71,13 +71,14 @@ test("llm7 chat request is forwarded through the configured relay", async () => 
     await res.text();
 
     assert.equal(seen.length, 1, "relay must receive exactly one forwarded request");
+    const seen0 = seen[0]!;
     assert.equal(
-      seen[0].target,
+      seen0.target,
       "https://api.llm7.io",
       "relay target must be the origin llm7 actually calls (LLM7_BASE_URL)",
     );
-    assert.equal(seen[0].path, "/v1/chat/completions");
-    assert.equal(seen[0].model, "codestral-latest");
+    assert.equal(seen0.path, "/v1/chat/completions");
+    assert.equal(seen0.model, "codestral-latest");
   } finally {
     saveRelayState(prev);
     await new Promise<void>((r) => server.close(() => r()));
