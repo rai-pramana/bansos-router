@@ -56,9 +56,9 @@ export async function runDoctor(_argv: string[]): Promise<number> {
 
 export type HarnessStatus = { id: string; status: "configured" | "unconfigured" | "missing"; path?: string };
 
-// bansos-opt4: adapter config paths can point at SQLite blobs (9router keeps its
+// bansos-opt5: adapter config paths can point at SQLite blobs (9router keeps its
 // registry in data.sqlite). Never feed a binary or huge file to parseJsonc —
-// see hasKeys.
+// see sqliteHasKeys and the size guard in harnessStatuses.
 const TEXT_CONFIG_LIMIT = 1 << 20;
 
 export function harnessStatuses(): HarnessStatus[] {
