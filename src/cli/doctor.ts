@@ -56,28 +56,31 @@ export async function runDoctor(_argv: string[]): Promise<number> {
 
 export type HarnessStatus = { id: string; status: "configured" | "unconfigured" | "missing"; path?: string };
 
-// bansos-opt5: adapter config paths can point at SQLite blobs (9router keeps its
-// registry in data.sqlite). Never feed a binary or huge file to parseJsonc —
-// see sqliteHasKeys and the size guard in harnessStatuses.
-const TEXT_CONFIG_LIMIT = 1 << 20;
+// adapter config paths can point at a binary store (9router keeps its registry in
+// data.sqlite), and parseJsonc is a per-character scanner whose trailing-comma trim
+// is O(n^2) — scanning a multi-megabyte blob as text wedges the event loop
+const MAX_TEXT_CONFIG_BYTES = 1 << 20;
 
 export function harnessStatuses(): HarnessStatus[] {
   return ADAPTERS.map((adapter) => {
     const found = adapter.configPaths.map(expandHome).find((p) => fs.existsSync(p));
     if (!found) return { id: adapter.id, status: "missing" };
-    // bansos-opt4: 9router keeps its registry in SQLite. Never read a blob as
-    // text — parseJsonc on the 27MB data.sqlite wedged the event loop.
+
     if (found.endsWith(".sqlite")) {
-      const ok = adapter.undoKeys ? sqliteHasKeys(found, adapter.undoKeys) : false;
-      return { id: adapter.id, status: ok ? "configured" : "unconfigured", path: found };
+      const configured = adapter.undoKeys ? sqliteKeysExist(found, adapter.undoKeys) : false;
+      return { id: adapter.id, status: configured ? "configured" : "unconfigured", path: found };
     }
+
     let content = "";
     try {
+      if (fs.statSync(found).size > MAX_TEXT_CONFIG_BYTES) {
+        return { id: adapter.id, status: "unconfigured", path: found };
+      }
       content = fs.readFileSync(found, "utf8");
     } catch {
       return { id: adapter.id, status: "unconfigured", path: found };
     }
-    if (content.length > TEXT_CONFIG_LIMIT || content.includes("\u0000")) {
+    if (content.includes("\u0000")) {
       return { id: adapter.id, status: "unconfigured", path: found };
     }
     const configured = adapter.undoKeys ? hasKeys(content, adapter.undoKeys) : content.includes(START_MARKER);
@@ -85,25 +88,30 @@ export function harnessStatuses(): HarnessStatus[] {
   });
 }
 
-// keys look like "<table>.<id>"; a row hit means the harness is set up
-function sqliteHasKeys(dbPath: string, keys: string[]): boolean {
+// undo keys are "<table>.<id>" pairs; a row hit means the harness was set up
+function sqliteKeysExist(dbPath: string, keys: string[]): boolean {
+  const valid = keys
+    .map((k) => k.split("."))
+    .filter(([table, id]) => Boolean(table && id && /^[A-Za-z_]\w*$/.test(table)));
+  if (valid.length === 0) return false;
+
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sqliteMod = (globalThis as any).process?.getBuiltinModule?.("node:sqlite");
-    if (!sqliteMod?.DatabaseSync) return false;
-    const db = new sqliteMod.DatabaseSync(dbPath, { readOnly: true });
-    try {
-      return keys.some((k) => {
-        const [table, id] = k.split(".");
-        if (!table || !id || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) return false;
-        return Boolean(db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id));
-      });
-    } finally {
-      db.close();
+    if (sqliteMod?.DatabaseSync) {
+      const db = new sqliteMod.DatabaseSync(dbPath, { readOnly: true });
+      try {
+        return valid.some(([table, id]) =>
+          Boolean(db.prepare(`SELECT 1 FROM ${table} WHERE id = ?`).get(id)),
+        );
+      } finally {
+        db.close();
+      }
     }
   } catch {
-    return false;
+    // not a readable database (or no sqlite support in this runtime): report unconfigured
   }
+  return false;
 }
 
 function hasKeys(content: string, keys: string[]): boolean {
