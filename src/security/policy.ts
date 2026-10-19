@@ -9,6 +9,8 @@ export interface SecurityConfig {
   allowCrossProviderFailover: boolean;
   unsafeAllowNonLoopbackBind: boolean;
   dlp: DlpAction;
+  /** strict-mode escape hatch for the secret guard; strict mode normalizes it back to false */
+  disableSecretGuard: boolean;
 }
 
 export const DEFAULT_SECURITY_CONFIG: SecurityConfig = {
@@ -17,6 +19,7 @@ export const DEFAULT_SECURITY_CONFIG: SecurityConfig = {
   allowCrossProviderFailover: true,
   unsafeAllowNonLoopbackBind: false,
   dlp: "redact",
+  disableSecretGuard: false,
 };
 
 const IPV6_LOOPBACK = new BlockList();
@@ -39,6 +42,7 @@ export function normalizeSecurityConfig(
     // strict mode stays fail-closed even if a stale config says otherwise
     allowCrossProviderFailover:
       mode === "strict" ? false : raw?.allowCrossProviderFailover !== false,
+    disableSecretGuard: mode === "strict" ? false : raw?.disableSecretGuard === true,
     unsafeAllowNonLoopbackBind: raw?.unsafeAllowNonLoopbackBind === true,
     dlp: normalizedMode(raw?.dlp) === "block" ? "block" : "redact",
   };

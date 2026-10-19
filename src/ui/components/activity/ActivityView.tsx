@@ -114,7 +114,10 @@ export function ActivityView() {
 
   useEffect(() => {
     void load();
-    const timer = setInterval(() => void load(), 3000);
+    // bansos-opt: the activity poll shared the 300/min loopback bucket with chat
+    // traffic and starved other endpoints; the daemon now exempts loopback, and
+    // 15s is plenty for a usage view
+    const timer = setInterval(() => void load(), 15_000);
     return () => clearInterval(timer);
   }, [window]);
 

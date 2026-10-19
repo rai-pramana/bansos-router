@@ -741,9 +741,21 @@ export function logUsageTransform(
 ): Transform {
   let tail = "";
   let reported = false;
+  // bansos-opt4: per-chunk regex over a rolling 16KB string is O(n^2) on the main
+  // thread; large streaming generations (normal traffic here) spun node at 100% CPU
+  // and wedged the accept queue. Gate the scan behind a cheap substring hit — usage
+  // frames are rare, SSE deltas are many.
+  let pending = "";
   return new Transform({
     transform(chunk, _enc, cb) {
-      tail = `${tail}${chunk.toString("utf8")}`.slice(-16384);
+      if (!reported) {
+        pending += chunk.toString("utf8");
+        if (pending.length > 16384) pending = pending.slice(-8192);
+        if (pending.includes('"usage"')) {
+          tail = pending;
+          pending = "";
+        }
+      }
       if (!reported) {
         const obj = findUsageObject(tail);
         if (obj) {
@@ -1194,7 +1206,7 @@ async function runChatForward(
         : transformedBody,
     );
 
-    if (isStrictSecurity(security) && isExternalUpstream(currentUpstream)) {
+    if (isStrictSecurity(security) && !security.disableSecretGuard && isExternalUpstream(currentUpstream)) {
       const secretScan = scanRequestBody(outboundBody);
       const redaction = secretScan.blocked && security.dlp === "redact" ? redactRequestBody(outboundBody) : null;
       if (redaction) {
@@ -1226,12 +1238,19 @@ async function runChatForward(
 
     let upstreamRes: Response;
     try {
+      // bansos-opt2: `signal` alone was client-disconnect-only, so a dead or hanging
+      // relay (serverless function killed mid-rotation) waited forever and the daemon
+      // wedged. Headers deadline 90s: the fetch timer stops at header arrival, so
+      // legitimately long buffered generations stay safe.
+      const chatSignal = signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(90_000)])
+        : AbortSignal.timeout(90_000);
       upstreamRes = await relayFetch(relay, outboundUrl, {
         method: "POST",
         headers,
         body: outboundBody,
         duplex: "half",
-        signal,
+        signal: chatSignal,
       }, isRelayAllowed(security));
     } catch {
       transientError = { status: 502, message: "upstream request failed" };
@@ -1985,7 +2004,10 @@ export function createServer(opts: ServerOptions): http.Server {
     const ip = req.socket.remoteAddress ?? "unknown";
     const method = req.method ?? "";
 
-    if (!rateLimiter.check(ip)) {
+    // bansos-opt: loopback exempt (single-user daemon; UI polling + chat shared the
+    // 300/min bucket and starved every other endpoint)
+    const loopbackClient = ip === "127.0.0.1" || ip === "::1" || ip.startsWith("::ffff:127.");
+    if (!loopbackClient && !rateLimiter.check(ip)) {
       log.warn("rate limit exceeded", { ip });
       sendJson(res, 429, { error: { message: "rate limit exceeded" } });
       return;
@@ -2155,6 +2177,7 @@ export function createServer(opts: ServerOptions): http.Server {
     }
 
     if (method === "GET" && url === "/bansos/usage") {
+      activity.checkDiskFreshness(); // bansos-opt3: the CLI may have written the file
       const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
       const window = (parsedUrl.searchParams.get("window") || "all") as import("./activity").TimeWindow;
       sendJson(res, 200, activity.getUsage(window));
@@ -2162,6 +2185,7 @@ export function createServer(opts: ServerOptions): http.Server {
     }
 
     if (method === "GET" && url === "/bansos/events") {
+      activity.checkDiskFreshness(); // bansos-opt3: the CLI may have written the file
       const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
       const limitParam = Number(parsedUrl.searchParams.get("limit"));
       const window = (parsedUrl.searchParams.get("window") || "all") as import("./activity").TimeWindow;

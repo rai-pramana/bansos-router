@@ -62,6 +62,12 @@ export class ActivityStore {
   private nextId = 1;
   private readonly cap: number;
   private saveTimeout: NodeJS.Timeout | null = null;
+  // bansos-opt3: the CLI writes this file too, so the in-memory list can go
+  // stale. Track a stat key and reload off-path.
+  private _freshAt = 0;
+  private _diskKey = "missing";
+  private _lastSavedKey = "";
+  private _reloadTimer: NodeJS.Timeout | null = null;
 
   constructor(cap = 5000) {
     this.cap = cap;
@@ -89,6 +95,34 @@ export class ActivityStore {
     }
   }
 
+  // bansos-opt3: detect external writes with a STAT ONLY (never parse on the
+  // request path); the reload itself happens off-path
+  public checkDiskFreshness(): void {
+    const now = Date.now();
+    if (now - this._freshAt < 1000) return; // stat throttle
+    this._freshAt = now;
+    let key = "missing";
+    try {
+      const st = fs.statSync(ACTIVITY_FILE);
+      key = `${st.mtimeMs}:${st.size}`;
+    } catch {
+      // file missing or unreadable
+    }
+    if (key === "missing" && this._diskKey !== "missing") {
+      this._diskKey = key;
+      this.events = [];
+      return;
+    }
+    if (key !== "missing" && key !== this._diskKey && key !== this._lastSavedKey) {
+      this._diskKey = key;
+      if (this._reloadTimer) return; // one pending reload is enough
+      this._reloadTimer = setTimeout(() => {
+        this._reloadTimer = null;
+        this.loadFromDisk();
+      }, 0);
+    }
+  }
+
   private scheduleSave(): void {
     if (this.saveTimeout) return;
     this.saveTimeout = setTimeout(() => {
@@ -104,6 +138,13 @@ export class ActivityStore {
         updatedAt: Date.now(),
         events: this.events,
       });
+      try {
+        const st = fs.statSync(ACTIVITY_FILE);
+        this._lastSavedKey = `${st.mtimeMs}:${st.size}`;
+        this._diskKey = this._lastSavedKey;
+      } catch {
+        // ignore
+      }
     } catch {
       // ignore persistence error
     }
