@@ -741,10 +741,11 @@ export function logUsageTransform(
 ): Transform {
   let tail = "";
   let reported = false;
-  // bansos-opt4: per-chunk regex over a rolling 16KB string is O(n^2) on the main
-  // thread; large streaming generations (normal traffic here) spun node at 100% CPU
-  // and wedged the accept queue. Gate the scan behind a cheap substring hit — usage
-  // frames are rare, SSE deltas are many.
+  // bansos-opt4: gate the scan behind a cheap substring hit. Measured: upstream's
+  // per-chunk append + regex over a rolling 16KB tail is LINEAR (chunks x 16KB), and
+  // a 1118-chunk stream held the daemon at 0.4% CPU, so this is not a fix for a
+  // wedge — it only stops the regex from running on every SSE delta. Do not ship it
+  // upstream as a CPU bug report without a measurement showing the spike.
   let pending = "";
   return new Transform({
     transform(chunk, _enc, cb) {
