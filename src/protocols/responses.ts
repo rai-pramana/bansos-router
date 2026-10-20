@@ -186,6 +186,12 @@ export function extractReasoningText(message: any): string {
   if (typeof message.reasoning === "string" && message.reasoning.length > 0) {
     parts.push(message.reasoning);
   }
+  // Zen/DeepSeek and most OpenAI-compatible upstreams send `reasoning_content`, not
+  // `reasoning`. Without this the non-stream content rescue finds nothing and the
+  // message goes out with an empty `content` while the answer sat in the reasoning.
+  if (typeof message.reasoning_content === "string" && message.reasoning_content.length > 0) {
+    parts.push(message.reasoning_content);
+  }
   const details = message.reasoning_details;
   if (Array.isArray(details)) {
     for (const d of details) {

@@ -1067,6 +1067,14 @@ export async function streamToChatResponse(
       return [{ id, type: "function" as const, function: fn }];
     });
   if (toolCalls.length === 0 && finishReason === "tool_calls") finishReason = "stop";
+  // Same rescue as the non-stream path: when upstream answers entirely inside
+  // `reasoning_content` (Zen/DeepSeek do this routinely) the reassembled message
+  // would ship an empty `content` and the caller sees a blank answer. Promote the
+  // reasoning only when nothing else arrived, so real answers are never overwritten.
+  if (content.length === 0 && toolCalls.length === 0 && reasoning.length > 0) {
+    content = reasoning;
+    reasoning = "";
+  }
   if (streamError && !content && !reasoning && toolCalls.length === 0) {
     return new Response(JSON.stringify({ error: { message: streamError, type: "upstream_error" } }), {
       status: 502,
@@ -1546,7 +1554,11 @@ async function handleChat(
     signal.addEventListener("abort", () => src.destroy());
     const filterTx = filterInjectedToolCallsTransform(callerTools);
     filterTx.on("error", failStream);
-    src.pipe(reasoningToContentTransform()).pipe(filterTx).pipe(usageTx).pipe(res);
+    // Filter BEFORE the fold: upstreams inject tool calls the caller never declared, and
+    // this filter drops them. Folding first meant `sawToolCalls` latched on those phantom
+    // calls (the fold declined) and the filter then removed them, so a reasoning-only answer
+    // reached the client as an empty `content` with finish_reason=stop.
+    src.pipe(filterTx).pipe(reasoningToContentTransform()).pipe(usageTx).pipe(res);
   } else {
     res.end();
   }
