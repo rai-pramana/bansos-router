@@ -98,10 +98,15 @@ export function loadConfig(file = CONFIG_FILE): BansosConfig {
 }
 
 // atomic write: temp file in the same dir, then rename over target
-export function writeJsonAtomic(file: string, data: unknown): void {
+// indent: 0 writes compact JSON. The daemon rewrites activity.json (5000 events,
+// ~1.5MB) on every chat batch; nothing parses it by eye, so the 30% of bytes that
+// were pretty-printing whitespace was pure write amplification. Everything else
+// stays indented because it is meant to be read and hand-edited.
+export function writeJsonAtomic(file: string, data: unknown, indent = 2): void {
   ensureBansosDir();
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+  const body = indent > 0 ? JSON.stringify(data, null, indent) : JSON.stringify(data);
+  fs.writeFileSync(tmp, `${body}\n`, { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
 

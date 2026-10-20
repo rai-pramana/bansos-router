@@ -137,7 +137,7 @@ export class ActivityStore {
       writeJsonAtomic(ACTIVITY_FILE, {
         updatedAt: Date.now(),
         events: this.events,
-      });
+      }, 0);
       try {
         const st = fs.statSync(ACTIVITY_FILE);
         this._lastSavedKey = `${st.mtimeMs}:${st.size}`;
