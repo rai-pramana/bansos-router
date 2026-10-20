@@ -16,6 +16,7 @@ export const STATE_FILE = path.join(BANSOS_DIR, "state.json");
 export const RELAY_STATE_FILE = path.join(BANSOS_DIR, "relay-state.json");
 export const LOG_DIR = path.join(BANSOS_DIR, "logs");
 export const LOG_FILE = path.join(LOG_DIR, "bansosd.log");
+export const CATALOG_FILE = path.join(BANSOS_DIR, "catalog.json");
 
 export interface BansosConfig {
   port: number;

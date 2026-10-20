@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { RuntimeCatalog } from "../src/daemon/catalog";
+import { CATALOG_FILE } from "../src/daemon/state";
 import { createLogger } from "../src/logger";
 import { modelDef, type Upstream } from "../src/upstreams/types";
 
@@ -120,4 +122,36 @@ test("a refused model is parked far longer than a rate-limited one", () => {
   assert.equal(cat.isCoolingDown("refused", t0 + 2 * 60_000), true);
   assert.equal(cat.isCoolingDown("refused", t0 + 29 * 60_000), true);
   assert.equal(cat.isCoolingDown("refused", t0 + 31 * 60_000), false, "but never permanent");
+});
+
+test("a live pass survives a reboot via the catalog snapshot (no egress at boot)", async () => {
+  const upstream = (id: string, live: ReturnType<typeof model>[] | null): Upstream => ({
+    id,
+    kind: "remote-keyless",
+    relayAllowed: true,
+    chatUrl: `http://${id}`,
+    async fetchCatalog() {
+      return live;
+    },
+    requestHeaders() {
+      return {};
+    },
+  });
+
+  const warm = new RuntimeCatalog([upstream("zen", [model("zen/live-1")])], createLogger({ out: devNull() }));
+  await warm.refresh();
+  const saved = JSON.parse(fs.readFileSync(CATALOG_FILE, "utf8")) as { models: { id: string }[] };
+  assert.deepEqual(saved.models.map((m) => m.id), ["zen/live-1"]);
+
+  // cold boot, upstream unreachable: the pins load first, the snapshot wins
+  const cold = new RuntimeCatalog([upstream("zen", null)], createLogger({ out: devNull() }));
+  cold.seed([model("zen/retired-pin")]);
+  assert.equal(cold.loadSnapshot(), true);
+  const report = await cold.refresh();
+  assert.deepEqual(report.degraded, ["zen"]);
+  assert.deepEqual(
+    cold.models.map((m) => m.id),
+    ["zen/live-1"],
+    "the snapshot replaces the zen pins instead of piling up beside them",
+  );
 });

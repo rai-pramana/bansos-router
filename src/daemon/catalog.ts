@@ -5,11 +5,14 @@ import {
   type SecurityConfig,
 } from "../security/policy";
 import type { ModelDef, Upstream, UpstreamSource } from "../upstreams/types";
+import { CATALOG_FILE, readJson, writeJsonAtomic } from "./state";
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 const MAX_COOLDOWN_MS = 15 * 60_000;
 // 401/403 is a policy refusal, not a burst limit: back off longer, but not forever
 const REFUSED_COOLDOWN_MS = 30 * 60_000;
+// a snapshot older than this says nothing about today's catalog
+const SNAPSHOT_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 
 export interface RefreshReport {
   checked: number;
@@ -45,6 +48,26 @@ export class RuntimeCatalog {
   // seed the pinned registry so the daemon works before any network call
   seed(models: ModelDef[]): void {
     for (const m of models) this.byId.set(m.id, m);
+  }
+
+  // the last live pass is a better offline seed than the build-time pins: a cold
+  // boot with no egress otherwise serves catalog entries that upstream retired
+  loadSnapshot(now = Date.now()): boolean {
+    const saved = readJson<{ savedAt?: number; models?: ModelDef[] }>(CATALOG_FILE);
+    if (!saved?.models?.length) return false;
+    if (typeof saved.savedAt === "number" && now - saved.savedAt > SNAPSHOT_MAX_AGE_MS) {
+      this.log.warn("catalog snapshot older than 7 days - ignoring it");
+      return false;
+    }
+    for (const m of saved.models) this.byId.set(m.id, m);
+    // the snapshot speaks for its sources: drop the pins there, or retired ids
+    // come back alongside it (muse-spark, space-bunny, ...)
+    const covered = new Set(saved.models.map((m) => m.source));
+    for (const [id, m] of this.byId) {
+      if (covered.has(m.source) && !saved.models.some((s) => s.id === id)) this.byId.delete(id);
+    }
+    this.log.info(`catalog snapshot: ${saved.models.length} model(s) from the last live pass`);
+    return true;
   }
 
   get models(): ModelDef[] {
@@ -121,6 +144,7 @@ export class RuntimeCatalog {
     );
 
     // applied in registry order so the catalog does not reshuffle per pass
+    const liveSources = new Set<UpstreamSource>();
     for (const { upstream, live } of fetched) {
       if (live === null) {
         report.degraded.push(upstream.id);
@@ -130,12 +154,26 @@ export class RuntimeCatalog {
       const source: UpstreamSource =
         upstream.kind === "local-openai" ? "local" : (upstream.id as UpstreamSource);
       this.replaceBySource(source, live);
+      liveSources.add(source);
       report.checked += live.length;
     }
 
+    this.saveSnapshot(liveSources);
     report.alive = this.byId.size;
     this.log.info(`catalog refresh: ${report.alive} model(s) alive`);
     return report;
+  }
+
+  // ponytail: one flat snapshot, written only from the sources that answered this
+  // pass; the build-time pins cover the rest. Per-source files only if that bites.
+  private saveSnapshot(live: Set<UpstreamSource>): void {
+    const models = this.models.filter((m) => live.has(m.source));
+    if (models.length === 0) return;
+    try {
+      writeJsonAtomic(CATALOG_FILE, { savedAt: Date.now(), models });
+    } catch (err) {
+      this.log.warn(`catalog snapshot write failed: ${String((err as Error)?.message ?? err)}`);
+    }
   }
 
   private replaceBySource(source: UpstreamSource, models: ModelDef[]): void {

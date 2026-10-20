@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { RELAY_STATE_FILE, readJson, writeJsonAtomic } from "../daemon/state";
 
 // only known keyless upstream origins may be targeted via the relay; each entry must equal an upstream chatUrl origin
@@ -19,17 +20,35 @@ export interface RelayState {
   relays: KnownRelay[];
 }
 
+// bansos-opt3: loadRelayState runs on the chat path; cache it and stat the file
+// per call, re-parsing only when mtime/size changed
+let _relayCache: RelayState | null = null;
+let _relayCacheKey = "";
+
 export function loadRelayState(): RelayState {
+  let st: fs.Stats | null = null;
+  try {
+    st = fs.statSync(RELAY_STATE_FILE);
+  } catch {
+    st = null;
+  }
+  const key = st ? `${st.mtimeMs}:${st.size}` : "missing";
+  if (_relayCache !== null && _relayCacheKey === key) return _relayCache;
+
   const s = readJson<RelayState>(RELAY_STATE_FILE);
-  return {
+  const out: RelayState = {
     enabled: Boolean(s?.enabled),
     url: typeof s?.url === "string" ? s.url : "",
     relays: Array.isArray(s?.relays) ? s.relays : [],
   };
+  _relayCache = out;
+  _relayCacheKey = key;
+  return out;
 }
 
 export function saveRelayState(state: RelayState): void {
   writeJsonAtomic(RELAY_STATE_FILE, state);
+  _relayCache = null; // bansos-opt3: drop cache on every in-process write
 }
 
 function ensureRelay(state: RelayState, url: string, label?: string): void {

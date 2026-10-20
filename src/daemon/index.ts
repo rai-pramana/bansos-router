@@ -25,6 +25,10 @@ import { createServer } from "./server";
 export const DEFAULT_PORT = 17070;
 export const MAX_PORT = 17090;
 
+// boot refresh backoff: egress is often not up when systemd starts us, and the
+// full interval (30 min) is far too long to sit on a stale catalog
+const BOOT_REFRESH_RETRY_MS = [15_000, 60_000, 5 * 60_000];
+
 // C1: rotate the log past MAX_LOG_BYTES, keeping MAX_LOG_BACKUPS; best-effort
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 const MAX_LOG_BACKUPS = 2;
@@ -133,6 +137,8 @@ function startServer(
 
   // seed the pinned registry: usable offline, refined by health checks
   catalog.seed(SEEDED_MODELS);
+  // ...then prefer the last live pass over those pins, which age with the build
+  catalog.loadSnapshot();
 
   const startedAt = Date.now();
   const rateLimiter = new RateLimiter({
@@ -278,14 +284,26 @@ async function main(argv: string[]): Promise<void> {
       );
     }
 
-    // not awaited: a restart counts as done once the server listens, so the next one is not dropped
-    void running.catalog.refresh().then(() => {
-      if (process.env.BANSOS_LOG !== "json") {
-        out.write(
-          `  └── Models   : ${running.catalog.servableModels.length} alive (${[...new Set(running.catalog.servableModels.map((m) => m.source))].join(", ")})\n\n`
-        );
-      }
-    }, (err) => log.warn(`catalog refresh failed: ${String((err as Error)?.message ?? err)}`));
+    // not awaited: a restart counts as done once the server listens, so the next one is not dropped.
+    // a cold boot usually races network-online, so an empty pass retries in seconds rather than
+    // leaving the seed on screen until the next refresh interval (30 min by default)
+    const refreshAtBoot = (attempt = 0): void => {
+      void running.catalog.refresh().then(
+        (report) => {
+          if (report.checked === 0 && attempt < BOOT_REFRESH_RETRY_MS.length) {
+            setTimeout(() => refreshAtBoot(attempt + 1), BOOT_REFRESH_RETRY_MS[attempt]!);
+            return;
+          }
+          if (process.env.BANSOS_LOG !== "json") {
+            out.write(
+              `  └── Models   : ${running.catalog.servableModels.length} alive (${[...new Set(running.catalog.servableModels.map((m) => m.source))].join(", ")})\n\n`
+            );
+          }
+        },
+        (err) => log.warn(`catalog refresh failed: ${String((err as Error)?.message ?? err)}`),
+      );
+    };
+    refreshAtBoot();
   };
 
   const stop = (running: Running): Promise<void> => {
