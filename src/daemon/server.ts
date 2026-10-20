@@ -738,6 +738,7 @@ export function logUsageTransform(
   requestedModel?: string,
   activity?: ActivityStore,
   kind: ActivityKind = "chat",
+  relay = "",
 ): Transform {
   let tail = "";
   let reported = false;
@@ -769,6 +770,7 @@ export function logUsageTransform(
               model,
               requestedModel: requestedModel ?? model,
               upstream,
+              ...(relay ? { relay } : {}),
               inputTokens: usage.inputTokens,
               outputTokens: usage.outputTokens,
               durationMs: Date.now() - startedAt,
@@ -1516,7 +1518,7 @@ async function handleChat(
     const src = Readable.fromWeb(
       upstreamRes.body as import("node:stream/web").ReadableStream,
     );
-    const usageTx = logUsageTransform(current.id, currentUpstream.id, log, requestStartedAt, model.id, activity, "chat");
+    const usageTx = logUsageTransform(current.id, currentUpstream.id, log, requestStartedAt, model.id, activity, "chat", result.relay);
     // a mid-stream upstream failure ends the client response, not the daemon; client abort releases the upstream
     const failStream = () => {
       if (signal.aborted) {

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable, Transform } from "node:stream";
 import { extractUsage, logUsageTransform, reasoningToContentTransform } from "../src/daemon/server";
+import type { ActivityStore } from "../src/daemon/activity";
 import type { Logger } from "../src/logger";
 
 test("extractUsage returns input/output tokens from an openai usage object", () => {
@@ -70,6 +71,55 @@ test("logUsageTransform reports usage from the final streamed chunk and passes b
       }
     });
   });
+});
+
+test("logUsageTransform records the serving relay on the event it writes", async () => {
+  // Regression guard: the streaming path has its own activity.record call site,
+  // separate from the 8 in the handlers. It was missed on the first pass, so
+  // every streamed chat — the common case — logged no relay and the watchdog
+  // could not attribute those failures to an egress.
+  const recorded: Array<Record<string, unknown>> = [];
+  const store = { record: (e: Record<string, unknown>) => recorded.push(e) } as unknown as ActivityStore;
+  const log = {
+    info: () => {}, debug: () => {}, warn: () => {}, error: () => {},
+  } as unknown as Logger;
+
+  const source = Readable.from([
+    Buffer.from(
+      'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}\n\n',
+    ),
+    Buffer.from("data: [DONE]\n\n"),
+  ]);
+  const sink = new Transform({ transform(c, _e, cb) { cb(null, c); } });
+  const relay = "https://bansos-relay-hnd1-rwk5.vercel.app";
+  await new Promise<void>((resolve, reject) => {
+    source
+      .pipe(logUsageTransform("m", "zen", log, Date.now(), "m", store, "chat", relay))
+      .pipe(sink);
+    sink.on("error", reject);
+    sink.on("finish", resolve);
+  });
+
+  assert.equal(recorded.length, 1, "one event recorded");
+  assert.equal(recorded[0]!.relay, relay, "relay carried onto the streamed event");
+
+  // An empty relay (direct egress) must not write the field at all, so old
+  // readers and the watchdog's 'unknown' state keep working.
+  recorded.length = 0;
+  const src2 = Readable.from([
+    Buffer.from(
+      'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}\n\n',
+    ),
+    Buffer.from("data: [DONE]\n\n"),
+  ]);
+  const sink2 = new Transform({ transform(c, _e, cb) { cb(null, c); } });
+  await new Promise<void>((resolve, reject) => {
+    src2.pipe(logUsageTransform("m", "zen", log, Date.now(), "m", store, "chat", "")).pipe(sink2);
+    sink2.on("error", reject);
+    sink2.on("finish", resolve);
+  });
+  assert.equal(recorded.length, 1, "direct event recorded");
+  assert.ok(!("relay" in recorded[0]!), "no relay field when serving direct");
 });
 
 async function throughTransform(input: string[]): Promise<string> {
