@@ -21,6 +21,7 @@ import { RuntimeCatalog } from "./catalog";
 import { RateLimiter } from "./rate-limit";
 import { ActivityStore } from "./activity";
 import { createServer } from "./server";
+import { shutdownServer, SHUTDOWN_GRACE_MS } from "./shutdown";
 
 export const DEFAULT_PORT = 17070;
 export const MAX_PORT = 17090;
@@ -342,7 +343,14 @@ async function main(argv: string[]): Promise<void> {
   const shutdown = () => {
     log.info("shutting down");
     if (!current) process.exit(0);
-    current.server.close(() => process.exit(0));
+    shutdownServer(current.server, SHUTDOWN_GRACE_MS, () => {
+      try {
+        activity.flushToDisk();
+      } catch {
+        // durable appends already landed; a failed fsync must not block exit
+      }
+      process.exit(0);
+    });
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
