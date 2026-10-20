@@ -847,12 +847,13 @@ export function pickFailover(
   return best;
 }
 // shared by chat and responses: resolve, sanitize, then retry on 429/5xx against another upstream
-type ForwardResult = { response: Response; model: ModelDef; upstream: Upstream };
+type ForwardResult = { response: Response; model: ModelDef; upstream: Upstream; relay: string };
 type ForwardError = {
   status: number;
   message: string;
   type?: "upstream_error" | "security_policy_error";
   secretTypes?: SecretType[];
+  relay?: string;
 };
 
 function isExternalUpstream(upstream: Upstream): boolean {
@@ -1117,6 +1118,12 @@ async function runChatForward(
 
   const requestStartedAt = Date.now();
   const relay = loadRelayState();
+  // Which egress served this request. The watchdog can only attribute failures
+  // to a relay if the event says which relay was in use, otherwise it sees
+  // "upstream=zen failed" and cannot tell a gated relay from a gated upstream.
+  // Computed once: relay state is loaded here and the failover loop below only
+  // swaps model/upstream, never the egress.
+  const servingRelay = relay.enabled && relay.url ? relay.url : "";
   const failoverAllowed =
     req.headers["x-bansos-no-failover"] !== "1" &&
     isCrossProviderFailoverAllowed(security);
@@ -1290,7 +1297,7 @@ async function runChatForward(
           durationMs: Date.now() - requestStartedAt,
           upstreamError: errorMsg,
         });
-        return { status: upstreamRes.status, message: errorMsg };
+        return { status: upstreamRes.status, message: errorMsg, relay: servingRelay };
       }
 
       if (refused) {
@@ -1373,6 +1380,7 @@ async function runChatForward(
       response: finalResponse,
       model: current,
       upstream: currentUpstream,
+      relay: servingRelay,
     };
   }
 
@@ -1434,6 +1442,7 @@ async function handleChat(
       model: parsed.value.model,
       requestedModel: parsed.value.model,
       upstream: catalog.resolve(parsed.value.model)?.source ?? "unknown",
+      relay: result.relay,
       inputTokens: 0,
       outputTokens: 0,
       durationMs: Date.now() - requestStartedAt,
@@ -1488,6 +1497,7 @@ async function handleChat(
           model: current.id,
           requestedModel: model.id,
           upstream: currentUpstream.id,
+          relay: result.relay,
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
           durationMs: Date.now() - requestStartedAt,
@@ -1635,6 +1645,7 @@ async function handleResponses(
       model: parsed.value.model,
       requestedModel: parsed.value.model,
       upstream: catalog.resolve(parsed.value.model)?.source ?? "unknown",
+      relay: result.relay,
       inputTokens: 0,
       outputTokens: 0,
       durationMs: Date.now() - requestStartedAt,
@@ -1680,6 +1691,7 @@ async function handleResponses(
         model: current.id,
         requestedModel: resolved.id,
         upstream: currentUpstream.id,
+        relay: result.relay,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
         durationMs: Date.now() - requestStartedAt,
@@ -1752,6 +1764,7 @@ async function handleResponses(
       model: current.id,
       requestedModel: resolved.id,
       upstream: currentUpstream.id,
+      relay: result.relay,
       inputTokens: streamUsage.inputTokens,
       outputTokens: streamUsage.outputTokens,
       durationMs: Date.now() - requestStartedAt,
@@ -1829,6 +1842,7 @@ async function handleAnthropic(
       model: parsed.value.model,
       requestedModel: parsed.value.model,
       upstream: model?.source ?? "unknown",
+      relay: result.relay,
       inputTokens: 0,
       outputTokens: 0,
       durationMs: Date.now() - requestStartedAt,
@@ -1871,6 +1885,7 @@ async function handleAnthropic(
         model: current.id,
         requestedModel: model.id,
         upstream: currentUpstream.id,
+        relay: result.relay,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
         durationMs: Date.now() - requestStartedAt,
@@ -1943,6 +1958,7 @@ async function handleAnthropic(
       model: current.id,
       requestedModel: model.id,
       upstream: currentUpstream.id,
+      relay: result.relay,
       inputTokens: streamUsage.inputTokens,
       outputTokens: streamUsage.outputTokens,
       durationMs: Date.now() - requestStartedAt,

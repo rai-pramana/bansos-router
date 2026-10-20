@@ -12,6 +12,10 @@ export interface ActivityEvent {
   model: string;
   requestedModel: string;
   upstream: string;
+  // Egress relay that served the request ("" when direct). Without it the
+  // watchdog sees "upstream=zen failed" and cannot tell a gated relay from a
+  // gated upstream, so it cannot decide whether switching egress would help.
+  relay?: string;
   inputTokens: number;
   outputTokens: number;
   durationMs: number;
@@ -46,6 +50,7 @@ export interface ActivityInput {
   model: string;
   requestedModel: string;
   upstream: string;
+  relay?: string;
   inputTokens: number;
   outputTokens: number;
   durationMs: number;
