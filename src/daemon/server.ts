@@ -1256,22 +1256,34 @@ async function runChatForward(
     }
 
     let upstreamRes: Response;
+    // bansos-opt2: `signal` alone was client-disconnect-only, so a dead or hanging
+    // relay (serverless function killed mid-rotation) waited forever and the daemon
+    // wedged. This is a HEADERS deadline: AbortSignal.timeout() keeps ticking after
+    // the headers land and used to kill the body read at 90s, truncating any long
+    // generation (measured: 1000-word answer cut at 90.009s, 383 words, no [DONE]).
+    // A controller we disarm on header arrival is the deadline that was intended.
+    const chatCtl = new AbortController();
+    const headersTimer = setTimeout(() => chatCtl.abort(), 90_000);
+    const onClientAbort = () => chatCtl.abort();
+    if (signal) {
+      if (signal.aborted) chatCtl.abort();
+      else signal.addEventListener("abort", onClientAbort, { once: true });
+    }
+    const disarmHeadersTimer = () => {
+      clearTimeout(headersTimer);
+      signal?.removeEventListener("abort", onClientAbort);
+    };
     try {
-      // bansos-opt2: `signal` alone was client-disconnect-only, so a dead or hanging
-      // relay (serverless function killed mid-rotation) waited forever and the daemon
-      // wedged. Headers deadline 90s: the fetch timer stops at header arrival, so
-      // legitimately long buffered generations stay safe.
-      const chatSignal = signal
-        ? AbortSignal.any([signal, AbortSignal.timeout(90_000)])
-        : AbortSignal.timeout(90_000);
       upstreamRes = await relayFetch(relay, outboundUrl, {
         method: "POST",
         headers,
         body: outboundBody,
         duplex: "half",
-        signal: chatSignal,
+        signal: chatCtl.signal,
       }, isRelayAllowed(security));
+      disarmHeadersTimer();
     } catch {
+      disarmHeadersTimer();
       transientError = { status: 502, message: "upstream request failed" };
       const next = selectFailover(
         catalog, current, currentUpstream, tried, security, failoverAllowed,
