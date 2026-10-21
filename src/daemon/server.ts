@@ -33,6 +33,7 @@ import {
   addRelay,
   removeRelay,
   relayFetch,
+  relayRetryState,
   type RelayState,
 } from "../relay/egress";
 import { ADAPTERS, buildSetupContext, findAdapter } from "../adapters";
@@ -2206,7 +2207,12 @@ export function createServer(opts: ServerOptions): http.Server {
     }
 
     if (method === "GET" && url === "/bansos/relay") {
-      sendJson(res, 200, visibleRelayState());
+      // retry carries the in-request failover state: `preferred` set while it
+      // differs from `url` means the active relay is NOT the one serving traffic
+      // (zen meters per relay, so a spent relay 429s and the request is served by
+      // another). The heal job reads this — probing through the daemon returns 200
+      // either way, so a plain probe can no longer see a dead active relay.
+      sendJson(res, 200, { ...visibleRelayState(), retry: relayRetryState() });
       return;
     }
 
