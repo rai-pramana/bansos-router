@@ -98,27 +98,6 @@ if (!OPENCODE_SESSION_RE.test(OPENCODE_SESSION)) {
   throw new Error("opencode session id generation failed shape check");
 }
 
-// zen's free tier meters per opencode session: an id held for the whole process
-// life exhausts its window and then EVERY relay 429s at once, which reads as a
-// dead fleet but is one session running dry (measured 2026-10-21: 8 relays x 8
-// regions x 8 accounts all 429 on deepseek-v4.1-flash-free while the same relay
-// accepted a fresh session id). Rotate on a TTL so the window recycles without a
-// daemon restart. `OPENCODE_SESSION_TTL_MS=0` pins one session for the process.
-const OPENCODE_SESSION_TTL_MS = Number(process.env.OPENCODE_SESSION_TTL_MS ?? 600_000);
-let openCodeSession = OPENCODE_SESSION;
-let openCodeSessionAt = Date.now();
-
-function currentOpenCodeSession(): string {
-  if (OPENCODE_SESSION_TTL_MS > 0 && Date.now() - openCodeSessionAt >= OPENCODE_SESSION_TTL_MS) {
-    const next = generateSessionId();
-    if (OPENCODE_SESSION_RE.test(next)) {
-      openCodeSession = next;
-      openCodeSessionAt = Date.now();
-    }
-  }
-  return openCodeSession;
-}
-
 let liveOpenCodeVersion: string | null = null;
 
 function getOpenCodeUA(): string {
@@ -132,15 +111,14 @@ function getOpenCodeUA(): string {
 function opencodeHeaders(withRequestHeader = false): Record<string, string> {
   const traceId = randomBytes(16).toString("hex");
   const spanId = randomBytes(8).toString("hex");
-  const session = currentOpenCodeSession();
   const headers: Record<string, string> = {
     "User-Agent": getOpenCodeUA(),
     authorization: "Bearer public",
     "x-opencode-client": "desktop",
     "x-opencode-project": OPENCODE_PROJECT_ID,
-    "x-opencode-session": session,
-    "x-opencode-session-id": session,
-    "x-session-affinity": session,
+    "x-opencode-session": OPENCODE_SESSION,
+    "x-opencode-session-id": OPENCODE_SESSION,
+    "x-session-affinity": OPENCODE_SESSION,
     b3: `${traceId}-${spanId}-1-${spanId}`,
     traceparent: `00-${traceId}-${spanId}-01`,
     Accept: "text/event-stream",
