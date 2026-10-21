@@ -184,7 +184,7 @@ export async function relayFetch(
     let res: Response;
     try {
       res = await relayOnce(url, u, init);
-    } catch (err) {
+    } catch {
       // Transport failure (dead deployment, DNS, reset). Try the next relay; if
       // none is left, the caller's direct-fetch fallback still applies.
       _penalty.set(url, Date.now() + PENALTY_MS);
