@@ -60,10 +60,18 @@ function ensureRelay(state: RelayState, url: string, label?: string): void {
   state.relays.push({ url: clean, label, addedAt: new Date().toISOString() });
 }
 
-// zen meters its free tier per RELAY (per egress pool) and per model, so a 429
-// from one relay says nothing about the next one: 148 of 159 relays served
-// deepseek while 11 did not, and the failing 11 clustered in one region. Retrying
-// a second relay therefore turns a user-visible 429 into a served request.
+// zen meters its free tier per CLIENT IP (its own egress address) and per model
+// prefix, and the limit is a server-side secret that moves with capacity. Two
+// consequences drive this file:
+//
+//   - A relay that answers 429 is NOT broken: its egress IP's daily allowance is
+//     spent. The response carries Retry-After pointing at the next UTC reset,
+//     so that relay is skipped until then instead of being probed again.
+//   - The relay's egress IP is shared with every other customer of the same
+//     platform (all Vercel functions of that account region land in one NAT
+//     pool), so a fleet of relays can be exhausted together while the machine's
+//     OWN address still has allowance. The direct fetch is therefore a real
+//     fallback with its own bucket, not a degraded path.
 //
 // Two pieces of state make that cheap enough to sit on the hot path:
 //   _penalty  — a relay that just answered 429/5xx is skipped for a while instead
@@ -72,10 +80,32 @@ function ensureRelay(state: RelayState, url: string, label?: string): void {
 //               request would pay the dead relay's round-trip first.
 const RETRY_STATUS = new Set([429, 502, 503, 504]);
 const PENALTY_MS = 5 * 60_000;
+// A quota answer (429 + FreeUsageLimitError) means "this egress IP is spent
+// until the reset", not "this relay is broken". Honour the upstream Retry-After
+// so the relay is not re-probed for the rest of the window, but keep the window
+// bounded: the limit is dynamic and can recover earlier.
+const QUOTA_PENALTY_MIN_MS = 10 * 60_000;
+const QUOTA_PENALTY_MAX_MS = 6 * 60 * 60_000;
 const PREFER_MS = 2 * 60_000;
 // Two alternates: enough to cross a dead region, small enough that a global 429
 // (every relay spent) does not turn into a stampede of probes per request.
 const MAX_ALTERNATES = 2;
+
+// Is this a free-tier quota rejection (as opposed to a burst rate limit)?
+// Both arrive as 429; only the quota one carries a long Retry-After or the
+// FreeUsageLimitError body.
+function quotaPenaltyMs(res: Response, bodyText: string): number {
+  const ra = res.headers.get("retry-after");
+  let ms = 0;
+  if (ra) {
+    const secs = Number.parseInt(ra.trim(), 10);
+    if (Number.isFinite(secs) && secs > 0) ms = secs * 1000;
+  }
+  const quotaBody = /FreeUsageLimitError|Free usage limit reached/i.test(bodyText);
+  if (!quotaBody && ms < QUOTA_PENALTY_MIN_MS) return PENALTY_MS;
+  if (ms === 0) ms = QUOTA_PENALTY_MIN_MS;
+  return Math.min(Math.max(ms, QUOTA_PENALTY_MIN_MS), QUOTA_PENALTY_MAX_MS);
+}
 
 let _preferred: { url: string; until: number } | null = null;
 const _penalty = new Map<string, number>();
@@ -177,9 +207,13 @@ export async function relayFetch(
 
   const now = Date.now();
   const candidates = relayCandidates(state, now).slice(0, 1 + MAX_ALTERNATES);
-  if (candidates.length === 0) return relayOnce(state.url!, u, init);
+  // Every candidate is currently marked spent: its egress IP's allowance is
+  // used up. Do NOT re-probe one of them — go straight to this machine's own
+  // address, which is a different client identity with its own allowance.
+  if (candidates.length === 0) return fetch(targetUrl, init);
 
   let last: Response | null = null;
+  let quotaHit = false;
   for (let i = 0; i < candidates.length; i++) {
     const url = candidates[i]!;
     let res: Response;
@@ -197,7 +231,6 @@ export async function relayFetch(
       else _preferred = null;
       return res;
     }
-    _penalty.set(url, Date.now() + PENALTY_MS);
     // Read the body BEFORE cancelling it. Returning the cancelled Response as
     // `last` used to surface as "Body is unusable: Body has already been read"
     // at the caller's res.text() — every exhausted retry turned into a 502 that
@@ -208,6 +241,12 @@ export async function relayFetch(
     } catch {
       /* body already gone */
     }
+    // A quota 429 (free allowance spent on that egress IP) is not a relay
+    // failure: park the relay until the upstream Retry-After instead of the flat
+    // 5 minutes, so the next call does not pay the same dead round-trip again.
+    const penalty = quotaPenaltyMs(res, lastText);
+    if (res.status === 429 && penalty > PENALTY_MS) quotaHit = true;
+    _penalty.set(url, Date.now() + penalty);
     last = new Response(lastText, { status: res.status, headers: res.headers });
     try {
       await res.body?.cancel();
@@ -215,7 +254,19 @@ export async function relayFetch(
       /* already closed */
     }
   }
-  return last ?? relayOnce(state.url!, u, init);
+  // The fleet could not serve it and the reason was a spent allowance. The local
+  // address is a SEPARATE client identity (its own bucket), so it is worth one
+  // more request before the caller sees the quota error.
+  if (quotaHit) {
+    try {
+      const direct = await fetch(targetUrl, init);
+      if (direct.status !== 429) return direct;
+      await direct.body?.cancel();
+    } catch {
+      /* transport failure on the direct path: keep the relay's answer */
+    }
+  }
+  return last ?? fetch(targetUrl, init);
 }
 
 // bansos-opt4: Vercel's Fast Origin Transfer meter counts bytes on the WIRE, not

@@ -113,9 +113,60 @@ test("when every relay is spent the last 429 is returned, not an invented succes
     );
     assert.equal(res.status, 429);
     // one active + two alternates: a global 429 must not fan out over the fleet
-    assert.equal(calls.length, 3);
+    const relayCalls = calls.filter((c) => c.url !== TARGET);
+    assert.equal(relayCalls.length, 3);
+    // ...but the machine's own address is a DIFFERENT client identity with its
+    // own allowance, so it gets exactly one last attempt before the 429 surfaces.
+    assert.equal(calls.filter((c) => c.url === TARGET).length, 1);
+    assert.equal(calls.length, 4);
   } finally {
     restore();
+  }
+});
+
+test("a spent fleet falls back to the direct path and serves the request", async () => {
+  // every relay is out of allowance, the local address is not
+  const { calls, restore } = stubFetch((url) => (url === TARGET ? 200 : 429));
+  try {
+    const res = await relayFetch(
+      state("https://r1.example", ["https://r2.example", "https://r3.example"]),
+      TARGET,
+      { method: "POST", body: '{"model":"deepseek-v4.1-flash-free"}' },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(calls[calls.length - 1]!.url, TARGET);
+    // the direct attempt replays the body, not an empty request
+    assert.equal(calls[calls.length - 1]!.body, '{"model":"deepseek-v4.1-flash-free"}');
+  } finally {
+    restore();
+  }
+});
+
+test("a spent relay stays parked for the upstream Retry-After, not 5 minutes", async () => {
+  const original = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    calls.push(url);
+    if (url.includes("r1")) {
+      return new Response('{"error":{"type":"FreeUsageLimitError"}}', {
+        status: 429,
+        headers: { "retry-after": "3600" },
+      });
+    }
+    return new Response('{"ok":true}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    const st = state("https://r1.example", ["https://r2.example"]);
+    await relayFetch(st, TARGET, { method: "POST", body: "{}" });
+    const afterFirst = calls.length;
+    // r1 is parked for an hour, r2 is preferred: the spent relay cannot be
+    // charged a round-trip again (that is what burned the pool all day).
+    await relayFetch(st, TARGET, { method: "POST", body: "{}" });
+    assert.equal(calls.length, afterFirst + 1);
+    assert.ok(!calls.slice(afterFirst).some((u) => u.includes("r1")));
+  } finally {
+    globalThis.fetch = original;
   }
 });
 
