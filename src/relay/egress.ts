@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
+import { promisify } from "node:util";
 import { RELAY_STATE_FILE, readJson, writeJsonAtomic } from "../daemon/state";
 
 // only known keyless upstream origins may be targeted via the relay; each entry must equal an upstream chatUrl origin
@@ -202,7 +203,7 @@ export async function relayFetch(
 
   // A streaming/async body can only be sent once; keep the single-attempt path.
   if (init.body && typeof init.body !== "string" && !(init.body instanceof Uint8Array)) {
-    return relayOnce(state.url!, u, init);
+    return relayOnce(state.url!, u, init, null);
   }
 
   const now = Date.now();
@@ -212,13 +213,16 @@ export async function relayFetch(
   // address, which is a different client identity with its own allowance.
   if (candidates.length === 0) return fetch(targetUrl, init);
 
+  // Compress once and reuse across attempts (a retry must not re-pay the CPU).
+  const packed = await packBody(init.body);
+
   let last: Response | null = null;
   let quotaHit = false;
   for (let i = 0; i < candidates.length; i++) {
     const url = candidates[i]!;
     let res: Response;
     try {
-      res = await relayOnce(url, u, init);
+      res = await relayOnce(url, u, init, packed);
     } catch {
       // Transport failure (dead deployment, DNS, reset). Try the next relay; if
       // none is left, the caller's direct-fetch fallback still applies.
@@ -272,10 +276,14 @@ export async function relayFetch(
 // bansos-opt4: Vercel's Fast Origin Transfer meter counts bytes on the WIRE, not
 // decoded bytes. Measured on a probe function with bodyParser off: the same
 // 30.0 MB of JSON cost +36.5 MB of FOT as plain text and +0.1 MB gzipped, because
-// the platform hands the function the still-compressed stream. Compressing the
-// outbound chat body therefore cuts FOT ~10x without touching context length.
-// The relay handler gunzips when it sees content-encoding: gzip.
+// the platform hands the function the still-compressed stream.
+//
+// Real-world ratio is 4x, not 10x: a 1.0 MB body of non-repeating source files and
+// diffs lands at 255 KB (0.238) at level 6, and 302 KB at level 1. The 10x figure
+// came from a low-entropy probe body. Level 9 buys 1 KB over level 6 for 3 ms more
+// CPU, so level 6 stays.
 const GZIP_MIN_BYTES = 1024;
+const GZIP_LEVEL = 6;
 let _gzipEnabled: boolean | null = null;
 
 function gzipEnabled(): boolean {
@@ -290,38 +298,81 @@ export function resetGzipCache(): void {
   _gzipEnabled = null;
 }
 
+// A relay can only take a compressed body if it decompresses on receipt. The
+// Vercel handler does (api/index.js: CommonJS + bodyParser:false + it reads the
+// raw stream and gunzips). The Cloudflare worker and the Netlify function hand
+// the body through untouched: measured on the worker, the same payload answers
+// 429 plain and 400 gzipped, so compressing to a non-Vercel relay turns a quota
+// error into a dead relay. Loopback is listed for the local relay (express.json
+// inflates gzip) and for the tests. Unknown hosts stay plain — plain always works.
+const GZIP_CAPABLE_HOSTS = [".vercel.app", "127.0.0.1", "localhost", "::1"];
+
+function relayTakesGzip(relayUrl: string): boolean {
+  let host: string;
+  try {
+    host = new URL(relayUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  const override = process.env.BANSOS_RELAY_GZIP_HOSTS;
+  const hosts = override === undefined
+    ? GZIP_CAPABLE_HOSTS
+    : override.split(",").map((h) => h.trim().toLowerCase()).filter(Boolean);
+  return hosts.some((h) => (h.startsWith(".") ? host.endsWith(h) : host === h));
+}
+
+// The compressed wire body. Node's `BodyInit` type does not accept a bare
+// Uint8Array (it models `Iterable<Uint8Array>`, not the buffer itself), so the
+// bytes travel in a small wrapper and get one documented cast at the fetch call.
+interface PackedBody {
+  bytes: Uint8Array;
+}
+
+const gzipAsync = promisify(zlib.gzip);
+
+// Compress ONCE per request, not once per relay attempt: relayFetch can try three
+// candidates, and a 1.6 MB agent body costs ~11 ms of CPU per pass (4 MB: ~36 ms)
+// on the same event loop that streams SSE to the client. zlib.gzip is async for
+// the same reason — gzipSync blocks the loop for the whole compression.
+async function packBody(body: BodyInit | null | undefined): Promise<PackedBody | null> {
+  if (!gzipEnabled() || typeof body !== "string" || body.length < GZIP_MIN_BYTES) return null;
+  const buf = await gzipAsync(Buffer.from(body, "utf8"), { level: GZIP_LEVEL });
+  return { bytes: new Uint8Array(buf) };
+}
+
 // Exported so the threshold and kill switch can be tested without standing up a
 // daemon: a real chat body is always >1 KB after transformation, so the small-body
 // path is unreachable through the HTTP surface.
-export function gzipBodyForTest(body: BodyInit | null | undefined): { body: BodyInit | null | undefined; gzipped: boolean } {
-  return maybeGzip(body);
+export async function gzipBodyForTest(
+  body: BodyInit | null | undefined,
+): Promise<{ body: BodyInit | null | undefined; gzipped: boolean }> {
+  const packed = await packBody(body);
+  return packed ? { body: packed.bytes as unknown as BodyInit, gzipped: true } : { body, gzipped: false };
 }
 
-function maybeGzip(body: BodyInit | null | undefined): { body: BodyInit | null | undefined; gzipped: boolean } {
-  if (!gzipEnabled() || typeof body !== "string" || body.length < GZIP_MIN_BYTES) {
-    return { body, gzipped: false };
-  }
-  return { body: new Uint8Array(zlib.gzipSync(Buffer.from(body, "utf8"))), gzipped: true };
-}
-
-async function relayOnce(relayUrl: string, u: URL, init: RequestInit): Promise<Response> {
+async function relayOnce(
+  relayUrl: string,
+  u: URL,
+  init: RequestInit,
+  packed: PackedBody | null,
+): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set("x-relay-target", u.origin);
   headers.set("x-relay-path", `${u.pathname}${u.search}`);
-  const packed = maybeGzip(init.body);
-  if (packed.gzipped) {
+  const wire = packed !== null && relayTakesGzip(relayUrl) ? packed : null;
+  if (wire !== null) {
     // Drop any inbound length/encoding the caller set: the wire body is now gzip.
     headers.set("content-encoding", "gzip");
     // Set the compressed length EXPLICITLY. Without it the request goes out
     // chunked, the Vercel edge buffers the stream and answers 400 with an empty
     // body before the function runs (measured: identical gzip payload is 200
     // when curl sends content-length, 400 when node sends it chunked).
-    headers.set("content-length", String((packed.body as Uint8Array).byteLength));
+    headers.set("content-length", String(wire.bytes.byteLength));
   }
   return fetch(relayUrl, {
     ...init,
     headers,
-    body: packed.body,
+    body: wire !== null ? (wire.bytes as unknown as BodyInit) : init.body,
     duplex: "half",
   });
 }

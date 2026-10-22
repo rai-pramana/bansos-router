@@ -159,30 +159,30 @@ test("Relay Egress: a body over 1 KB is gzipped on the wire and still arrives as
   }
 });
 
-test("Relay Egress: small bodies and non-strings are never compressed", () => {
+test("Relay Egress: small bodies and non-strings are never compressed", async () => {
   // A real chat body is always >1 KB once transformed, so this path cannot be
   // reached through HTTP — assert the helper directly instead.
   resetGzipCache();
 
   const tiny = JSON.stringify({ messages: [{ role: "user", content: "hi" }] });
-  const small = gzipBodyForTest(tiny);
+  const small = await gzipBodyForTest(tiny);
   assert.equal(small.gzipped, false, "body under the threshold must stay plain");
   assert.equal(small.body, tiny);
 
   // exactly at the threshold compresses; one byte under does not
   const atLimit = "x".repeat(1024);
-  assert.equal(gzipBodyForTest(atLimit).gzipped, true, "1024 B must compress");
-  assert.equal(gzipBodyForTest("x".repeat(1023)).gzipped, false, "1023 B must not");
+  assert.equal((await gzipBodyForTest(atLimit)).gzipped, true, "1024 B must compress");
+  assert.equal((await gzipBodyForTest("x".repeat(1023))).gzipped, false, "1023 B must not");
 
   // non-string bodies (streams, Uint8Array) are passed through untouched: they
   // cannot be compressed without consuming them, and relayFetch already skips
   // those on its own single-attempt path.
   const bytes = new Uint8Array([1, 2, 3]);
-  const passthrough = gzipBodyForTest(bytes);
+  const passthrough = await gzipBodyForTest(bytes);
   assert.equal(passthrough.gzipped, false);
   assert.equal(passthrough.body, bytes);
-  assert.equal(gzipBodyForTest(null).gzipped, false);
-  assert.equal(gzipBodyForTest(undefined).gzipped, false);
+  assert.equal((await gzipBodyForTest(null)).gzipped, false);
+  assert.equal((await gzipBodyForTest(undefined)).gzipped, false);
 });
 
 test("Relay Egress: BANSOS_RELAY_GZIP=0 disables compression", async () => {
