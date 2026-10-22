@@ -451,8 +451,16 @@ function runRequest(
   res.on("error", () => {
     // client vanished mid-response; nothing left to send
   });
-  promise.catch(() => {
-    log.warn(`${label}: request failed`, { status: 502 });
+  promise.catch((err: unknown) => {
+    log.warn(`${label}: request failed`, {
+      status: 502,
+      upstreamError: String((err as Error)?.message || err).slice(0, 300),
+      from: String((err as Error)?.stack || "")
+        .split("\n")
+        .slice(1, 3)
+        .join(" | ")
+        .slice(0, 200),
+    });
     try {
       if (res.headersSent) res.end();
       else {

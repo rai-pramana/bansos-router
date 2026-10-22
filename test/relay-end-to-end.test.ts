@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import zlib from "node:zlib";
 import { createServer } from "../src/daemon/server";
 import { RuntimeCatalog } from "../src/daemon/catalog";
 import { RateLimiter } from "../src/daemon/rate-limit";
@@ -12,24 +13,30 @@ import { loadRelayState, saveRelayState } from "../src/relay/egress";
 import { modelDef, type ModelDef } from "../src/upstreams/types";
 
 // records what the daemon forwards so the test can assert on headers and body
+// NOTE: the daemon gzips any body >= 1 KB on the wire (bansos-opt4 — Vercel FOT
+// meters wire bytes), and the real relay handler gunzips it back. This mock has
+// to honour the same contract or it records compressed bytes instead of JSON.
 function createMockRelayServer(shouldFail = false): Promise<{
   server: http.Server;
   relayUrl: string;
-  receivedRequests: Array<{ method?: string; headers: http.IncomingHttpHeaders; body: string }>;
+  receivedRequests: Array<{ method?: string; headers: http.IncomingHttpHeaders; body: string; wireBytes: number }>;
   close: () => Promise<void>;
 }> {
-  const receivedRequests: Array<{ method?: string; headers: http.IncomingHttpHeaders; body: string }> = [];
+  const receivedRequests: Array<{ method?: string; headers: http.IncomingHttpHeaders; body: string; wireBytes: number }> = [];
 
   const server = http.createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) {
       chunks.push(chunk as Buffer);
     }
-    const body = Buffer.concat(chunks).toString("utf8");
+    const raw = Buffer.concat(chunks);
+    const enc = String(req.headers["content-encoding"] || "").toLowerCase();
+    const body = enc.includes("gzip") ? zlib.gunzipSync(raw).toString("utf8") : raw.toString("utf8");
     receivedRequests.push({
       method: req.method,
       headers: req.headers,
       body,
+      wireBytes: raw.length,
     });
 
     if (shouldFail) {
