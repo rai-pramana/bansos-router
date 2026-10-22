@@ -525,29 +525,6 @@ export function extractUsage(json: unknown): TokenUsage | null {
   return { inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens };
 }
 
-// find the first complete `"usage": {...}` in a tail of SSE bytes, tolerating nested braces
-function findUsageObject(tail: string): Record<string, unknown> | null {
-  const open = tail.search(/"usage"\s*:\s*\{/);
-  if (open < 0) return null;
-  const start = tail.indexOf("{", open);
-  let depth = 0;
-  for (let i = start; i < tail.length; i++) {
-    const ch = tail[i];
-    if (ch === "{") depth++;
-    else if (ch === "}") {
-      depth--;
-      if (depth === 0) {
-        try {
-          return JSON.parse(tail.slice(start, i + 1));
-        } catch {
-          return null;
-        }
-      }
-    }
-  }
-  return null;
-}
-
 // fold reasoning into content when a model streams reasoning_content but no content (C5)
 type ChatFoldState = { sawContent: boolean; sawToolCalls: boolean; reasoning: string; envelope: Record<string, unknown> };
 
@@ -594,6 +571,38 @@ function foldedContentFrame(state: { reasoning: string; envelope: Record<string,
     model: state.envelope.model ?? "",
     choices: [{ index: 0, delta: { role: "assistant", content: state.reasoning }, finish_reason: null }],
   })}\n\n`;
+}
+
+// Terminal chunk for a stream whose upstream never sent finish_reason. Clients need a verdict
+// to close their translation; without one 9router reports stream_disconnected and Hermes drops
+// the turn. "length" is the verdict that means "cut short, continue" (9router maps it to
+// response.incomplete/max_output_tokens); "stop" is used when usage already arrived.
+function terminalChatFrame(state: ChatFoldState, fallbackModel: string, reason: string): string {
+  return `data: ${JSON.stringify({
+    id: state.envelope.id ?? "chatcmpl-synthetic-finish",
+    object: "chat.completion.chunk",
+    created: state.envelope.created ?? Math.floor(Date.now() / 1000),
+    model: state.envelope.model ?? fallbackModel,
+    choices: [{ index: 0, delta: {}, finish_reason: reason }],
+  })}\n\n`;
+}
+
+// A body can end right after a complete `data:` line but before its blank separator. Keep it
+// when it still parses, drop it when it was cut mid-JSON.
+function salvageSseFrame(rest: string): string | undefined {
+  const lines = rest.split("\n").filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return undefined;
+  for (const line of lines) {
+    if (!line.startsWith("data:")) return undefined;
+    const payload = line.slice(5).trim();
+    if (payload === "[DONE]") continue;
+    try {
+      JSON.parse(payload);
+    } catch {
+      return undefined;
+    }
+  }
+  return `${lines.join("\n")}\n\n`;
 }
 
 // stream transform: reassemble split SSE frames, fold reasoning-only deltas, pass the rest
@@ -738,7 +747,16 @@ export function reasoningToContentTransform(): Transform {
   });
 }
 
-// pass-through that logs the usage object once and emits a terminating [DONE] if missing
+// Pass-through that logs the usage object once and guarantees a well-formed terminal frame.
+//
+// Upstreams — zen's free pool above all — sometimes close the SSE body without ever sending
+// finish_reason. A raw pipe then hands the client a stream that ended with no verdict, and
+// strict translators (9router's openai-responses) turn that into
+// response.failed/stream_disconnected: Hermes retries the whole turn and eventually aborts it
+// with "stream_disconnected: upstream stream ended without finish_reason". Re-frame instead:
+// drop a half-written trailing frame and close with finish_reason=length, the one verdict every
+// client treats as "truncated, continue". Usage present means the generation actually finished
+// and only its terminal chunk was lost, so that case closes with stop.
 export function logUsageTransform(
   model: string,
   upstream: string,
@@ -749,53 +767,88 @@ export function logUsageTransform(
   kind: ActivityKind = "chat",
   relay = "",
 ): Transform {
-  let tail = "";
+  const splitter = createSseFrameSplitter();
+  const state: ChatFoldState = { sawContent: false, sawToolCalls: false, reasoning: "", envelope: {} };
+  let usage: TokenUsage | null = null;
   let reported = false;
-  // bansos-opt4: gate the scan behind a cheap substring hit. Measured: upstream's
-  // per-chunk append + regex over a rolling 16KB tail is LINEAR (chunks x 16KB), and
-  // a 1118-chunk stream held the daemon at 0.4% CPU, so this is not a fix for a
-  // wedge — it only stops the regex from running on every SSE delta. Do not ship it
-  // upstream as a CPU bug report without a measurement showing the spike.
-  let pending = "";
+  let finished = false;
+  let done = false;
+
+  const reportUsage = () => {
+    if (reported || !usage) return;
+    reported = true;
+    log.info("chat done", { model, upstream, durationMs: Date.now() - startedAt, ...usage });
+    activity?.record({
+      kind,
+      model,
+      requestedModel: requestedModel ?? model,
+      upstream,
+      ...(relay ? { relay } : {}),
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      durationMs: Date.now() - startedAt,
+      status: "ok",
+      ...(requestedModel && requestedModel !== model ? { failoverFrom: requestedModel } : {}),
+    });
+  };
+
+  // read verdict + usage off one complete frame; [DONE] is tracked but still forwarded verbatim
+  const absorb = (frame: string) => {
+    if (inspectChatFrame(frame, state).finished) finished = true;
+    if (/^data: ?\[DONE\]/.test(frame)) {
+      done = true;
+      return;
+    }
+    if (usage) return;
+    for (const line of frame.split("\n")) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        usage = extractUsage(JSON.parse(payload)) ?? usage;
+      } catch {
+        // keep the frame untouched; a non-JSON data line is not ours to judge
+      }
+    }
+  };
+
   return new Transform({
     transform(chunk, _enc, cb) {
-      if (!reported) {
-        pending += chunk.toString("utf8");
-        if (pending.length > 16384) pending = pending.slice(-8192);
-        if (pending.includes('"usage"')) {
-          tail = pending;
-          pending = "";
-        }
+      for (const frame of splitter.push(chunk)) {
+        absorb(frame);
+        if (usage) reportUsage();
+        this.push(Buffer.from(frame, "utf8"));
       }
-      if (!reported) {
-        const obj = findUsageObject(tail);
-        if (obj) {
-          const usage = extractUsage({ usage: obj });
-          if (usage) {
-            reported = true;
-            log.info("chat done", { model, upstream, durationMs: Date.now() - startedAt, ...usage });
-            activity?.record({
-              kind,
-              model,
-              requestedModel: requestedModel ?? model,
-              upstream,
-              ...(relay ? { relay } : {}),
-              inputTokens: usage.inputTokens,
-              outputTokens: usage.outputTokens,
-              durationMs: Date.now() - startedAt,
-              status: "ok",
-              ...(requestedModel && requestedModel !== model ? { failoverFrom: requestedModel } : {}),
-            });
-          }
-        }
-      }
-      cb(null, chunk);
+      cb();
     },
     flush(cb) {
-      // strict SSE parsers hang without a terminating [DONE]
-      if (!tail.includes("[DONE]")) {
-        this.push("\ndata: [DONE]\n\n");
+      // A frame cut mid-write is not a frame: forwarding it hands the client invalid JSON.
+      const rest = splitter.rest();
+      const salvaged = rest ? salvageSseFrame(rest) : undefined;
+      if (salvaged) {
+        absorb(salvaged);
+        if (usage) reportUsage();
+        if (!done) this.push(Buffer.from(salvaged, "utf8"));
+      } else if (rest.trim()) {
+        log.warn("dropped partial sse frame", {
+          model,
+          upstream,
+          bytes: Buffer.byteLength(rest),
+        });
       }
+      if (!finished) {
+        const reason = usage ? "stop" : "length";
+        log.warn("chat stream ended without finish_reason", {
+          model,
+          upstream,
+          durationMs: Date.now() - startedAt,
+          synthesised: reason,
+          ...(relay ? { relay } : {}),
+        });
+        this.push(terminalChatFrame(state, model, reason));
+      }
+      // strict SSE parsers hang without a terminating [DONE]
+      if (!done) this.push("data: [DONE]\n\n");
       cb();
     },
   });
@@ -1548,8 +1601,12 @@ async function handleChat(
       upstreamRes.body as import("node:stream/web").ReadableStream,
     );
     const usageTx = logUsageTransform(current.id, currentUpstream.id, log, requestStartedAt, model.id, activity, "chat", result.relay);
+    const filterTx = filterInjectedToolCallsTransform(callerTools);
+    let closing = false;
     // a mid-stream upstream failure ends the client response, not the daemon; client abort releases the upstream
     const failStream = () => {
+      if (closing) return;
+      closing = true;
       if (signal.aborted) {
         try {
           res.destroy();
@@ -1563,17 +1620,27 @@ async function handleChat(
         upstream: currentUpstream.id,
         status: 502,
       });
+      // Close the client stream cleanly instead of resetting it. Destroying the response
+      // turned an upstream reset into a broken socket on the caller's side, which strict
+      // translators report as a failed stream with no verdict. Ending the chain lets the
+      // terminal transform synthesise finish_reason, so a cut answer arrives as a
+      // truncation the client can continue from.
       try {
-        res.destroy();
+        src.unpipe(filterTx);
+        src.destroy();
+        if (!filterTx.destroyed) filterTx.end();
       } catch {
-        // response already gone
+        try {
+          res.destroy();
+        } catch {
+          // response already gone
+        }
       }
     };
     src.on("error", failStream);
     usageTx.on("error", failStream);
     res.on("error", () => src.destroy());
     signal.addEventListener("abort", () => src.destroy());
-    const filterTx = filterInjectedToolCallsTransform(callerTools);
     filterTx.on("error", failStream);
     // Filter BEFORE the fold: upstreams inject tool calls the caller never declared, and
     // this filter drops them. Folding first meant `sawToolCalls` latched on those phantom
