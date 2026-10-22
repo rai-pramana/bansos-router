@@ -136,6 +136,13 @@ test("Relay Egress: a body over 1 KB is gzipped on the wire and still arrives as
     assert.equal(relay.seen.length, 1);
     const req = relay.seen[0]!;
     assert.equal(req.headers["content-encoding"], "gzip", "wire body must be gzip");
+    // Vercel's edge buffers a CHUNKED gzip stream and answers 400 with an empty
+    // body before the function runs, so the compressed length must be declared.
+    assert.equal(
+      Number(req.headers["content-length"]),
+      req.wireBytes,
+      "gzip body must declare its compressed content-length",
+    );
     assert.ok(
       req.wireBytes < req.decoded.length / 3,
       `wire ${req.wireBytes} should be far smaller than decoded ${req.decoded.length}`,
