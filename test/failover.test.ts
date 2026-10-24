@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { RuntimeCatalog } from "../src/daemon/catalog";
-import { createServer, parseRetryAfterMs, peekStreamError, pickFailover, retryAfterFromMessage, streamToChatResponse } from "../src/daemon/server";
+import { createServer, isQuotaExhaustion, parseRetryAfterMs, peekStreamError, pickFailover, retryAfterFromMessage, streamToChatResponse } from "../src/daemon/server";
 import { RateLimiter } from "../src/daemon/rate-limit";
 import { normalizeSecurityConfig } from "../src/security/policy";
 import type { Logger } from "../src/logger";
@@ -84,6 +84,7 @@ async function testDaemon(
   upstreams: Upstream[],
   models: ModelDef[],
   entries: Array<Record<string, unknown>>,
+  securityOverride?: Record<string, unknown>,
 ): Promise<{ baseUrl: string; close(): Promise<void> }> {
   const log = {
     info: (msg: string, fields?: Record<string, unknown>) => entries.push({ msg, ...fields }),
@@ -92,7 +93,7 @@ async function testDaemon(
     error: () => {},
     child: () => log,
   } as unknown as Logger;
-  const security = normalizeSecurityConfig({});
+  const security = normalizeSecurityConfig(securityOverride ?? {});
   const catalog = new RuntimeCatalog(upstreams, log, security);
   catalog.seed(models);
   const server = createServer({
@@ -326,6 +327,105 @@ test("a 429 parks the model so the next request does not retry it", async () => 
     assert.equal((await ask()).status, 200);
     assert.equal(limited.hits, 1, "second request must skip the parked model entirely");
     assert.equal(spare.hits, 2);
+  } finally {
+    await daemon.close();
+    await limited.close();
+    await spare.close();
+  }
+});
+
+test("a quota exhaustion is told apart from a burst rate limit", () => {
+  // OpenCode Zen's daily free bucket: the body names it, and Retry-After
+  // points at the next UTC midnight.
+  assert.equal(
+    isQuotaExhaustion(429, '{"error":{"type":"FreeUsageLimitError"}}', 6 * 60 * 60_000),
+    true,
+  );
+  assert.equal(
+    isQuotaExhaustion(429, "Free usage limit reached. Subscribe to OpenCode Go to keep going", undefined),
+    true,
+  );
+  // A gateway that drops the body type but keeps a day-long Retry-After.
+  assert.equal(isQuotaExhaustion(429, "rate limited", 6 * 60 * 60_000), true);
+  // A burst limit is NOT a daily exhaustion: short Retry-After, no free-tier body.
+  assert.equal(isQuotaExhaustion(429, "rate limited", 30_000), false);
+  assert.equal(isQuotaExhaustion(429, "too many requests", undefined), false);
+  // Only 429 can be a quota rejection.
+  assert.equal(isQuotaExhaustion(503, "Free usage limit reached", undefined), false);
+});
+
+test("a quota-exhausted model is parked for the upstream's window, not 15 minutes", () => {
+  const cat = new RuntimeCatalog([], logger());
+  const t0 = Date.now();
+  cat.markQuotaExhausted("zen-free", 6 * 60 * 60_000);
+  assert.equal(cat.isCoolingDown("zen-free", t0 + 5 * 60 * 60_000), true);
+  assert.equal(cat.isCoolingDown("zen-free", t0 + 7 * 60 * 60_000), false);
+});
+
+test("a quota-exhausted 429 tells the client when to come back", async () => {
+  const limited = await mockProvider(
+    429,
+    { error: { type: "FreeUsageLimitError", message: "Free usage limit reached" } },
+    { "retry-after": "600" },
+  );
+  const origin = md({ id: "zen-origin", source: "zen", reasoning: true, contextWindow: 128_000 });
+  const entries: Array<Record<string, unknown>> = [];
+  const daemon = await testDaemon([httpUpstream("zen", limited.url)], [origin], entries);
+
+  try {
+    const res = await fetch(`${daemon.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: origin.id, messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(res.status, 429);
+    assert.equal(res.headers.get("retry-after"), "600");
+    const body = (await res.json()) as { error: { message: string } };
+    assert.match(body.error.message, /Free usage limit reached/);
+  } finally {
+    await daemon.close();
+    await limited.close();
+  }
+});
+
+test("a per-request opt-in header lets one request fail over across providers", async () => {
+  const limited = await mockProvider(
+    429,
+    { error: { type: "FreeUsageLimitError", message: "Free usage limit reached" } },
+    { "retry-after": "600" },
+  );
+  const spare = await mockProvider(200, {
+    id: "x",
+    choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
+  });
+  const origin = md({ id: "zen-origin", source: "zen", reasoning: true, contextWindow: 128_000 });
+  const fallback = md({ id: "kilo-fallback", source: "kilo", reasoning: true, contextWindow: 128_000 });
+  const entries: Array<Record<string, unknown>> = [];
+  // The operator's policy: cross-provider failover is off on this install.
+  const daemon = await testDaemon(
+    [httpUpstream("zen", limited.url), httpUpstream("kilo", spare.url)],
+    [origin, fallback],
+    entries,
+    { allowCrossProviderFailover: false },
+  );
+
+  try {
+    const ask = (headers: Record<string, string>) =>
+      fetch(`${daemon.baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify({ model: origin.id, messages: [{ role: "user", content: "hi" }] }),
+      });
+
+    // Without the opt-in the global policy stands: the error is forwarded.
+    const plain = await ask({});
+    assert.equal(plain.status, 429);
+    assert.equal(spare.hits, 0, "no substitute is contacted without the opt-in");
+
+    // With the opt-in the same request is served by the healthy provider.
+    const opted = await ask({ "x-bansos-failover": "1" });
+    assert.equal(opted.status, 200);
+    assert.equal(spare.hits, 1, "the substitute provider served the request");
   } finally {
     await daemon.close();
     await limited.close();

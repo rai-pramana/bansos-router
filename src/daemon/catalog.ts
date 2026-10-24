@@ -9,6 +9,14 @@ import { CATALOG_FILE, readJson, writeJsonAtomic } from "./state";
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 const MAX_COOLDOWN_MS = 15 * 60_000;
+// A daily free-tier quota is not a burst limit: the upstream says exactly when
+// the bucket refills (Retry-After points at the next UTC midnight, up to 24h).
+// Parking such a model for the flat 15 minutes above means the next request
+// pays the full round-trip again to relearn the same "spent" answer, and every
+// probe/watch tick burns one more request from the bucket that is already
+// empty. Honour the upstream window instead — bounded so a wild header cannot
+// park a model forever.
+const QUOTA_COOLDOWN_MAX_MS = 24 * 60 * 60_000;
 // 401/403 is a policy refusal, not a burst limit: back off longer, but not forever
 const REFUSED_COOLDOWN_MS = 30 * 60_000;
 // a snapshot older than this says nothing about today's catalog
@@ -89,6 +97,16 @@ export class RuntimeCatalog {
     this.coolUntil.set(id, Date.now() + ms);
   }
 
+  // park a model whose DAILY free-tier bucket is spent. The upstream's
+  // Retry-After points at the exact refill moment (next UTC midnight), so the
+  // park lasts that long instead of the flat 15 minutes a burst limit gets:
+  // every probe in the meantime would spend another request from the bucket
+  // that is already empty, and the fleet would keep marking live relays dead.
+  markQuotaExhausted(id: string, retryAfterMs?: number): void {
+    const ms = Math.min(Math.max(retryAfterMs ?? DEFAULT_COOLDOWN_MS, 1_000), QUOTA_COOLDOWN_MAX_MS);
+    this.coolUntil.set(id, Date.now() + ms);
+  }
+
   // upstream refused this model (401/403), usually about egress location, not the request
   markRefused(id: string): void {
     this.coolUntil.set(id, Date.now() + REFUSED_COOLDOWN_MS);
@@ -102,6 +120,15 @@ export class RuntimeCatalog {
       return false;
     }
     return true;
+  }
+
+  // Milliseconds left on a model's park, 0 when it is not parked. The daemon
+  // uses this to keep the zen probe gate closed for exactly as long as the
+  // model stays parked, even if the gate marker was cleared by hand.
+  cooldownRemaining(id: string, now = Date.now()): number {
+    const until = this.coolUntil.get(id);
+    if (until === undefined) return 0;
+    return Math.max(0, until - now);
   }
 
   resolve(id: string): ModelDef | undefined {

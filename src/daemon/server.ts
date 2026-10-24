@@ -17,6 +17,7 @@ import {
 } from "../security/policy";
 import { redactRequestBody, scanRequestBody, type SecretType } from "../security/secret-guard";
 import { ActivityStore, type ActivityKind } from "./activity";
+import { noteZenQuotaExhausted, noteZenQuotaRecovered } from "./zen-gate";
 import type { ModelDef, Upstream } from "../upstreams/types";
 import { pickSmartDefaultModel } from "../upstreams/types";
 import { parseChatTurn, sanitizeChatBody } from "../protocols/openai-chat";
@@ -486,11 +487,13 @@ function sendJson(
   res: http.ServerResponse,
   status: number,
   body: unknown,
+  extraHeaders: Record<string, string> = {},
 ): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(payload),
+    ...extraHeaders,
     ...corsFor(res),
   });
   res.end(payload);
@@ -874,6 +877,16 @@ export function retryAfterFromMessage(message: string): number | undefined {
   return n * 1000;
 }
 
+// A daily free-tier exhaustion, not a burst limit. OpenCode Zen answers with
+// FreeUsageLimitError and a Retry-After that points at the next UTC midnight
+// (up to 24h). The body type is the reliable signal; the long Retry-After is
+// the fallback for a gateway that drops the type but keeps the header.
+export function isQuotaExhaustion(status: number, body: string, retryAfterMs?: number): boolean {
+  if (status !== 429) return false;
+  if (/FreeUsageLimitError|Free usage limit reached/i.test(body)) return true;
+  return retryAfterMs !== undefined && retryAfterMs >= 15 * 60_000;
+}
+
 export const FAILOVER_CONTEXT_TOLERANCE = 0.9;
 
 export function pickFailover(
@@ -918,6 +931,9 @@ type ForwardError = {
   type?: "upstream_error" | "security_policy_error";
   secretTypes?: SecretType[];
   relay?: string;
+  // Seconds the client should wait before retrying. Carried from the upstream's
+  // Retry-After so a daily free-tier exhaustion is not retried in a tight loop.
+  retryAfter?: number;
 };
 
 function isExternalUpstream(upstream: Upstream): boolean {
@@ -1198,7 +1214,13 @@ async function runChatForward(
   const servingRelay = relay.enabled && relay.url ? relay.url : "";
   const failoverAllowed =
     req.headers["x-bansos-no-failover"] !== "1" &&
-    isCrossProviderFailoverAllowed(security);
+    // Per-request opt-in. The global switch stays off (the operator manages
+    // which model may answer), but a caller that KNOWS the requested model's
+    // bucket is spent — e.g. the gateway lane that just saw the upstream's
+    // Retry-After — can ask for a substitute on this one request instead of
+    // failing the call. The answer's origin still changes, so it stays opt-in
+    // rather than a default.
+    (isCrossProviderFailoverAllowed(security) || req.headers["x-bansos-failover"] === "1");
   const tried = new Set<string>([model.id]);
   let current: ModelDef = model;
   let currentUpstream = upstream;
@@ -1229,6 +1251,14 @@ async function runChatForward(
   // model is in 429 cooldown: start on a fallback instead of re-learning it
   if (failoverAllowed && catalog.isCoolingDown(current.id) && current.id === model.id) {
     transientError = { status: 429, message: "model is cooling down after a recent rate limit" };
+    // The model's bucket is still spent: keep the zen probe gate closed for
+    // the rest of the park, even though this request never reaches zen (it
+    // goes straight to the substitute). Without this, clearing the marker by
+    // hand would re-open the probe lane while the bucket is still empty.
+    const parkedMs = catalog.cooldownRemaining(current.id);
+    if (currentUpstream.id === "zen" && parkedMs > 0) {
+      noteZenQuotaExhausted(parkedMs);
+    }
     const warm = selectFailover(
       catalog, current, currentUpstream, tried, security, true,
       429, requestStartedAt, log,
@@ -1373,6 +1403,13 @@ async function runChatForward(
       const capabilityRejected =
         (needsTools && TOOLS_UNSUPPORTED_RE.test(errorMsg)) || (needsVision && VISION_UNSUPPORTED_RE.test(errorMsg));
       const transient = refused || capabilityRejected || upstreamRes.status === 429 || upstreamRes.status >= 500;
+      // Seconds the client should wait before retrying this model, taken from
+      // the upstream's Retry-After. Kept even when failover finds a
+      // replacement, so the caller learns the bucket is a daily one.
+      const upstreamRetryAfterMs =
+        upstreamRes.status === 429
+          ? parseRetryAfterMs(upstreamRes.headers.get("retry-after")) ?? retryAfterFromMessage(errorMsg)
+          : undefined;
       if (!transient) {
         log.warn("upstream rejected", {
           model: current.id,
@@ -1387,13 +1424,31 @@ async function runChatForward(
       if (refused) {
         catalog.markRefused(current.id);
       } else if (upstreamRes.status === 429) {
-        catalog.markRateLimited(
-          current.id,
-          parseRetryAfterMs(upstreamRes.headers.get("retry-after")) ?? retryAfterFromMessage(errorMsg),
-        );
+        const retryAfterMs = upstreamRetryAfterMs;
+        // Free-tier exhaustion is a daily bucket, not a burst limit: park the
+        // model until the upstream's refill moment instead of the flat 15
+        // minutes, so the next request and every probe tick stop paying to
+        // relearn that the bucket is empty.
+        if (isQuotaExhaustion(upstreamRes.status, text, retryAfterMs)) {
+          catalog.markQuotaExhausted(current.id, retryAfterMs);
+          // Close the probe lane for the upstream's own refill window so the
+          // watchers stop spending requests from an empty bucket. Without this
+          // the lane stays quiet only until someone runs the gate by hand.
+          if (currentUpstream.id === "zen") {
+            noteZenQuotaExhausted(retryAfterMs);
+          }
+        } else {
+          catalog.markRateLimited(current.id, retryAfterMs);
+        }
       }
 
-      transientError = { status: upstreamRes.status, message: errorMsg };
+      transientError = {
+        status: upstreamRes.status,
+        message: errorMsg,
+        ...(upstreamRetryAfterMs !== undefined
+          ? { retryAfter: Math.ceil(upstreamRetryAfterMs / 1000) }
+          : {}),
+      };
       const next = selectFailover(
         catalog, current, currentUpstream, tried, security, failoverAllowed,
         upstreamRes.status, requestStartedAt, log, errorMsg,
@@ -1459,6 +1514,10 @@ async function runChatForward(
     } else if (forcedStream) {
       finalResponse = await streamToChatResponse(upstreamRes, current.id, callerTools);
     }
+
+    // A zen request that made it through means the daily bucket has room
+    // again: reopen the probe lane so the watchers resume on their own.
+    if (currentUpstream.id === "zen") noteZenQuotaRecovered();
 
     return {
       response: finalResponse,
@@ -1536,7 +1595,7 @@ async function handleChat(
     sendJson(res, result.status, {
       error: { message: result.message, type: result.type ?? "upstream_error", status: result.status },
       ...(result.secretTypes ? { secret_types: result.secretTypes } : {}),
-    });
+    }, result.retryAfter !== undefined ? { "retry-after": String(result.retryAfter) } : {});
     return;
   }
 
@@ -1757,7 +1816,7 @@ async function handleResponses(
     sendJson(res, result.status, {
       error: { message: result.message, type: result.type ?? "upstream_error", status: result.status },
       ...(result.secretTypes ? { secret_types: result.secretTypes } : {}),
-    });
+    }, result.retryAfter !== undefined ? { "retry-after": String(result.retryAfter) } : {});
     return;
   }
 
