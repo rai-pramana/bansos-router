@@ -118,9 +118,16 @@ const _penalty = new Map<string, number>();
 // account the scheduler is actively resting (main/neko were 73% and 84% of cap
 // while ytk7 idled at 17%).
 // Resolved per call, not at import: tests and `bansos doctor` point it elsewhere.
+//
+// BANSOS_DIR must win over the home directory: a test run with an isolated
+// state dir would otherwise read the PRODUCTION ranking and splice live
+// relays into the candidate list, so a test that expects "stub A fails,
+// stub B answers" would send the second attempt to a real deployment.
 function rankFile(): string {
   return process.env.BANSOS_RELAY_RANK
-    || path.join(os.homedir(), ".bansos", "logs", ".relay-rank.json");
+    || (process.env.BANSOS_DIR
+      ? path.join(process.env.BANSOS_DIR, "logs", ".relay-rank.json")
+      : path.join(os.homedir(), ".bansos", "logs", ".relay-rank.json"));
 }
 const RANK_MAX_AGE_MS = 30 * 60_000;
 let _rankCache: { key: string; urls: string[] } | null = null;
