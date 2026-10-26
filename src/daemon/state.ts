@@ -25,6 +25,16 @@ export interface BansosConfig {
   security: SecurityConfig;
   // opt-in local gateways (freebuff-proxy, litellm, ...)
   localUpstreams: Array<{ name: string; baseUrl: string; apiKey?: string }>;
+  // OpenCode Zen's free pool is a daily per-IP request budget. When it is
+  // spent, the same model is often still served by another free upstream under
+  // a different id. This mirror lets the daemon answer the SAME zen model id
+  // from such an upstream instead of returning 429.
+  zenMirror?: {
+    baseUrl: string;
+    apiKey?: string;
+    // provider prefixes to try, in order (e.g. ["orca", "unorouter", "kenari"])
+    providers: string[];
+  };
 }
 
 export const DEFAULT_CONFIG: BansosConfig = {
@@ -89,11 +99,31 @@ export function loadConfigWarnings(file = CONFIG_FILE): string[] {
 export function loadConfig(file = CONFIG_FILE): BansosConfig {
   const { raw } = readRawConfig(file);
   if (!raw) return { ...DEFAULT_CONFIG };
+  // The mirror is opt-in: without a base URL and at least one provider there
+  // is nothing to mirror to, and a half-configured mirror must not make the
+  // daemon send zen traffic somewhere unexpected.
+  const mirror = raw.zenMirror;
+  const zenMirror =
+    mirror &&
+    typeof mirror === "object" &&
+    typeof mirror.baseUrl === "string" &&
+    mirror.baseUrl.trim().length > 0 &&
+    Array.isArray(mirror.providers) &&
+    mirror.providers.length > 0
+      ? {
+          baseUrl: mirror.baseUrl.trim(),
+          ...(typeof mirror.apiKey === "string" && mirror.apiKey ? { apiKey: mirror.apiKey } : {}),
+          providers: mirror.providers.filter(
+            (p): p is string => typeof p === "string" && p.trim().length > 0,
+          ),
+        }
+      : undefined;
   return {
     ...DEFAULT_CONFIG,
     ...raw,
     security: normalizeSecurityConfig(raw.security),
     localUpstreams: raw.localUpstreams ?? [],
+    ...(zenMirror ? { zenMirror } : {}),
   };
 }
 

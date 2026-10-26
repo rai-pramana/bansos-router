@@ -18,11 +18,12 @@ import {
 import { createLogger, type Logger } from "../logger";
 import { assertBindAllowed } from "../security/policy";
 import { buildUpstreams, SEEDED_MODELS } from "../upstreams";
+import { createZenMirror } from "../upstreams/zen-mirror";
 import { VERSION } from "../update";
 import { RuntimeCatalog } from "./catalog";
 import { RateLimiter } from "./rate-limit";
 import { ActivityStore } from "./activity";
-import { createServer } from "./server";
+import { createServer, setZenMirror } from "./server";
 import { zenQuotaClosedForMs, zenQuotaReason } from "./zen-gate";
 import { shutdownServer, SHUTDOWN_GRACE_MS } from "./shutdown";
 
@@ -138,6 +139,22 @@ function startServer(
 ): Promise<Running> {
   const upstreams = buildUpstreams(config.localUpstreams);
   const catalog = new RuntimeCatalog(upstreams, log, config.security);
+
+  // The zen mirror answers a zen model id from another free upstream when
+  // opencode.ai's daily pool is spent. It is a transport, not a catalog
+  // source, so it is not part of `upstreams`.
+  const mirror = config.zenMirror ? createZenMirror(config.zenMirror) : null;
+  setZenMirror(mirror);
+  if (mirror) {
+    // Resolve once at startup so the first zen request that hits the closed
+    // pool does not pay for the discovery round trip.
+    void mirror.ready().then(() => {
+      log.info("zen mirror ready", {
+        models: [...mirror.mirrors.keys()].length,
+        mirrors: Object.fromEntries(mirror.mirrors),
+      });
+    });
+  }
 
   // seed the pinned registry: usable offline, refined by health checks
   catalog.seed(SEEDED_MODELS);

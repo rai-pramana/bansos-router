@@ -44,8 +44,22 @@ import { createSseFrameSplitter, readSseStream } from "../protocols/stream";
 import { callerToolsFromBody, type CallerTools, type Translator } from "../protocols/tool-bridge";
 import type { RuntimeCatalog } from "./catalog";
 import type { RateLimiter } from "./rate-limit";
+import {
+  ZEN_MIRROR_REFUSAL,
+  type ZenMirrorHandle,
+} from "../upstreams/zen-mirror";
 
 let activity: ActivityStore = new ActivityStore();
+
+// The zen mirror: when opencode.ai's daily free pool is spent, the SAME zen
+// model id can be answered by another free upstream that still has quota.
+// It is a transport, not a catalog source, so it lives here rather than in
+// the upstream registry.
+let zenMirror: ZenMirrorHandle | null = null;
+
+export function setZenMirror(handle: ZenMirrorHandle | null): void {
+  zenMirror = handle;
+}
 
 export interface StatusPayload {
   status: "ok";
@@ -55,6 +69,9 @@ export interface StatusPayload {
   models: string[];
   providers: Array<{ id: string; models: number; allowed: boolean }>;
   relay?: { enabled: boolean; url: string };
+  // zen model id -> the free upstream ids that can serve it when opencode.ai's
+  // daily pool is spent
+  zenMirror?: Record<string, string[]>;
   security?: {
     mode: "normal" | "strict";
     dlp: "redact" | "block";
@@ -1186,6 +1203,341 @@ export async function streamToChatResponse(
   );
 }
 
+// Try the zen mirror for a model whose zen upstream reported its daily free
+// pool as spent.
+//
+// The mirror is a DIFFERENT free upstream serving the same model under a
+// different id, so the request keeps the client's model id in its body and
+// only the transport changes. The response is checked for two traps that a
+// plain status check would miss:
+//
+//   1. Some free routers answer HTTP 200 with a refusal string ("Sorry, to
+//      prevent abuse of free resources..."). That is a valid-looking
+//      completion that says nothing — worse than an error, because the client
+//      cannot tell it apart from a real answer.
+//   2. The gateway rewrites the `model` field to the upstream's own id
+//      ("deepseek-v4-1-flash-economy-261017"). The client asked for the zen
+//      id and must get the zen id back.
+//
+// A free id on the gateway's model list is not a promise that the upstream
+// still has quota for it: one hangs without answering, one answers 402
+// "exclusive to a paid subscription", one answers a prose refusal. The
+// candidates are therefore raced — the first usable answer wins — instead of
+// walked in order, so one dead candidate does not hold up the ones behind it.
+//
+// Returns the usable response, or null when no mirror can serve it (the
+// caller then falls through to the normal failover path).
+async function tryZenMirror(
+  model: ModelDef,
+  candidates: string[],
+  mirror: ZenMirrorHandle,
+  sanitizedBody: Record<string, unknown>,
+  req: http.IncomingMessage,
+  log: Logger,
+  requestStartedAt: number,
+): Promise<Response | null> {
+  if (candidates.length === 0) return null;
+
+  // The losers are cancelled as soon as one candidate wins: a hanging
+  // candidate must not keep a socket (and the upstream's quota) alive.
+  const race = new AbortController();
+  const attempts = candidates.map((mirrorId) =>
+    tryZenMirrorOnce(model, mirrorId, mirror, sanitizedBody, req, log, requestStartedAt, race.signal).then(
+      (response) => ({ mirrorId, response }),
+    ),
+  );
+
+  // The first candidate that produces a usable answer wins; the rest are
+  // abandoned (their responses are dropped, not shipped).
+  const winner = await Promise.any(
+    attempts.map((p) =>
+      p.then(({ response }) => {
+        if (response) return response;
+        // A failed candidate must not win the race.
+        throw new Error("mirror candidate unusable");
+      }),
+    ),
+  )
+    .catch(() => null)
+    .finally(() => race.abort());
+
+  if (!winner) {
+    log.warn("zen mirror exhausted all candidates", { model: model.id, candidates });
+  }
+  return winner;
+}
+
+// The text a mirror actually produced. A free router is free to answer in
+// any of the three places the OpenAI-compatible shape allows:
+//
+//   content           — the normal answer
+//   reasoning_content — DeepSeek/Nemotron style reasoning models
+//   reasoning         — the same thing under the other name (observed on
+//                       kiosapi, which also sends `content: null` and labels
+//                       a plain JSON body as `text/event-stream`)
+//
+// Whichever carries text is the answer.
+function mirrorAnswerText(parsed: any): string {
+  const message = parsed?.choices?.[0]?.message ?? {};
+  return String(
+    message.content ?? message.reasoning_content ?? message.reasoning ?? "",
+  );
+}
+
+async function tryZenMirrorOnce(
+  model: ModelDef,
+  mirrorId: string,
+  mirror: ZenMirrorHandle,
+  sanitizedBody: Record<string, unknown>,
+  req: http.IncomingMessage,
+  log: Logger,
+  requestStartedAt: number,
+  raceSignal?: AbortSignal,
+): Promise<Response | null> {
+  const headers = new Headers({
+    "content-type": "application/json",
+    ...mirror.upstream.requestHeaders(model, req.headers as Record<string, string | string[] | undefined>),
+  });
+  // The body keeps the client's model id; the mirror's transport maps it to
+  // the upstream's own id. The candidate id is written directly here: the
+  // transport's own mapping always picks the FIRST candidate, but this call
+  // may be about the second one.
+  const transformed = { ...sanitizedBody, model: mirrorId };
+  const body = JSON.stringify(transformed);
+
+  let res: Response;
+  const ctl = new AbortController();
+  // A free id that the upstream cannot actually serve may HANG instead of
+  // answering (observed: unorouter/mimo-v2.6-flash:free never returns a
+  // response). The deadline is per candidate, and it is short enough that a
+  // hung candidate does not eat the whole request budget.
+  const timer = setTimeout(() => ctl.abort(), 25_000);
+  const onRaceAbort = () => ctl.abort();
+  raceSignal?.addEventListener("abort", onRaceAbort, { once: true });
+  try {
+    res = await fetch(mirror.upstream.chatUrl, {
+      method: "POST",
+      headers,
+      body,
+      signal: ctl.signal,
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    raceSignal?.removeEventListener("abort", onRaceAbort);
+    // A candidate that lost the race is not a failure worth reporting.
+    if (!raceSignal?.aborted) {
+      log.warn("zen mirror request failed", {
+        model: model.id,
+        mirror: mirrorId,
+        error: String((err as Error)?.message ?? err).slice(0, 120),
+        durationMs: Date.now() - requestStartedAt,
+      });
+    }
+    return null;
+  }
+  clearTimeout(timer);
+  raceSignal?.removeEventListener("abort", onRaceAbort);
+
+  if (res.status >= 400) {
+    const text = await res.text().catch(() => "");
+    log.warn("zen mirror rejected", {
+      model: model.id,
+      mirror: mirrorId,
+      status: res.status,
+      upstreamError: text.slice(0, 160),
+      durationMs: Date.now() - requestStartedAt,
+    });
+    return null;
+  }
+
+  const contentType = res.headers.get("content-type") ?? "";
+  const wantsStream = sanitizedBody.stream === true;
+
+  // Streaming answer: the model id sits in every SSE frame, so it is rewritten
+  // in the stream rather than in a parsed body.
+  if (contentType.includes("text/event-stream")) {
+    // A mirror may label a plain JSON body as `text/event-stream` (observed on
+    // kiosapi). Sniffing the first bytes tells the two apart without waiting
+    // for the whole body: an SSE body starts with `data:`.
+    const sniffed = await res.clone().text().catch(() => "");
+    const isSse = /^\s*(data:|event:)/.test(sniffed);
+
+    // Some mirrors answer with an SSE stream even when the client asked for a
+    // plain JSON body (observed: the glm mirror). The client must get what it
+    // asked for, so the stream is reassembled into one completion — with the
+    // zen model id, not the upstream's.
+    if (!wantsStream && isSse) {
+      const assembled = await streamToChatResponse(res, model.id);
+      const text = await assembled.text();
+      let parsed: any;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        log.warn("zen mirror stream did not reassemble", { model: model.id, mirror: mirrorId });
+        return null;
+      }
+      const answer = mirrorAnswerText(parsed);
+      if (!answer.trim()) {
+        log.warn("zen mirror returned an empty answer", { model: model.id, mirror: mirrorId });
+        return null;
+      }
+      if (ZEN_MIRROR_REFUSAL.test(answer)) {
+        log.warn("zen mirror returned a refusal", {
+          model: model.id,
+          mirror: mirrorId,
+          answer: answer.slice(0, 120),
+        });
+        return null;
+      }
+      parsed.model = model.id;
+      log.info("zen mirror served model", {
+        model: model.id,
+        mirror: mirrorId,
+        upstream: mirror.upstream.id,
+        durationMs: Date.now() - requestStartedAt,
+      });
+      return new Response(JSON.stringify(parsed), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (wantsStream && !isSse) {
+      // The client asked for a stream but the mirror sent a plain JSON body.
+      // It is turned back into the SSE shape the client expects, with the zen
+      // model id in the chunk.
+      const framed = await jsonToEventStream(res, model.id);
+      log.info("zen mirror served model", {
+        model: model.id,
+        mirror: mirrorId,
+        upstream: mirror.upstream.id,
+        durationMs: Date.now() - requestStartedAt,
+      });
+      return framed;
+    }
+    const framed = rewriteStreamModelId(res, model.id);
+    log.info("zen mirror served model", {
+      model: model.id,
+      mirror: mirrorId,
+      upstream: mirror.upstream.id,
+      durationMs: Date.now() - requestStartedAt,
+    });
+    return framed;
+  }
+
+  const raw = await res.text().catch(() => "");
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    log.warn("zen mirror returned unreadable body", { model: model.id, mirror: mirrorId });
+    return null;
+  }
+
+  const choices = parsed?.choices;
+  if (!Array.isArray(choices) || choices.length === 0) {
+    log.warn("zen mirror returned no choices", { model: model.id, mirror: mirrorId });
+    return null;
+  }
+
+  const answer = mirrorAnswerText(parsed);
+  if (!answer.trim()) {
+    log.warn("zen mirror returned an empty answer", { model: model.id, mirror: mirrorId });
+    return null;
+  }
+  if (ZEN_MIRROR_REFUSAL.test(answer)) {
+    // A 200 that refuses in prose is not an answer. Treat it as a failure so
+    // the caller keeps looking instead of shipping the refusal to the client.
+    log.warn("zen mirror returned a refusal", {
+      model: model.id,
+      mirror: mirrorId,
+      answer: answer.slice(0, 120),
+    });
+    return null;
+  }
+
+  // Put the zen model id back: the client asked for it and the daemon's
+  // bookkeeping expects it.
+  parsed.model = model.id;
+
+  log.info("zen mirror served model", {
+    model: model.id,
+    mirror: mirrorId,
+    upstream: mirror.upstream.id,
+    durationMs: Date.now() - requestStartedAt,
+  });
+
+  return new Response(JSON.stringify(parsed), {
+    status: res.status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// The mirror for a parked zen model. Unlike the 429 path, the mirror list may
+// not have been resolved yet (the daemon may have restarted while the park
+// survived on disk), so the lookup refreshes once when it comes up empty.
+async function tryZenMirrorForParked(
+  model: ModelDef,
+  mirror: ZenMirrorHandle,
+  sanitizedBody: Record<string, unknown>,
+  req: http.IncomingMessage,
+  log: Logger,
+  requestStartedAt: number,
+): Promise<Response | null> {
+  let candidates = mirror.mirrorsFor(model.id);
+  if (candidates.length === 0) {
+    await mirror.ready();
+    candidates = mirror.mirrorsFor(model.id);
+  }
+  return tryZenMirror(model, candidates, mirror, sanitizedBody, req, log, requestStartedAt);
+}
+
+// Turn a plain JSON completion into the SSE shape a streaming client expects.
+// The mirror's own model id is replaced with the zen id the client asked for.
+async function jsonToEventStream(res: Response, modelId: string): Promise<Response> {
+  const raw = await res.text().catch(() => "");
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return new Response(raw, { status: res.status, headers: res.headers });
+  }
+  const message = parsed?.choices?.[0]?.message ?? {};
+  const content = String(message.content ?? message.reasoning_content ?? message.reasoning ?? "");
+  const chunk = {
+    id: parsed.id ?? `chatcmpl-${Math.random().toString(36).slice(2, 12)}`,
+    object: "chat.completion.chunk",
+    created: parsed.created ?? Math.floor(Date.now() / 1000),
+    model: modelId,
+    choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: "stop" }],
+  };
+  const body = `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+  });
+}
+
+// Rewrite the `model` field inside every SSE frame of a streaming answer.
+function rewriteStreamModelId(res: Response, modelId: string): Response {
+  if (!res.body) return res;
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const transform = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      const text = decoder.decode(chunk, { stream: true });
+      const rewritten = text.replace(
+        /("model"\s*:\s*)"[^"]*"/g,
+        (_m, prefix: string) => `${prefix}${JSON.stringify(modelId)}`,
+      );
+      controller.enqueue(encoder.encode(rewritten));
+    },
+  });
+  return new Response(res.body.pipeThrough(transform), {
+    status: res.status,
+    headers: res.headers,
+  });
+}
+
 async function runChatForward(
   req: http.IncomingMessage,
   catalog: RuntimeCatalog,
@@ -1301,6 +1653,25 @@ async function runChatForward(
     if (parkedMs > 0 && (!failoverAllowed || current.id === model.id)) {
       // No substitute: answer from the park instead of paying for the same 429
       // again. The client gets the original model's own refill deadline.
+      //
+      // The zen mirror is the one exception: it answers the SAME model id from
+      // an upstream whose own bucket still has room, so it is not "paying for
+      // the same 429 again" — it is taking the request somewhere that can
+      // actually serve it. Trying it here is what makes a closed zen pool a
+      // working lane instead of a 429 wall.
+      if (currentUpstream.id === "zen" && zenMirror) {
+        const mirrored = await tryZenMirrorForParked(
+          current,
+          zenMirror,
+          sanitizedBody,
+          req,
+          log,
+          requestStartedAt,
+        );
+        if (mirrored) {
+          return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: "" };
+        }
+      }
       log.warn("model parked after a recent rate limit", {
         model: current.id,
         upstream: currentUpstream.id,
@@ -1484,7 +1855,6 @@ async function runChatForward(
           catalog.markRateLimited(current.id, retryAfterMs, { status: upstreamRes.status, message: errorMsg });
         }
       }
-
       transientError = {
         status: upstreamRes.status,
         message: errorMsg,
@@ -1492,6 +1862,30 @@ async function runChatForward(
           ? { retryAfter: Math.ceil(upstreamRetryAfterMs / 1000) }
           : {}),
       };
+
+      // The zen pool is a daily per-IP request budget. When it is spent, the
+      // upstream is CLOSED for every egress identity — there is no route to
+      // the model left. But the same model is often served by another free
+      // upstream under a different id, and that upstream has its own quota.
+      //
+      // So before giving up on the model, try the mirror: the SAME model id,
+      // answered by a different free transport. This is not failover to a
+      // substitute model — the client asked for "beam-free" and gets an
+      // answer for "beam-free", from an upstream that still has room.
+      if (currentUpstream.id === "zen" && upstreamRes.status === 429 && zenMirror) {
+        const mirrored = await tryZenMirrorForParked(
+          current,
+          zenMirror,
+          sanitizedBody,
+          req,
+          log,
+          requestStartedAt,
+        );
+        if (mirrored) {
+          return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: "" };
+        }
+      }
+
       const next = selectFailover(
         catalog, current, currentUpstream, tried, security, failoverAllowed,
         upstreamRes.status, requestStartedAt, log, errorMsg,
@@ -2315,6 +2709,9 @@ export function createServer(opts: ServerOptions): http.Server {
         models: catalog.servableModels.map((m) => m.id),
         providers: providerCounts(catalog, security),
         relay: { enabled: relay.enabled, url: relay.url },
+        ...(zenMirror
+          ? { zenMirror: Object.fromEntries(zenMirror.mirrors) }
+          : {}),
         security: {
           mode: security.mode,
           dlp: security.dlp,
