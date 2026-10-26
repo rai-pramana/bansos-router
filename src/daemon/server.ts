@@ -1248,25 +1248,53 @@ async function runChatForward(
     }
   }
 
-  // model is in 429 cooldown: start on a fallback instead of re-learning it
-  if (failoverAllowed && catalog.isCoolingDown(current.id) && current.id === model.id) {
-    transientError = { status: 429, message: "model is cooling down after a recent rate limit" };
-    // The model's bucket is still spent: keep the zen probe gate closed for
-    // the rest of the park, even though this request never reaches zen (it
-    // goes straight to the substitute). Without this, clearing the marker by
-    // hand would re-open the probe lane while the bucket is still empty.
+  // A parked model must not be re-probed, even when failover is off.
+  //
+  // The upstream already told us when its bucket refills (a daily
+  // FreeUsageLimitError carries Retry-After to 00:00 UTC). Re-learning that on
+  // every request costs a round trip, spends a request from a bucket that is
+  // empty by definition, and — for zen — keeps the probe gate churning. So the
+  // park is consulted unconditionally, and a caller that asked for a parked
+  // model gets the upstream's own cooldown answer instead of a fresh 429.
+  //
+  // Failover, by contrast, stays opt-in: `failoverAllowed` below still decides
+  // whether this request may be answered by a DIFFERENT model.
+  if (catalog.isCoolingDown(current.id) && current.id === model.id) {
     const parkedMs = catalog.cooldownRemaining(current.id);
+    // A spent zen bucket keeps the probe lane closed for the rest of the park,
+    // even when this request never reaches zen. Without this, clearing the
+    // marker by hand would re-open the lane while the bucket is still empty.
     if (currentUpstream.id === "zen" && parkedMs > 0) {
       noteZenQuotaExhausted(parkedMs);
     }
-    const warm = selectFailover(
-      catalog, current, currentUpstream, tried, security, true,
-      429, requestStartedAt, log,
-    );
-    if (warm) {
-      tried.add(warm.id);
-      current = warm;
-      currentUpstream = catalog.upstreamBySource(current.source)!;
+    transientError = {
+      status: 429,
+      message: catalog.parkMessage(current.id)?.message ?? "model is cooling down after a recent rate limit",
+      ...(parkedMs > 0 ? { retryAfter: Math.ceil(parkedMs / 1000) } : {}),
+    };
+    if (failoverAllowed) {
+      const warm = selectFailover(
+        catalog, current, currentUpstream, tried, security, true,
+        429, requestStartedAt, log,
+      );
+      if (warm) {
+        tried.add(warm.id);
+        current = warm;
+        currentUpstream = catalog.upstreamBySource(current.source)!;
+      }
+    }
+    if (!failoverAllowed || current.id === model.id) {
+      // No substitute: answer from the park instead of paying for the same 429
+      // again. The client gets the original model's own refill deadline.
+      log.warn("model parked after a recent rate limit", {
+        model: current.id,
+        upstream: currentUpstream.id,
+        status: 429,
+        durationMs: Date.now() - requestStartedAt,
+        failoverBlocked: !failoverAllowed,
+        retryAfter: transientError.retryAfter,
+      });
+      return transientError;
     }
   }
 
@@ -1422,7 +1450,7 @@ async function runChatForward(
       }
 
       if (refused) {
-        catalog.markRefused(current.id);
+        catalog.markRefused(current.id, { status: upstreamRes.status, message: errorMsg });
       } else if (upstreamRes.status === 429) {
         const retryAfterMs = upstreamRetryAfterMs;
         // Free-tier exhaustion is a daily bucket, not a burst limit: park the
@@ -1430,7 +1458,7 @@ async function runChatForward(
         // minutes, so the next request and every probe tick stop paying to
         // relearn that the bucket is empty.
         if (isQuotaExhaustion(upstreamRes.status, text, retryAfterMs)) {
-          catalog.markQuotaExhausted(current.id, retryAfterMs);
+          catalog.markQuotaExhausted(current.id, retryAfterMs, { status: upstreamRes.status, message: errorMsg });
           // Close the probe lane for the upstream's own refill window so the
           // watchers stop spending requests from an empty bucket. Without this
           // the lane stays quiet only until someone runs the gate by hand.
@@ -1438,7 +1466,7 @@ async function runChatForward(
             noteZenQuotaExhausted(retryAfterMs);
           }
         } else {
-          catalog.markRateLimited(current.id, retryAfterMs);
+          catalog.markRateLimited(current.id, retryAfterMs, { status: upstreamRes.status, message: errorMsg });
         }
       }
 

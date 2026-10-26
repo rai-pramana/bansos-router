@@ -447,6 +447,45 @@ test("failover never hands the request to a model that is also cooling down", ()
   );
 });
 
+test("a parked model is not re-probed when failover is off", async () => {
+  // The bug this guards: the cooldown short-circuit sat behind `failoverAllowed`,
+  // so with the global failover switch OFF (this install's policy) every request
+  // re-contacted the upstream for a bucket the upstream had already said was
+  // empty until 00:00 UTC. The park was recorded and then never consulted.
+  const limited = await mockProvider(
+    429,
+    { error: { type: "FreeUsageLimitError", message: "Free usage limit reached" } },
+    { "retry-after": "600" },
+  );
+  const origin = md({ id: "zen-origin", source: "zen", reasoning: true, contextWindow: 128_000 });
+  const entries: Array<Record<string, unknown>> = [];
+  const daemon = await testDaemon([httpUpstream("zen", limited.url)], [origin], entries, {
+    allowCrossProviderFailover: false,
+  });
+
+  const ask = () =>
+    fetch(`${daemon.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: origin.id, messages: [{ role: "user", content: "hi" }] }),
+    });
+
+  try {
+    const first = await ask();
+    assert.equal(first.status, 429);
+    assert.equal(limited.hits, 1, "the first request learns the bucket is spent");
+
+    const second = await ask();
+    assert.equal(second.status, 429);
+    assert.equal(limited.hits, 1, "the parked model must not be contacted again");
+    // The caller still learns when to come back, from the park it was given.
+    assert.equal(second.headers.get("retry-after"), "600");
+  } finally {
+    await daemon.close();
+    await limited.close();
+  }
+});
+
 test("a 403 fails over to a healthy model and parks the refused one", async () => {
   // reported in #10: a VPS gets 403 from zen, and muse is the default model
   const refusing = await mockProvider(403, { error: { message: "This service is not available in your region." } });

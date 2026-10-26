@@ -334,7 +334,10 @@ test("strict mode blocks cross-provider failover consistently on all wire protoc
       const response = await postJson(daemon.baseUrl, wire.path, wire.body);
       assert.equal(response.status, 429, wire.name);
     }
-    assert.equal(originProvider.hits, 3);
+    // The first wire teaches the daemon that the origin's bucket is spent; the
+    // remaining wires are answered from that park without re-contacting the
+    // upstream. Failover stays blocked, which is what this test is about.
+    assert.equal(originProvider.hits, 1, "a parked origin is not re-probed on every wire");
     assert.equal(fallbackProvider.hits, 0);
     assert.equal(JSON.stringify(entries).includes("failoverBlocked"), true);
   } finally {

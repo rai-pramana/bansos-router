@@ -35,6 +35,9 @@ export class RuntimeCatalog {
   private readonly upstreams: Upstream[];
   private refreshInFlight: Promise<RefreshReport> | null = null;
   private readonly coolUntil = new Map<string, number>();
+  // Why a model is parked, so a repeated request to it can repeat the upstream's
+  // own rejection (message + status) instead of paying for the same round trip.
+  private readonly parkReason = new Map<string, { status: number; message: string }>();
 
   constructor(
     upstreams: Upstream[],
@@ -92,9 +95,10 @@ export class RuntimeCatalog {
   }
 
   // park a 429'd model so the next request skips it; Retry-After sets the time, else a minute
-  markRateLimited(id: string, retryAfterMs?: number): void {
+  markRateLimited(id: string, retryAfterMs?: number, reason?: { status: number; message: string }): void {
     const ms = Math.min(Math.max(retryAfterMs ?? DEFAULT_COOLDOWN_MS, 1_000), MAX_COOLDOWN_MS);
     this.coolUntil.set(id, Date.now() + ms);
+    if (reason) this.parkReason.set(id, reason);
   }
 
   // park a model whose DAILY free-tier bucket is spent. The upstream's
@@ -102,14 +106,16 @@ export class RuntimeCatalog {
   // park lasts that long instead of the flat 15 minutes a burst limit gets:
   // every probe in the meantime would spend another request from the bucket
   // that is already empty, and the fleet would keep marking live relays dead.
-  markQuotaExhausted(id: string, retryAfterMs?: number): void {
+  markQuotaExhausted(id: string, retryAfterMs?: number, reason?: { status: number; message: string }): void {
     const ms = Math.min(Math.max(retryAfterMs ?? DEFAULT_COOLDOWN_MS, 1_000), QUOTA_COOLDOWN_MAX_MS);
     this.coolUntil.set(id, Date.now() + ms);
+    if (reason) this.parkReason.set(id, reason);
   }
 
   // upstream refused this model (401/403), usually about egress location, not the request
-  markRefused(id: string): void {
+  markRefused(id: string, reason?: { status: number; message: string }): void {
     this.coolUntil.set(id, Date.now() + REFUSED_COOLDOWN_MS);
+    if (reason) this.parkReason.set(id, reason);
   }
 
   isCoolingDown(id: string, now = Date.now()): boolean {
@@ -117,9 +123,15 @@ export class RuntimeCatalog {
     if (until === undefined) return false;
     if (until <= now) {
       this.coolUntil.delete(id);
+      this.parkReason.delete(id);
       return false;
     }
     return true;
+  }
+
+  // The upstream rejection that parked this model, when one was recorded.
+  parkMessage(id: string): { status: number; message: string } | undefined {
+    return this.parkReason.get(id);
   }
 
   // Milliseconds left on a model's park, 0 when it is not parked. The daemon
