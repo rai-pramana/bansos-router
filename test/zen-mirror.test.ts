@@ -266,6 +266,60 @@ test("a mirror answer that is a prose refusal is NOT served to the client", asyn
   }
 });
 
+// A mirror may answer with a JSON body that has a stray SSE terminator glued
+// to the end (`data: [DONE]`), under an SSE content-type. That is neither
+// pure JSON nor pure SSE, and the client must still get valid JSON.
+test("a mirror that answers with JSON plus a stray `data: [DONE]` is served", async () => {
+  const payload =
+    JSON.stringify({
+      id: "gen-2",
+      object: "chat.completion",
+      created: 1,
+      model: "z-ai/glm-5.3-flash-free",
+      choices: [{ index: 0, message: { role: "assistant", content: "PONG" }, finish_reason: "stop" }],
+    }) + "data: [DONE]\n\n";
+  const gateway = await startGateway(["orca/z-ai/glm-5.3-flash-free"], {
+    "orca/z-ai/glm-5.3-flash-free": { status: 200, body: payload },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init?: any) => {
+    const res = await originalFetch(input, init);
+    if (!String(input).includes(gateway.url)) return res;
+    return new Response(await res.text(), {
+      status: res.status,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as typeof fetch;
+
+  const { bansos, bport, server } = await startZenDaemon("glm-5.3-flash-free");
+  try {
+    const mirror = createZenMirror({ baseUrl: gateway.url, providers: ["orca"] });
+    await mirror.ready();
+    setZenMirror(mirror);
+
+    const res = await fetch(`http://127.0.0.1:${bport}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "glm-5.3-flash-free",
+        messages: [{ role: "user", content: "Reply PONG" }],
+        max_tokens: 32,
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+    const json = (await res.json()) as { model?: string; choices?: Array<{ message: { content: string } }> };
+    assert.equal(json.model, "glm-5.3-flash-free");
+    assert.equal(json.choices?.[0]?.message.content, "PONG");
+  } finally {
+    globalThis.fetch = originalFetch;
+    setZenMirror(null);
+    await new Promise<void>((resolve) => bansos.close(() => resolve()));
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await gateway.close();
+  }
+});
+
 // A mirror may answer with the answer under `reasoning` instead of `content`,
 // and may label the body `text/event-stream` even though it is plain JSON
 // (observed on kiosapi). Both must still reach the client as a JSON answer.

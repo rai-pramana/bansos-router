@@ -1284,6 +1284,43 @@ function mirrorAnswerText(parsed: any): string {
   );
 }
 
+// Parse the JSON object at the start of a body that has trailing junk glued to
+// it (observed: `...}data: [DONE]`). The object's extent is found by walking
+// the braces with string awareness, so a `}` inside a string value does not
+// end the object early.
+function parseJsonPrefix(raw: string): any {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) {
+      try {
+        return JSON.parse(raw.slice(start, i + 1));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
 async function tryZenMirrorOnce(
   model: ModelDef,
   mirrorId: string,
@@ -1353,67 +1390,21 @@ async function tryZenMirrorOnce(
   const contentType = res.headers.get("content-type") ?? "";
   const wantsStream = sanitizedBody.stream === true;
 
-  // Streaming answer: the model id sits in every SSE frame, so it is rewritten
-  // in the stream rather than in a parsed body.
-  if (contentType.includes("text/event-stream")) {
-    // A mirror may label a plain JSON body as `text/event-stream` (observed on
-    // kiosapi). Sniffing the first bytes tells the two apart without waiting
-    // for the whole body: an SSE body starts with `data:`.
-    const sniffed = await res.clone().text().catch(() => "");
-    const isSse = /^\s*(data:|event:)/.test(sniffed);
+  // A mirror may label a plain JSON body as `text/event-stream` (observed on
+  // kiosapi and orca), so the content-type is not trusted on its own. The
+  // body is sniffed instead: an SSE body starts with `data:`.
+  //
+  // The sniff is not enough on its own either: a body may be JSON followed by
+  // a stray SSE terminator (`data: [DONE]`), which is neither pure JSON nor
+  // pure SSE. That shape is parsed as JSON with the terminator cut off.
+  const sniffed = contentType.includes("text/event-stream")
+    ? await res.clone().text().catch(() => "")
+    : "";
+  const isSse = /^\s*(data:|event:)/.test(sniffed);
 
-    // Some mirrors answer with an SSE stream even when the client asked for a
-    // plain JSON body (observed: the glm mirror). The client must get what it
-    // asked for, so the stream is reassembled into one completion — with the
-    // zen model id, not the upstream's.
-    if (!wantsStream && isSse) {
-      const assembled = await streamToChatResponse(res, model.id);
-      const text = await assembled.text();
-      let parsed: any;
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        log.warn("zen mirror stream did not reassemble", { model: model.id, mirror: mirrorId });
-        return null;
-      }
-      const answer = mirrorAnswerText(parsed);
-      if (!answer.trim()) {
-        log.warn("zen mirror returned an empty answer", { model: model.id, mirror: mirrorId });
-        return null;
-      }
-      if (ZEN_MIRROR_REFUSAL.test(answer)) {
-        log.warn("zen mirror returned a refusal", {
-          model: model.id,
-          mirror: mirrorId,
-          answer: answer.slice(0, 120),
-        });
-        return null;
-      }
-      parsed.model = model.id;
-      log.info("zen mirror served model", {
-        model: model.id,
-        mirror: mirrorId,
-        upstream: mirror.upstream.id,
-        durationMs: Date.now() - requestStartedAt,
-      });
-      return new Response(JSON.stringify(parsed), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-    if (wantsStream && !isSse) {
-      // The client asked for a stream but the mirror sent a plain JSON body.
-      // It is turned back into the SSE shape the client expects, with the zen
-      // model id in the chunk.
-      const framed = await jsonToEventStream(res, model.id);
-      log.info("zen mirror served model", {
-        model: model.id,
-        mirror: mirrorId,
-        upstream: mirror.upstream.id,
-        durationMs: Date.now() - requestStartedAt,
-      });
-      return framed;
-    }
+  // The client asked for a stream and the mirror sent one: the model id sits
+  // in every SSE frame, so it is rewritten in the stream.
+  if (wantsStream && isSse) {
     const framed = rewriteStreamModelId(res, model.id);
     log.info("zen mirror served model", {
       model: model.id,
@@ -1424,13 +1415,71 @@ async function tryZenMirrorOnce(
     return framed;
   }
 
+  // The client asked for a stream but the mirror sent a plain JSON body. It
+  // is turned back into the SSE shape the client expects, with the zen model
+  // id in the chunk.
+  if (wantsStream) {
+    const framed = await jsonToEventStream(res, model.id);
+    log.info("zen mirror served model", {
+      model: model.id,
+      mirror: mirrorId,
+      upstream: mirror.upstream.id,
+      durationMs: Date.now() - requestStartedAt,
+    });
+    return framed;
+  }
+
+  // The client asked for JSON. A mirror may still answer with an SSE stream
+  // (observed: the glm mirror), which is reassembled into one completion —
+  // with the zen model id, not the upstream's.
+  if (isSse) {
+    const assembled = await streamToChatResponse(res, model.id);
+    const text = await assembled.text();
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      log.warn("zen mirror stream did not reassemble", { model: model.id, mirror: mirrorId });
+      return null;
+    }
+    const answer = mirrorAnswerText(parsed);
+    if (!answer.trim()) {
+      log.warn("zen mirror returned an empty answer", { model: model.id, mirror: mirrorId });
+      return null;
+    }
+    if (ZEN_MIRROR_REFUSAL.test(answer)) {
+      log.warn("zen mirror returned a refusal", {
+        model: model.id,
+        mirror: mirrorId,
+        answer: answer.slice(0, 120),
+      });
+      return null;
+    }
+    parsed.model = model.id;
+    log.info("zen mirror served model", {
+      model: model.id,
+      mirror: mirrorId,
+      upstream: mirror.upstream.id,
+      durationMs: Date.now() - requestStartedAt,
+    });
+    return new Response(JSON.stringify(parsed), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // A body that is neither pure SSE nor pure JSON: JSON followed by a stray
+  // SSE terminator. The terminator is cut off so the JSON parses.
   const raw = await res.text().catch(() => "");
   let parsed: any;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    log.warn("zen mirror returned unreadable body", { model: model.id, mirror: mirrorId });
-    return null;
+    parsed = parseJsonPrefix(raw);
+    if (!parsed) {
+      log.warn("zen mirror returned unreadable body", { model: model.id, mirror: mirrorId });
+      return null;
+    }
   }
 
   const choices = parsed?.choices;
