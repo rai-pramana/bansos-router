@@ -17,7 +17,7 @@ import {
 } from "../security/policy";
 import { redactRequestBody, scanRequestBody, type SecretType } from "../security/secret-guard";
 import { ActivityStore, type ActivityKind } from "./activity";
-import { noteZenQuotaExhausted, noteZenQuotaRecovered } from "./zen-gate";
+import { noteZenQuotaExhausted, noteZenQuotaRecovered, zenQuotaClosedForMs } from "./zen-gate";
 import type { ModelDef, Upstream } from "../upstreams/types";
 import { pickSmartDefaultModel } from "../upstreams/types";
 import { parseChatTurn, sanitizeChatBody } from "../protocols/openai-chat";
@@ -1260,18 +1260,33 @@ async function runChatForward(
   // Failover, by contrast, stays opt-in: `failoverAllowed` below still decides
   // whether this request may be answered by a DIFFERENT model.
   if (catalog.isCoolingDown(current.id) && current.id === model.id) {
-    const parkedMs = catalog.cooldownRemaining(current.id);
-    // A spent zen bucket keeps the probe lane closed for the rest of the park,
-    // even when this request never reaches zen. Without this, clearing the
-    // marker by hand would re-open the lane while the bucket is still empty.
-    if (currentUpstream.id === "zen" && parkedMs > 0) {
-      noteZenQuotaExhausted(parkedMs);
+    let parkedMs = catalog.cooldownRemaining(current.id);
+    // The on-disk marker is the authority for a ZEN QUOTA park: it is what
+    // survives a restart and what a human clears by hand to force a retry. If
+    // the marker is gone (or has expired), that park must yield instead of
+    // re-stamping itself forever, otherwise clearing the gate could never open
+    // the lane. A burst park is the daemon's own timing and keeps its window.
+    if (currentUpstream.id === "zen" && catalog.isQuotaParked(current.id)) {
+      const closedMs = zenQuotaClosedForMs();
+      if (closedMs > 0) {
+        // Keep the lane closed for the rest of the park. Re-stamping from the
+        // REMAINING time (never from now + full window) means repeated requests
+        // cannot push the deadline forward.
+        noteZenQuotaExhausted(closedMs);
+      } else {
+        // No open window on disk: the park is stale, let the request through so
+        // a recovered bucket is discovered instead of being hidden forever.
+        parkedMs = 0;
+        catalog.clearPark(current.id);
+      }
     }
-    transientError = {
-      status: 429,
-      message: catalog.parkMessage(current.id)?.message ?? "model is cooling down after a recent rate limit",
-      ...(parkedMs > 0 ? { retryAfter: Math.ceil(parkedMs / 1000) } : {}),
-    };
+    if (parkedMs > 0) {
+      transientError = {
+        status: 429,
+        message: catalog.parkMessage(current.id)?.message ?? "model is cooling down after a recent rate limit",
+        retryAfter: Math.ceil(parkedMs / 1000),
+      };
+    }
     if (failoverAllowed) {
       const warm = selectFailover(
         catalog, current, currentUpstream, tried, security, true,
@@ -1283,7 +1298,7 @@ async function runChatForward(
         currentUpstream = catalog.upstreamBySource(current.source)!;
       }
     }
-    if (!failoverAllowed || current.id === model.id) {
+    if (parkedMs > 0 && (!failoverAllowed || current.id === model.id)) {
       // No substitute: answer from the park instead of paying for the same 429
       // again. The client gets the original model's own refill deadline.
       log.warn("model parked after a recent rate limit", {
@@ -1292,9 +1307,9 @@ async function runChatForward(
         status: 429,
         durationMs: Date.now() - requestStartedAt,
         failoverBlocked: !failoverAllowed,
-        retryAfter: transientError.retryAfter,
+        retryAfter: Math.ceil(parkedMs / 1000),
       });
-      return transientError;
+      return transientError ?? { status: 429, message: "model is cooling down after a recent rate limit" };
     }
   }
 

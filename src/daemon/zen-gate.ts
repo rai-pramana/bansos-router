@@ -120,6 +120,23 @@ export function nextUtcMidnight(nowMs = Date.now()): number {
   return midnight - nowMs;
 }
 
+/**
+ * Read the zen probe lane's remaining closed window, in milliseconds.
+ *
+ * The marker is the only SURVIVOR of a daemon restart, so it is what keeps a
+ * daily free-tier park from being forgotten: the model's cooldown lives in
+ * memory, and without this the first request after every restart pays for the
+ * same already-known 429. Returns 0 when the lane is open (or on a frozen
+ * marker, whose window is not ours to interpret).
+ */
+export function zenQuotaClosedForMs(nowMs = Date.now()): number {
+  const marker = readMarker();
+  if (marker.freeze) return 0;
+  if (typeof marker.until !== "number") return 0;
+  const remaining = marker.until * 1000 - nowMs;
+  return remaining > 0 ? remaining : 0;
+}
+
 /** Test seam: the marker path the daemon and the gate script must agree on. */
 export function zenGateMarkerPath(): string {
   return MARKER;

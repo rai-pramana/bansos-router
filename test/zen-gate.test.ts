@@ -9,7 +9,7 @@ import test from "node:test";
 const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "zen-gate-test-"));
 process.env.BANSOS_DIR = path.join(TMP_HOME, ".bansos");
 
-const { noteZenQuotaExhausted, noteZenQuotaRecovered, nextUtcMidnight } = await import(
+const { noteZenQuotaExhausted, noteZenQuotaRecovered, nextUtcMidnight, zenQuotaClosedForMs } = await import(
   "../src/daemon/zen-gate"
 );
 
@@ -77,4 +77,37 @@ test("nextUtcMidnight lands on the next 00:00 UTC", () => {
   assert.equal(delta, 30 * 60_000);
   const iso = new Date(now + delta).toISOString();
   assert.equal(iso, "2026-10-25T00:00:00.000Z");
+});
+
+test("the closed window is readable so a restart does not forget the park", () => {
+  // The daemon's per-model park lives in memory; only this window survives a
+  // restart. It must report the REMAINING time, so boot code can re-park for
+  // exactly what is left instead of starting from zero (a wasted round trip)
+  // or from a fresh full day (a park that outlives the real refill).
+  // Prior tests can leave a FROZEN marker behind, which deliberately makes an
+  // exhaustion notice a no-op; start from a clean, unfrozen lane.
+  fs.rmSync(MARKER, { force: true });
+  noteZenQuotaExhausted(6 * 60 * 60_000, "restart test");
+  const remaining = zenQuotaClosedForMs();
+  // `until` is stored as ceil(epoch seconds), so a fresh window can read up to
+  // one second PAST the requested length; anything meaningfully longer would
+  // mean the window was re-stamped from now instead of from the refill moment.
+  assert.ok(remaining > 5.9 * 60 * 60_000 && remaining <= 6 * 60 * 60_000 + 1_000, `unexpected window ${remaining}`);
+
+  // Past the deadline it reports open, so the lane cannot stay closed forever.
+  assert.equal(zenQuotaClosedForMs(Date.now() + 7 * 60 * 60_000), 0);
+
+  // No marker at all is an open lane, not an error.
+  noteZenQuotaRecovered();
+  assert.equal(zenQuotaClosedForMs(), 0);
+});
+
+test("a human freeze leaves the closed-window question to the human", () => {
+  fs.mkdirSync(path.dirname(MARKER), { recursive: true });
+  fs.writeFileSync(MARKER, JSON.stringify({ until: 4102444800, freeze: true, reason: "human freeze" }));
+  // A freeze is a human decision, not a measured refill moment: reporting it as
+  // a closed window would let boot code re-park every zen model indefinitely.
+  assert.equal(zenQuotaClosedForMs(), 0);
+  noteZenQuotaRecovered();
+  fs.unlinkSync(MARKER);
 });

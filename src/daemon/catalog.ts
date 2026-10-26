@@ -38,6 +38,11 @@ export class RuntimeCatalog {
   // Why a model is parked, so a repeated request to it can repeat the upstream's
   // own rejection (message + status) instead of paying for the same round trip.
   private readonly parkReason = new Map<string, { status: number; message: string }>();
+  // Models parked by a DAILY free-tier exhaustion (as opposed to a burst rate
+  // limit or a policy refusal). Only these defer to the on-disk refill marker:
+  // a burst park is the daemon's own timing and must not be cleared just
+  // because no marker exists.
+  private readonly quotaParked = new Set<string>();
 
   constructor(
     upstreams: Upstream[],
@@ -109,6 +114,7 @@ export class RuntimeCatalog {
   markQuotaExhausted(id: string, retryAfterMs?: number, reason?: { status: number; message: string }): void {
     const ms = Math.min(Math.max(retryAfterMs ?? DEFAULT_COOLDOWN_MS, 1_000), QUOTA_COOLDOWN_MAX_MS);
     this.coolUntil.set(id, Date.now() + ms);
+    this.quotaParked.add(id);
     if (reason) this.parkReason.set(id, reason);
   }
 
@@ -129,9 +135,46 @@ export class RuntimeCatalog {
     return true;
   }
 
+  // Drop a park whose reason no longer holds (e.g. an expired zen gate marker),
+  // so the next request actually probes the upstream again.
+  clearPark(id: string): void {
+    this.coolUntil.delete(id);
+    this.parkReason.delete(id);
+    this.quotaParked.delete(id);
+  }
+
+  // True when this model's park came from a daily free-tier exhaustion, i.e.
+  // the on-disk refill marker — not the daemon's own burst timing — is the
+  // authority on when it may be probed again.
+  isQuotaParked(id: string): boolean {
+    return this.quotaParked.has(id);
+  }
+
   // The upstream rejection that parked this model, when one was recorded.
   parkMessage(id: string): { status: number; message: string } | undefined {
     return this.parkReason.get(id);
+  }
+
+  /**
+   * Re-park every zen model for a window that survived a restart.
+   *
+   * The per-model park lives in memory; the refill deadline on disk does not.
+   * Without this, a daemon restart (including `bansos-install-local`) forgets
+   * that the daily bucket is spent until the bucket is spent AGAIN — one paid
+   * round trip per model, per restart.
+   *
+   * Only models that are actually served by zen are touched, and an existing
+   * (longer) park is never shortened.
+   */
+  restoreZenPark(windowMs: number, now = Date.now()): void {
+    if (windowMs <= 0) return;
+    for (const model of this.models) {
+      if (model.source !== "zen") continue;
+      const until = this.coolUntil.get(model.id);
+      if (until !== undefined && until >= now + windowMs) continue;
+      this.coolUntil.set(model.id, now + windowMs);
+      this.quotaParked.add(model.id);
+    }
   }
 
   // Milliseconds left on a model's park, 0 when it is not parked. The daemon

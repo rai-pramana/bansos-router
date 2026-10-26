@@ -362,6 +362,39 @@ test("a quota-exhausted model is parked for the upstream's window, not 15 minute
   assert.equal(cat.isCoolingDown("zen-free", t0 + 7 * 60 * 60_000), false);
 });
 
+test("a restart re-parks only zen quota models, for the remaining window", () => {
+  // The per-model park is in memory and dies with the process; the refill
+  // deadline on disk survives. Boot must re-park from THAT, otherwise the first
+  // request after every restart pays for the same known 429.
+  const zen = md({ id: "zen-free", source: "zen" });
+  const kilo = md({ id: "kilo-free", source: "kilo" });
+  const cat = new RuntimeCatalog([fakeUpstream("zen"), fakeUpstream("kilo")], logger());
+  cat.seed([zen, kilo]);
+
+  const window = 5 * 60 * 60_000;
+  cat.restoreZenPark(window);
+
+  assert.equal(cat.isCoolingDown("zen-free"), true, "the zen model is re-parked");
+  assert.equal(cat.isQuotaParked("zen-free"), true, "and as a quota park, so the marker governs it");
+  assert.equal(cat.isCoolingDown("kilo-free"), false, "other upstreams are untouched");
+
+  // A window already known to be longer is never shortened.
+  const longer = new RuntimeCatalog([fakeUpstream("zen")], logger());
+  longer.seed([zen]);
+  longer.markQuotaExhausted("zen-free", 20 * 60 * 60_000);
+  longer.restoreZenPark(window);
+  assert.ok(
+    longer.cooldownRemaining("zen-free") > 19 * 60 * 60_000,
+    "a longer existing park survives the boot restore",
+  );
+
+  // A zero/expired window must not park anything.
+  const open = new RuntimeCatalog([fakeUpstream("zen")], logger());
+  open.seed([zen]);
+  open.restoreZenPark(0);
+  assert.equal(open.isCoolingDown("zen-free"), false);
+});
+
 test("a quota-exhausted 429 tells the client when to come back", async () => {
   const limited = await mockProvider(
     429,
