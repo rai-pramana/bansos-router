@@ -121,6 +121,15 @@ function normalizeName(name: string): string {
   return name.toLowerCase().replace(/[._]/g, "-");
 }
 
+// The gateway's own description of a model, used to build a catalog entry for
+// a mirror-only zen id.
+interface ModelMeta {
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  input?: ModelDef["input"];
+}
+
 export interface ZenMirrorHandle {
   upstream: Upstream;
   // zen id -> candidate mirror ids, best first
@@ -145,7 +154,7 @@ export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
   let modelIds: string[] = [];
   // The gateway's own metadata per model id, used to describe a mirror-only
   // zen id (one the upstream never listed, so the registry has no pin).
-  const modelMeta = new Map<string, { contextWindow?: number; maxTokens?: number; reasoning?: boolean; input?: string[] }>();
+  const modelMeta = new Map<string, ModelMeta>();
   let fetchedAt = 0;
   let inflight: Promise<void> | null = null;
 
@@ -162,7 +171,7 @@ export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
           id?: string;
           context_length?: number;
           max_completion_tokens?: number;
-          capabilities?: { reasoning?: boolean; vision?: boolean; tools?: boolean };
+          capabilities?: { reasoning?: boolean; vision?: boolean };
         }>;
       };
       const ids = (data.data ?? []).map((m) => m.id ?? "").filter(Boolean);
@@ -172,13 +181,11 @@ export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
         for (const m of data.data ?? []) {
           if (!m.id) continue;
           const caps = m.capabilities ?? {};
-          const input: string[] = ["text"];
-          if (caps.vision) input.push("image");
           modelMeta.set(m.id, {
             contextWindow: m.context_length,
             maxTokens: m.max_completion_tokens,
             reasoning: caps.reasoning === true,
-            input,
+            input: caps.vision ? ["text", "image"] : ["text"],
           });
         }
         fetchedAt = Date.now();
@@ -283,7 +290,7 @@ export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
         reasoning: meta.reasoning ?? false,
         contextWindow: meta.contextWindow ?? 200_000,
         maxTokens: meta.maxTokens ?? 32_768,
-        input: (meta.input ?? ["text"]) as ModelDef["input"],
+        input: meta.input ?? ["text"],
         compat: { supportsReasoningEffort: false, supportsDeveloperRole: false },
       });
     },

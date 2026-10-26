@@ -1969,20 +1969,17 @@ async function runChatForward(
       // The same applies when the upstream RETIRED the model (410
       // ModelDeprecated, or 400 "Model is unavailable"): that upstream will
       // never answer this id again, but a mirror still can, under the same id.
-      if (currentUpstream.id === "zen" && zenMirror) {
-        const zenRefused = upstreamRes.status === 429 || zenRetired;
-        if (zenRefused) {
-          const mirrored = await tryZenMirrorForParked(
-            current,
-            zenMirror,
-            sanitizedBody,
-            req,
-            log,
-            requestStartedAt,
-          );
-          if (mirrored) {
-            return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: "" };
-          }
+      if (currentUpstream.id === "zen" && zenMirror && (upstreamRes.status === 429 || zenRetired)) {
+        const mirrored = await tryZenMirrorForParked(
+          current,
+          zenMirror,
+          sanitizedBody,
+          req,
+          log,
+          requestStartedAt,
+        );
+        if (mirrored) {
+          return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: "" };
         }
       }
 

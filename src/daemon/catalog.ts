@@ -27,9 +27,6 @@ export interface RefreshReport {
   alive: number;
   dead: number;
   degraded: string[];
-  // Model ids that the upstream retired but that are still published here
-  // because a free mirror can serve them under the same id.
-  mirrored?: string[];
 }
 
 export class RuntimeCatalog {
