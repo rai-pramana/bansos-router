@@ -170,6 +170,30 @@ test("the mirror maps a zen id to a free counterpart and keeps the provider orde
   }
 });
 
+// Providers disagree on punctuation: kenari writes `flint-v1-0:free` where
+// orca writes `flint-v1.0:free`. Both are the same model, so both must be
+// found.
+test("the mirror matches a model across the provider's punctuation spelling", async () => {
+  const gateway = await startGateway(
+    ["kenari/flint-v1-0:free", "kenari/longcat-2-5-preview:free"],
+    {},
+  );
+  try {
+    const mirror = createZenMirror({
+      baseUrl: gateway.url,
+      providers: ["kenari"],
+    });
+    await mirror.ready();
+
+    assert.deepEqual(mirror.mirrorsFor("flint-40b-free"), ["kenari/flint-v1-0:free"]);
+    assert.deepEqual(mirror.mirrorsFor("longcat-2.5-preview-free"), [
+      "kenari/longcat-2-5-preview:free",
+    ]);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test("the mirror body carries the upstream's own id, not the zen id", async () => {
   const gateway = await startGateway(["unorouter/beam:free"], {
     "unorouter/beam:free": { status: 200, body: completion("PONG") },

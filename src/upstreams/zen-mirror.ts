@@ -93,15 +93,27 @@ export function zenMirrorIsFreeId(id: string): boolean {
 // WHOLE tail, not a prefix of a longer family: "deepseek-v4-flash-free" must
 // lose to "deepseek-v4.1-flash-free". The best-scoring stem wins, so a model
 // may have several acceptable spellings.
+//
+// Providers disagree on punctuation: kenari writes `flint-v1-0:free` where
+// zen writes `flint-40b-free` and orca writes `flint-v1.0:free`. Dots and
+// dashes are interchangeable in a model name, so both sides are normalised
+// before comparing — otherwise a provider's spelling of the same model is
+// simply not recognised.
 function score(tail: string, zenId: string): number {
-  const t = tail.toLowerCase();
+  const t = normalizeName(tail);
   let best = 10;
   for (const stem of MIRRORABLE.get(zenId) ?? [zenId]) {
-    const s = stem.toLowerCase();
+    const s = normalizeName(stem);
     const score = t === s ? 100 : t.startsWith(s) ? 80 : t.includes(s) ? 60 : 10;
     if (score > best) best = score;
   }
   return best;
+}
+
+// A model name with its punctuation flattened, so "flint-v1.0" and
+// "flint-v1-0" compare equal.
+function normalizeName(name: string): string {
+  return name.toLowerCase().replace(/[._]/g, "-");
 }
 
 export interface ZenMirrorHandle {
@@ -159,8 +171,8 @@ export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
           if (slash < 0) return false;
           if (id.slice(0, slash) !== provider) return false;
           if (!zenMirrorIsFreeId(id)) return false;
-          const tail = id.slice(slash + 1).toLowerCase();
-          return stems.some((s) => tail.includes(s.toLowerCase()));
+          const tail = normalizeName(id.slice(slash + 1));
+          return stems.some((s) => tail.includes(normalizeName(s)));
         });
         if (candidates.length === 0) continue;
         candidates.sort((a, b) => {
