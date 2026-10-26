@@ -8,8 +8,19 @@ import { restoreBridgedCalls } from "../protocols/tool-bridge";
 import { modelDef, type ModelDef, type Upstream } from "./types";
 
 // MITM-captured from real opencode CLI v2.1.3: POST https://opencode.ai/inference/openai/v1/chat/completions; the old /inference/v1/... path returns 429 for identical requests.
-const ZEN_INFERENCE_URL = "https://opencode.ai/inference/openai/v1";
-const ZEN_MODELS_URL = "https://opencode.ai/zen/v1";
+//
+// BANSOS_ZEN_BASE redirects the upstream at the local Bun sidecar
+// (127.0.0.1:17071), which speaks the same wire protocol over Bun's TLS
+// stack (BoringSSL). opencode.ai classifies clients by TLS fingerprint
+// (JA4): Bun matches the official OpenCode runtime, Node's OpenSSL does not.
+// Unset => direct upstream, exactly as before.
+//
+// The sidecar must understand BOTH inference paths: the upstream fix moved
+// to /inference/openai/v1, and the sidecar forwards whatever path it is
+// given.
+const ZEN_BASE = (process.env.BANSOS_ZEN_BASE?.trim() || "https://opencode.ai").replace(/\/+$/, "");
+const ZEN_INFERENCE_URL = `${ZEN_BASE}/inference/openai/v1`;
+const ZEN_MODELS_URL = `${ZEN_BASE}/zen/v1`;
 export const MODELS_DEV_URL = "https://models.dev/api.json";
 
 // UA of the real opencode CLI (binary: `opencode/${channel}/${version}/${name}`, e.g. opencode/latest/2.1.3/cli)
