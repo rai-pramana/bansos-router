@@ -129,6 +129,13 @@ export interface ZenMirrorHandle {
   ready(): Promise<void>;
   // the candidate mirror ids for a zen id, best first
   mirrorsFor(zenId: string): string[];
+  // A catalog entry for a zen id this mirror can serve.
+  //
+  // Most zen ids are pinned in the registry and the daemon uses that entry.
+  // Some ids are mirror-only: they exist as a free mirror but the upstream
+  // never listed them, so there is no pin to restore. Their entry is built
+  // from the gateway's own model metadata, so the daemon can publish them.
+  describe(zenId: string): ModelDef | undefined;
 }
 
 export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
@@ -136,6 +143,9 @@ export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
   const ttl = cfg.ttlMs ?? 10 * 60_000;
   const mirrors = new Map<string, string[]>();
   let modelIds: string[] = [];
+  // The gateway's own metadata per model id, used to describe a mirror-only
+  // zen id (one the upstream never listed, so the registry has no pin).
+  const modelMeta = new Map<string, { contextWindow?: number; maxTokens?: number; reasoning?: boolean; input?: string[] }>();
   let fetchedAt = 0;
   let inflight: Promise<void> | null = null;
 
@@ -147,10 +157,30 @@ export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
         signal: AbortSignal.timeout(15_000),
       });
       if (!res.ok) return modelIds;
-      const data = (await res.json()) as { data?: Array<{ id?: string }> };
+      const data = (await res.json()) as {
+        data?: Array<{
+          id?: string;
+          context_length?: number;
+          max_completion_tokens?: number;
+          capabilities?: { reasoning?: boolean; vision?: boolean; tools?: boolean };
+        }>;
+      };
       const ids = (data.data ?? []).map((m) => m.id ?? "").filter(Boolean);
       if (ids.length > 0) {
         modelIds = ids;
+        modelMeta.clear();
+        for (const m of data.data ?? []) {
+          if (!m.id) continue;
+          const caps = m.capabilities ?? {};
+          const input: string[] = ["text"];
+          if (caps.vision) input.push("image");
+          modelMeta.set(m.id, {
+            contextWindow: m.context_length,
+            maxTokens: m.max_completion_tokens,
+            reasoning: caps.reasoning === true,
+            input,
+          });
+        }
         fetchedAt = Date.now();
       }
       return modelIds;
@@ -239,6 +269,24 @@ export function createZenMirror(cfg: ZenMirrorConfig): ZenMirrorHandle {
     mirrors,
     ready,
     mirrorsFor: (zenId: string) => mirrors.get(zenId) ?? [],
+    describe: (zenId: string): ModelDef | undefined => {
+      const candidates = mirrors.get(zenId);
+      if (!candidates || candidates.length === 0) return undefined;
+      // The first candidate is the best match; its metadata describes the
+      // model. A missing field falls back to a conservative default, so an
+      // incomplete gateway entry still yields a usable catalog row.
+      const meta = modelMeta.get(candidates[0]!) ?? {};
+      return modelDef({
+        id: zenId,
+        name: zenId,
+        source: "zen",
+        reasoning: meta.reasoning ?? false,
+        contextWindow: meta.contextWindow ?? 200_000,
+        maxTokens: meta.maxTokens ?? 32_768,
+        input: (meta.input ?? ["text"]) as ModelDef["input"],
+        compat: { supportsReasoningEffort: false, supportsDeveloperRole: false },
+      });
+    },
   };
 }
 

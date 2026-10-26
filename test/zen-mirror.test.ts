@@ -90,7 +90,13 @@ const completion = (content: string, model = "upstream-model") => ({
 // A bansos daemon whose only upstream is a zen upstream that always reports
 // its daily free pool as spent. Every request must therefore be answered by
 // the mirror.
-async function startZenDaemon(zenModelId: string) {
+//
+// `zenAnswer` overrides what the zen upstream replies with, so a test can
+// model the other upstream verdicts (a retired model answers 410).
+async function startZenDaemon(
+  zenModelId: string,
+  zenAnswer?: { status: number; body: unknown },
+) {
   const zenUpstream: Upstream = {
     id: "zen",
     kind: "remote-keyless",
@@ -106,8 +112,12 @@ async function startZenDaemon(zenModelId: string) {
   const server = http.createServer((req, res) => {
     req.on("data", () => {});
     req.on("end", () => {
-      res.writeHead(429, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { message: "Free usage limit reached" } }));
+      const answer = zenAnswer ?? {
+        status: 429,
+        body: { error: { message: "Free usage limit reached" } },
+      };
+      res.writeHead(answer.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(answer.body));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -483,6 +493,239 @@ test("a mirror that answers with SSE while the client wants JSON is reassembled"
     setZenMirror(null);
     await new Promise<void>((resolve) => bansos.close(() => resolve()));
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    await gateway.close();
+  }
+});
+
+// The upstream RETIRED the model id: it answers 410 ModelDeprecated and will
+// never answer it again. A mirror still serves the SAME id from another
+// transport, so the client must get the mirror's answer under the zen id —
+// not a 410.
+test("a retired zen model (410) is answered by the mirror under the same id", async () => {
+  const gateway = await startGateway(["kenari/muse-spark-1-3-contributor:free"], {
+    "kenari/muse-spark-1-3-contributor:free": {
+      status: 200,
+      body: completion("PONG", "rewritten-upstream-id"),
+    },
+  });
+  const { bansos, bport, server } = await startZenDaemon("muse-spark-1.3-contributor-free", {
+    status: 410,
+    body: {
+      type: "error",
+      error: {
+        type: "ModelDeprecated",
+        message: "Model muse-spark-1.3-contributor-free has been deprecated.",
+      },
+    },
+  });
+
+  try {
+    const mirror = createZenMirror({
+      baseUrl: gateway.url,
+      providers: ["kenari"],
+    });
+    await mirror.ready();
+    setZenMirror(mirror);
+
+    const res = await fetch(`http://127.0.0.1:${bport}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "muse-spark-1.3-contributor-free",
+        messages: [{ role: "user", content: "Reply PONG" }],
+        max_tokens: 32,
+      }),
+    });
+    assert.equal(res.status, 200, "a retired model must not surface as 410");
+    const json = (await res.json()) as { model?: string; choices?: Array<{ message: { content: string } }> };
+    assert.equal(json.model, "muse-spark-1.3-contributor-free", "the client gets the zen id back");
+    assert.equal(json.choices?.[0]?.message.content, "PONG");
+    assert.equal(gateway.requests[0]?.model, "kenari/muse-spark-1-3-contributor:free");
+  } finally {
+    setZenMirror(null);
+    await new Promise<void>((resolve) => bansos.close(() => resolve()));
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await gateway.close();
+  }
+});
+
+// The upstream retires a model with a 400 whose body names the model as
+// unavailable. That is a retirement, not a malformed request, so the mirror
+// takes the request.
+test("a retired zen model (400 Model is unavailable) is answered by the mirror", async () => {
+  const gateway = await startGateway(["unorouter/nemotron-3-ultra-550b-a55b:free"], {
+    "unorouter/nemotron-3-ultra-550b-a55b:free": { status: 200, body: completion("PONG") },
+  });
+  const { bansos, bport, server } = await startZenDaemon("nemotron-3-ultra-free", {
+    status: 400,
+    body: { error: { type: "server_error", message: "Upstream request failed: Model is unavailable." } },
+  });
+
+  try {
+    const mirror = createZenMirror({ baseUrl: gateway.url, providers: ["unorouter"] });
+    await mirror.ready();
+    setZenMirror(mirror);
+
+    const res = await fetch(`http://127.0.0.1:${bport}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "nemotron-3-ultra-free",
+        messages: [{ role: "user", content: "Reply PONG" }],
+        max_tokens: 32,
+      }),
+    });
+    assert.equal(res.status, 200);
+    const json = (await res.json()) as { model?: string; choices?: Array<{ message: { content: string } }> };
+    assert.equal(json.model, "nemotron-3-ultra-free");
+    assert.equal(json.choices?.[0]?.message.content, "PONG");
+  } finally {
+    setZenMirror(null);
+    await new Promise<void>((resolve) => bansos.close(() => resolve()));
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await gateway.close();
+  }
+});
+
+// The upstream retired the model, so asking it again buys the same rejection.
+// The second request must go straight to the mirror without re-probing the
+// upstream.
+test("a model the upstream retired is not probed again on the next request", async () => {
+  const gateway = await startGateway(["kenari/muse-spark-1-3-contributor:free"], {
+    "kenari/muse-spark-1-3-contributor:free": { status: 200, body: completion("PONG") },
+  });
+  let zenHits = 0;
+  const { bansos, bport, server } = await startZenDaemon("muse-spark-1.3-contributor-free", {
+    status: 410,
+    body: {
+      type: "error",
+      error: { type: "ModelDeprecated", message: "Model has been deprecated." },
+    },
+  });
+  // count the upstream hits
+  const zenServer = server;
+  zenServer.prependListener("request", () => {
+    zenHits++;
+  });
+
+  try {
+    const mirror = createZenMirror({ baseUrl: gateway.url, providers: ["kenari"] });
+    await mirror.ready();
+    setZenMirror(mirror);
+
+    const body = JSON.stringify({
+      model: "muse-spark-1.3-contributor-free",
+      messages: [{ role: "user", content: "Reply PONG" }],
+      max_tokens: 32,
+    });
+    const first = await fetch(`http://127.0.0.1:${bport}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    assert.equal(first.status, 200);
+    const hitsAfterFirst = zenHits;
+
+    const second = await fetch(`http://127.0.0.1:${bport}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    assert.equal(second.status, 200);
+    assert.equal(zenHits, hitsAfterFirst, "the retired upstream must not be asked again");
+  } finally {
+    setZenMirror(null);
+    await new Promise<void>((resolve) => bansos.close(() => resolve()));
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await gateway.close();
+  }
+});
+
+// A model the upstream retired but a mirror serves under the SAME id stays
+// published. The catalog drops retired ids on every refresh, so without this
+// the id comes back as "unknown model" and the working lane dies.
+test("a retired model id stays in the catalog when a mirror serves it", async () => {
+  const upstream: Upstream = {
+    id: "zen",
+    kind: "remote-keyless",
+    relayAllowed: false,
+    chatUrl: "https://example.invalid/chat/completions",
+    async fetchCatalog() {
+      // the upstream no longer lists the retired id
+      return [md("beam-free", "zen")];
+    },
+    requestHeaders: () => ({}),
+  };
+  const catalog = new RuntimeCatalog([upstream], logger(), normalizeSecurityConfig(undefined));
+  catalog.seed([md("beam-free", "zen"), md("muse-spark-1.3-contributor-free", "zen")]);
+
+  // the mirror declares it serves the retired id
+  catalog.setMirroredModels(["muse-spark-1.3-contributor-free"]);
+
+  await catalog.refresh();
+  assert.equal(
+    catalog.resolve("muse-spark-1.3-contributor-free")?.id,
+    "muse-spark-1.3-contributor-free",
+    "a mirror-backed retired id must stay published",
+  );
+
+  // a retired id with NO mirror is still dropped
+  catalog.setMirroredModels([]);
+  await catalog.refresh();
+  assert.equal(
+    catalog.resolve("muse-spark-1.3-contributor-free"),
+    undefined,
+    "an id with no mirror must still be dropped",
+  );
+});
+
+// Some ids are mirror-only: the upstream never listed them, so the registry
+// has no pin, but a free mirror serves them under the same id. Without an
+// entry built from the gateway's own metadata the id stays unknown and every
+// request for it fails with "unknown model" (observed: the MoA aggregator
+// `minimax-m3.1-flash-free`).
+test("a mirror-only id is published even though the upstream never listed it", async () => {
+  const gateway = await startGateway(["apinex/free/minimax-m3.1-flash"], {
+    "apinex/free/minimax-m3.1-flash": { status: 200, body: completion("PONG") },
+  });
+  try {
+    const mirror = createZenMirror({ baseUrl: gateway.url, providers: ["apinex"] });
+    await mirror.ready();
+    assert.deepEqual(mirror.mirrorsFor("minimax-m3.1-flash-free"), [
+      "apinex/free/minimax-m3.1-flash",
+    ]);
+    const described = mirror.describe("minimax-m3.1-flash-free");
+    assert.equal(described?.id, "minimax-m3.1-flash-free");
+    assert.equal(described?.source, "zen");
+
+    // the catalog publishes it even with no pin for it
+    const upstream: Upstream = {
+      id: "zen",
+      kind: "remote-keyless",
+      relayAllowed: false,
+      chatUrl: "https://example.invalid/chat/completions",
+      async fetchCatalog() {
+        return [md("beam-free", "zen")];
+      },
+      requestHeaders: () => ({}),
+    };
+    const catalog = new RuntimeCatalog([upstream], logger(), normalizeSecurityConfig(undefined));
+    catalog.seed([md("beam-free", "zen")]);
+    catalog.setMirroredModels(mirror.mirrors.keys(), (id) => mirror.describe(id));
+    assert.equal(
+      catalog.resolve("minimax-m3.1-flash-free")?.id,
+      "minimax-m3.1-flash-free",
+      "a mirror-only id must be published",
+    );
+
+    // and a refresh keeps it published
+    await catalog.refresh();
+    assert.equal(
+      catalog.resolve("minimax-m3.1-flash-free")?.id,
+      "minimax-m3.1-flash-free",
+      "a refresh must not drop a mirror-only id",
+    );
+  } finally {
     await gateway.close();
   }
 });

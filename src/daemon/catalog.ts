@@ -27,6 +27,9 @@ export interface RefreshReport {
   alive: number;
   dead: number;
   degraded: string[];
+  // Model ids that the upstream retired but that are still published here
+  // because a free mirror can serve them under the same id.
+  mirrored?: string[];
 }
 
 export class RuntimeCatalog {
@@ -35,6 +38,21 @@ export class RuntimeCatalog {
   private readonly upstreams: Upstream[];
   private refreshInFlight: Promise<RefreshReport> | null = null;
   private readonly coolUntil = new Map<string, number>();
+  // The pinned registry, kept so a model the upstream retired can be
+  // published again when a mirror takes it over.
+  private readonly pins = new Map<string, ModelDef>();
+  // Model ids a free mirror can serve under the SAME id. The upstream may
+  // retire such an id (410 ModelDeprecated) while the mirror still answers
+  // it, so the catalog keeps publishing it instead of dropping it as
+  // unknown. The client asked for this id and the mirror answers under it.
+  private readonly mirrored = new Set<string>();
+  // The catalog entry used for each mirror-backed id, so a refresh can
+  // re-publish it after the upstream dropped it.
+  private readonly mirrorDefs = new Map<string, ModelDef>();
+  // Model ids the upstream retired (410 / "Model is unavailable"). Asking
+  // that upstream again only buys the same rejection, so the request goes
+  // straight to the mirror while the id stays published.
+  private readonly retired = new Set<string>();
   // Why a model is parked, so a repeated request to it can repeat the upstream's
   // own rejection (message + status) instead of paying for the same round trip.
   private readonly parkReason = new Map<string, { status: number; message: string }>();
@@ -63,7 +81,49 @@ export class RuntimeCatalog {
 
   // seed the pinned registry so the daemon works before any network call
   seed(models: ModelDef[]): void {
-    for (const m of models) this.byId.set(m.id, m);
+    for (const m of models) {
+      this.byId.set(m.id, m);
+      this.pins.set(m.id, m);
+    }
+  }
+
+  // Declare which ids a free mirror can serve under the same id.
+  //
+  // A retired upstream id stays published when the mirror takes it over: the
+  // mirror answers the SAME id from a different transport with its own quota,
+  // so the id is not dead — only that upstream's copy of it is. Any such id
+  // the upstream has already dropped is published again from the pins.
+  //
+  // `describe` supplies the entry for a mirror-only id: one the upstream never
+  // listed, so the registry has no pin for it. Without such an entry the id
+  // stays unknown and every request for it fails with "unknown model".
+  setMirroredModels(ids: Iterable<string>, describe?: (id: string) => ModelDef | undefined): void {
+    this.mirrored.clear();
+    for (const id of ids) this.mirrored.add(id);
+    for (const id of this.mirrored) {
+      // The entry is remembered even when the id is already published: a
+      // later refresh drops it (the upstream no longer lists it), and the
+      // remembered entry is what puts it back.
+      const entry = this.byId.get(id) ?? this.pins.get(id) ?? describe?.(id);
+      if (!entry) continue;
+      this.mirrorDefs.set(id, entry);
+      if (!this.byId.has(id)) this.byId.set(id, entry);
+    }
+  }
+
+  // The ids a mirror can serve, and that are published here.
+  get mirroredIds(): string[] {
+    return [...this.mirrored].filter((id) => this.byId.has(id));
+  }
+
+  // Remember that the upstream retired this id, so the next request skips
+  // that upstream instead of paying for the same rejection again.
+  markRetired(id: string): void {
+    this.retired.add(id);
+  }
+
+  isRetired(id: string): boolean {
+    return this.retired.has(id);
   }
 
   // the last live pass is a better offline seed than the build-time pins: a cold
@@ -80,7 +140,12 @@ export class RuntimeCatalog {
     // come back alongside it (muse-spark, space-bunny, ...)
     const covered = new Set(saved.models.map((m) => m.source));
     for (const [id, m] of this.byId) {
-      if (covered.has(m.source) && !saved.models.some((s) => s.id === id)) this.byId.delete(id);
+      if (covered.has(m.source) && !saved.models.some((s) => s.id === id)) {
+        // A mirror-backed id stays: the snapshot predates the retirement, and
+        // the mirror still answers this id.
+        if (this.mirrored.has(id)) continue;
+        this.byId.delete(id);
+      }
     }
     this.log.info(`catalog snapshot: ${saved.models.length} model(s) from the last live pass`);
     return true;
@@ -266,5 +331,20 @@ export class RuntimeCatalog {
       if (m.source === source) this.byId.delete(id);
     }
     for (const m of models) this.byId.set(m.id, m);
+    // A model the upstream retired but a mirror can serve under the SAME id
+    // stays published. The upstream's copy is gone, but the id is not: the
+    // mirror answers it from a different transport with its own quota, so
+    // dropping it here would turn a working lane into "unknown model".
+    for (const id of this.mirrored) {
+      if (this.byId.has(id)) continue;
+      const entry = this.mirrorDefs.get(id);
+      if (entry) {
+        this.byId.set(id, entry);
+        this.log.info(`catalog: keeping retired model id, a mirror serves it`, {
+          model: id,
+          source,
+        });
+      }
+    }
   }
 }

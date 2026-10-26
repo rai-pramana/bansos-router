@@ -1025,6 +1025,12 @@ export function hasImageInput(body: unknown): boolean {
 
 export const TOOLS_UNSUPPORTED_RE = /(does not|doesn't|not) support(s)? (tools|tool use|tool calls|function calling)|support tool use/i;
 
+// The upstream retired this model id: it will never answer it again, so the
+// request belongs to a mirror that still serves the same id. Zen answers a
+// retired id with 410 ModelDeprecated, or with a 400 whose body names the
+// model as unavailable.
+export const ZEN_MODEL_RETIRED_RE = /ModelDeprecated|Model is unavailable|model is not available|deprecated/i;
+
 // some upstreams answer 200 and then put the failure in the first SSE frame
 export async function peekStreamError(
   res: Response,
@@ -1607,6 +1613,23 @@ async function runChatForward(
 
   const requestStartedAt = Date.now();
   const relay = loadRelayState();
+  // An upstream that RETIRED this model id will never answer it again, and a
+  // mirror serves the SAME id from another transport. So a known retirement
+  // goes straight to the mirror: asking the upstream again would only buy
+  // the same rejection.
+  if (catalog.isRetired(model.id) && zenMirror && upstream.id === "zen") {
+    const mirrored = await tryZenMirrorForParked(
+      model,
+      zenMirror,
+      sanitizedBody,
+      req,
+      log,
+      requestStartedAt,
+    );
+    if (mirrored) {
+      return { response: mirrored, model, upstream: zenMirror.upstream, relay: "" };
+    }
+  }
   // Which egress served this request. The watchdog can only attribute failures
   // to a relay if the event says which relay was in use, otherwise it sees
   // "upstream=zen failed" and cannot tell a gated relay from a gated upstream.
@@ -1865,6 +1888,14 @@ async function runChatForward(
       const refused = upstreamRes.status === 401 || upstreamRes.status === 403;
       const capabilityRejected =
         (needsTools && TOOLS_UNSUPPORTED_RE.test(errorMsg)) || (needsVision && VISION_UNSUPPORTED_RE.test(errorMsg));
+      // The upstream retired this model id. It will never answer it again, so
+      // the request belongs to the mirror that still serves the SAME id. This
+      // is checked before the transient verdict because a retirement is not
+      // transient — a 410 would otherwise return straight to the client.
+      const zenRetired =
+        currentUpstream.id === "zen" &&
+        (upstreamRes.status === 410 ||
+          (upstreamRes.status === 400 && ZEN_MODEL_RETIRED_RE.test(errorMsg)));
       const transient = refused || capabilityRejected || upstreamRes.status === 429 || upstreamRes.status >= 500;
       // Seconds the client should wait before retrying this model, taken from
       // the upstream's Retry-After. Kept even when failover finds a
@@ -1873,7 +1904,7 @@ async function runChatForward(
         upstreamRes.status === 429
           ? parseRetryAfterMs(upstreamRes.headers.get("retry-after")) ?? retryAfterFromMessage(errorMsg)
           : undefined;
-      if (!transient) {
+      if (!transient && !zenRetired) {
         log.warn("upstream rejected", {
           model: current.id,
           upstream: currentUpstream.id,
@@ -1882,6 +1913,19 @@ async function runChatForward(
           upstreamError: errorMsg,
         });
         return { status: upstreamRes.status, message: errorMsg, relay: servingRelay };
+      }
+
+      if (zenRetired) {
+        // Remember it: the next request goes straight to the mirror instead of
+        // paying for the same rejection again.
+        catalog.markRetired(current.id);
+        log.warn("upstream retired the model - handing it to the mirror", {
+          model: current.id,
+          upstream: currentUpstream.id,
+          status: upstreamRes.status,
+          durationMs: Date.now() - requestStartedAt,
+          upstreamError: errorMsg,
+        });
       }
 
       if (refused) {
@@ -1921,17 +1965,24 @@ async function runChatForward(
       // answered by a different free transport. This is not failover to a
       // substitute model — the client asked for "beam-free" and gets an
       // answer for "beam-free", from an upstream that still has room.
-      if (currentUpstream.id === "zen" && upstreamRes.status === 429 && zenMirror) {
-        const mirrored = await tryZenMirrorForParked(
-          current,
-          zenMirror,
-          sanitizedBody,
-          req,
-          log,
-          requestStartedAt,
-        );
-        if (mirrored) {
-          return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: "" };
+      //
+      // The same applies when the upstream RETIRED the model (410
+      // ModelDeprecated, or 400 "Model is unavailable"): that upstream will
+      // never answer this id again, but a mirror still can, under the same id.
+      if (currentUpstream.id === "zen" && zenMirror) {
+        const zenRefused = upstreamRes.status === 429 || zenRetired;
+        if (zenRefused) {
+          const mirrored = await tryZenMirrorForParked(
+            current,
+            zenMirror,
+            sanitizedBody,
+            req,
+            log,
+            requestStartedAt,
+          );
+          if (mirrored) {
+            return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: "" };
+          }
         }
       }
 

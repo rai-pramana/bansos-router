@@ -153,6 +153,15 @@ function startServer(
         models: [...mirror.mirrors.keys()].length,
         mirrors: Object.fromEntries(mirror.mirrors),
       });
+      // A model the upstream retired but a mirror still serves under the SAME
+      // id stays published. The catalog drops retired ids on every refresh,
+      // so this must be re-declared after each refresh — otherwise the id
+      // disappears from the catalog and comes back as "unknown model".
+      catalog.setMirroredModels(mirror.mirrors.keys(), (id) => mirror.describe(id));
+      const kept = catalog.mirroredIds;
+      if (kept.length > 0) {
+        log.info("catalog: mirror-backed model ids published", { models: kept });
+      }
     });
   }
 
