@@ -133,6 +133,10 @@ test("zenMirrorIsFreeId accepts the free spellings and rejects paid ones", () =>
   assert.equal(zenMirrorIsFreeId("unorouter/beam:free"), true);
   assert.equal(zenMirrorIsFreeId("orca/z-ai/glm-5.3-flash"), false);
   assert.equal(zenMirrorIsFreeId("beam-free"), false, "an id without a provider prefix is not a gateway id");
+  // a provider may namespace its free tier INSIDE the path, not just suffix
+  // the model name
+  assert.equal(zenMirrorIsFreeId("apinex/free/mimo-v2.6-pro"), true);
+  assert.equal(zenMirrorIsFreeId("apinex/mimo-v2.6-pro"), false);
 });
 
 test("the mirror maps a zen id to a free counterpart and keeps the provider order", async () => {

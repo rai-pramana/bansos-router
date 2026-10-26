@@ -48,7 +48,11 @@ const MIRRORABLE = new Map<string, string[]>([
   ["beam-free", ["beam"]],
   ["deepseek-v4.1-flash-free", ["deepseek-v4.1-flash"]],
   ["glm-5.3-flash-free", ["glm-5.3-flash"]],
-  ["mimo-v2.6-flash-free", ["mimo-v2.6-flash"]],
+  // The zen flash id has no free mirror of its own: every `mimo-v2.6-flash`
+  // free id answers 402 "subscription only". The pro model is the same
+  // family with a different tier, and it does have free quota — so the
+  // stem list carries both, best first.
+  ["mimo-v2.6-flash-free", ["mimo-v2.6-flash", "mimo-v2.6-pro"]],
   ["nemotron-3.5-super-vl-free", ["nemotron-3.5-super-vl"]],
   ["nemotron-3.5-lightning-free", ["nemotron-3.5-lightning"]],
   ["flint-40b-free", ["flint-v1.0", "flint-40b"]],
@@ -71,21 +75,33 @@ const MIRRORABLE = new Map<string, string[]>([
 export const ZEN_MIRROR_REFUSAL =
   /prevent abuse|free resources|rate limit|try again|exceeded|quota|not available/i;
 
+// Is this gateway id a free one?
+//
+// The free marker is not always the last segment: a provider may namespace
+// its free tier inside the path (`apinex/free/mimo-v2.6-pro`), not just
+// suffix the model name (`unorouter/beam:free`, `orca/…-flash-free`). So
+// every segment is checked, not just the tail.
 export function zenMirrorIsFreeId(id: string): boolean {
-  const tail = id.split("/").slice(1).join("/");
-  return /:free$|-free$|\/free$/.test(tail) || /:free/.test(tail);
+  const segments = id.split("/");
+  // A gateway id always carries a provider prefix; an id without one is not
+  // a gateway id at all and must never be treated as a free mirror.
+  if (segments.length < 2) return false;
+  return segments.some((segment) => /:free$|-free$|^free$/.test(segment));
 }
 
 // How well a candidate matches the zen model. The family stem must match the
 // WHOLE tail, not a prefix of a longer family: "deepseek-v4-flash-free" must
-// lose to "deepseek-v4.1-flash-free".
+// lose to "deepseek-v4.1-flash-free". The best-scoring stem wins, so a model
+// may have several acceptable spellings.
 function score(tail: string, zenId: string): number {
-  const stem = (MIRRORABLE.get(zenId) ?? [zenId])[0]!.toLowerCase();
   const t = tail.toLowerCase();
-  if (t === stem) return 100;
-  if (t.startsWith(stem)) return 80;
-  if (t.includes(stem)) return 60;
-  return 10;
+  let best = 10;
+  for (const stem of MIRRORABLE.get(zenId) ?? [zenId]) {
+    const s = stem.toLowerCase();
+    const score = t === s ? 100 : t.startsWith(s) ? 80 : t.includes(s) ? 60 : 10;
+    if (score > best) best = score;
+  }
+  return best;
 }
 
 export interface ZenMirrorHandle {
