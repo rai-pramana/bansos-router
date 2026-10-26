@@ -166,7 +166,7 @@ export class RuntimeCatalog {
    * Only models that are actually served by zen are touched, and an existing
    * (longer) park is never shortened.
    */
-  restoreZenPark(windowMs: number, now = Date.now()): void {
+  restoreZenPark(windowMs: number, reason?: string, now = Date.now()): void {
     if (windowMs <= 0) return;
     for (const model of this.models) {
       if (model.source !== "zen") continue;
@@ -174,6 +174,9 @@ export class RuntimeCatalog {
       if (until !== undefined && until >= now + windowMs) continue;
       this.coolUntil.set(model.id, now + windowMs);
       this.quotaParked.add(model.id);
+      // Carry the recorded reason so a repeat request still explains WHY,
+      // instead of falling back to the generic cooldown sentence.
+      if (reason) this.parkReason.set(model.id, { status: 429, message: reason });
     }
   }
 

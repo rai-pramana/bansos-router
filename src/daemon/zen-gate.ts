@@ -137,6 +137,13 @@ export function zenQuotaClosedForMs(nowMs = Date.now()): number {
   return remaining > 0 ? remaining : 0;
 }
 
+/** The refill reason recorded on disk, for a repeat request to quote verbatim. */
+export function zenQuotaReason(): string | undefined {
+  const marker = readMarker();
+  if (marker.freeze) return undefined;
+  return typeof marker.reason === "string" && marker.reason ? marker.reason : undefined;
+}
+
 /** Test seam: the marker path the daemon and the gate script must agree on. */
 export function zenGateMarkerPath(): string {
   return MARKER;

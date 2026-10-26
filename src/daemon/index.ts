@@ -23,7 +23,7 @@ import { RuntimeCatalog } from "./catalog";
 import { RateLimiter } from "./rate-limit";
 import { ActivityStore } from "./activity";
 import { createServer } from "./server";
-import { zenQuotaClosedForMs } from "./zen-gate";
+import { zenQuotaClosedForMs, zenQuotaReason } from "./zen-gate";
 import { shutdownServer, SHUTDOWN_GRACE_MS } from "./shutdown";
 
 export const DEFAULT_PORT = 17070;
@@ -145,7 +145,7 @@ function startServer(
   catalog.loadSnapshot();
   // A zen daily park outlives the process: the refill deadline is on disk, so
   // the first request after a restart must not pay for the same known 429.
-  catalog.restoreZenPark(zenQuotaClosedForMs());
+  catalog.restoreZenPark(zenQuotaClosedForMs(), zenQuotaReason());
 
   const startedAt = Date.now();
   const rateLimiter = new RateLimiter({
