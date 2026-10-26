@@ -53,6 +53,12 @@ const MIRRORABLE = new Map<string, string[]>([
   // family with a different tier, and it does have free quota — so the
   // stem list carries both, best first.
   ["mimo-v2.6-flash-free", ["mimo-v2.6-flash", "mimo-v2.6-pro"]],
+  // `big-pickle` is the stealth name for the same underlying model as
+  // `mimo-v2.6-flash-free` — identical tokenizer fingerprints (587/594/700
+  // prompt tokens on three fixed strings) and the same self-identification.
+  // It is therefore served by the same free mirrors, and the zen id stays
+  // the client's contract.
+  ["big-pickle", ["big-pickle", "mimo-v2.6-flash", "mimo-v2.6-pro"]],
   ["nemotron-3.5-super-vl-free", ["nemotron-3.5-super-vl"]],
   ["nemotron-3.5-lightning-free", ["nemotron-3.5-lightning"]],
   ["flint-40b-free", ["flint-v1.0", "flint-40b"]],
@@ -63,7 +69,6 @@ const MIRRORABLE = new Map<string, string[]>([
   ["cat-jam-free", ["cat-jam"]],
   // Zen-exclusive models. No free mirror exists today, but keeping them in the
   // map costs nothing and picks them up the moment a provider offers one.
-  ["big-pickle", ["big-pickle"]],
   ["nemotron-3-ultra-free", ["nemotron-3-ultra"]],
   ["step-5-preview-free", ["step-5-preview"]],
 ]);

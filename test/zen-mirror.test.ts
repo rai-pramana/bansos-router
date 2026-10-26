@@ -194,6 +194,32 @@ test("the mirror matches a model across the provider's punctuation spelling", as
   }
 });
 
+// `big-pickle` is the stealth name for the same underlying model as
+// `mimo-v2.6-flash-free` (identical tokenizer fingerprints on three fixed
+// strings), so it is served by the same free mirrors.
+test("the mirror serves the big-pickle stealth id through the mimo mirrors", async () => {
+  const gateway = await startGateway(
+    ["unorouter/mimo-v2.6-flash:free", "apinex/free/mimo-v2.6-pro", "nilovr/big-pickle"],
+    {},
+  );
+  try {
+    const mirror = createZenMirror({
+      baseUrl: gateway.url,
+      providers: ["unorouter", "apinex", "nilovr"],
+    });
+    await mirror.ready();
+
+    assert.deepEqual(mirror.mirrorsFor("big-pickle"), [
+      "unorouter/mimo-v2.6-flash:free",
+      "apinex/free/mimo-v2.6-pro",
+    ]);
+    // an id without a free marker is never a mirror
+    assert.equal(mirror.mirrorsFor("big-pickle").includes("nilovr/big-pickle"), false);
+  } finally {
+    await gateway.close();
+  }
+});
+
 test("the mirror body carries the upstream's own id, not the zen id", async () => {
   const gateway = await startGateway(["unorouter/beam:free"], {
     "unorouter/beam:free": { status: 200, body: completion("PONG") },
