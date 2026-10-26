@@ -149,8 +149,14 @@ test("Relay Egress: a body over 1 KB is gzipped on the wire and still arrives as
     );
     assert.ok(req.decoded.includes("Hello relay"), "decoded body must be the original JSON");
     // the relay must be able to parse it back into a request
-    const parsed = JSON.parse(req.decoded) as { messages: Array<{ content: string }> };
-    assert.ok(parsed.messages[0]?.content.includes("Hello relay"));
+    const parsed = JSON.parse(req.decoded) as { messages: Array<{ role: string; content: string }> };
+    // The zen upstream transform may inject a system message (the `<env>` block
+    // the free-tier gate requires), so the user content is not necessarily at
+    // index 0. Assert the content survived the round trip, wherever it landed.
+    assert.ok(
+      parsed.messages.some((m) => m.content.includes("Hello relay")),
+      "user content must survive the gzip round trip",
+    );
   } finally {
     saveRelayState(original);
     resetGzipCache();
