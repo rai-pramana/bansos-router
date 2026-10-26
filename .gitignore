@@ -8,3 +8,4 @@ dist/
 
 # Hermes agent environment descriptor (local tooling, not source)
 .hermes/
+/site/
