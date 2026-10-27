@@ -143,7 +143,16 @@ function startServer(
   // The zen mirror answers a zen model id from another free upstream when
   // opencode.ai's daily pool is spent. It is a transport, not a catalog
   // source, so it is not part of `upstreams`.
-  const mirror = config.zenMirror ? createZenMirror(config.zenMirror) : null;
+  //
+  // BANSOS_ZEN_MIRROR=0 disables the mirror entirely. The user asked for a
+  // PURE opencode-zen lane: a zen id must be answered by opencode.ai or fail,
+  // never by a different provider under the same id. BANSOS_ZEN_FAILOVER=0
+  // keeps the mirror registered but refuses the per-request fallback, so the
+  // catalog still publishes the id while the answer stays on the zen lane.
+  const mirrorEnabled = !["0", "false", "off", "no"].includes(
+    (process.env.BANSOS_ZEN_MIRROR ?? "").trim().toLowerCase(),
+  );
+  const mirror = config.zenMirror && mirrorEnabled ? createZenMirror(config.zenMirror) : null;
   setZenMirror(mirror);
   if (mirror) {
     // Resolve once at startup so the first zen request that hits the closed

@@ -1613,11 +1613,18 @@ async function runChatForward(
 
   const requestStartedAt = Date.now();
   const relay = loadRelayState();
+  // BANSOS_ZEN_FAILOVER=0 keeps the zen lane PURE: a zen id is answered by
+  // opencode.ai or the call fails. The mirror stays registered (so the catalog
+  // still publishes the id) but it may not take the request. This is the
+  // operator-level switch; the per-request header below still works.
+  const zenFailoverAllowed = !["0", "false", "off", "no"].includes(
+    (process.env.BANSOS_ZEN_FAILOVER ?? "").trim().toLowerCase(),
+  );
   // An upstream that RETIRED this model id will never answer it again, and a
   // mirror serves the SAME id from another transport. So a known retirement
   // goes straight to the mirror: asking the upstream again would only buy
   // the same rejection.
-  if (catalog.isRetired(model.id) && zenMirror && upstream.id === "zen") {
+  if (catalog.isRetired(model.id) && zenMirror && upstream.id === "zen" && zenFailoverAllowed) {
     const mirrored = await tryZenMirrorForParked(
       model,
       zenMirror,
@@ -1731,7 +1738,7 @@ async function runChatForward(
       // the same 429 again" — it is taking the request somewhere that can
       // actually serve it. Trying it here is what makes a closed zen pool a
       // working lane instead of a 429 wall.
-      if (currentUpstream.id === "zen" && zenMirror) {
+      if (currentUpstream.id === "zen" && zenMirror && zenFailoverAllowed) {
         const mirrored = await tryZenMirrorForParked(
           current,
           zenMirror,
@@ -1969,7 +1976,12 @@ async function runChatForward(
       // The same applies when the upstream RETIRED the model (410
       // ModelDeprecated, or 400 "Model is unavailable"): that upstream will
       // never answer this id again, but a mirror still can, under the same id.
-      if (currentUpstream.id === "zen" && zenMirror && (upstreamRes.status === 429 || zenRetired)) {
+      if (
+        currentUpstream.id === "zen" &&
+        zenMirror &&
+        zenFailoverAllowed &&
+        (upstreamRes.status === 429 || zenRetired)
+      ) {
         const mirrored = await tryZenMirrorForParked(
           current,
           zenMirror,
