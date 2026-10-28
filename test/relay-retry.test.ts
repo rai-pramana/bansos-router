@@ -71,6 +71,25 @@ test("a 429 from the active relay is retried on the next relay and served", asyn
   }
 });
 
+test("a relay that refuses the target does not end the request", async () => {
+  // The fleet's allowlist is per deployment. A relay deployed before a
+  // target was added answers 403 "target not allowlisted" - that is a
+  // property of THAT relay, not of the target. The request must continue to
+  // the next relay instead of failing outright.
+  const { calls, restore } = stubFetch((url) => (url.includes("r1") ? 403 : 200));
+  try {
+    const res = await relayFetch(
+      state("https://r1.example", ["https://r2.example"]),
+      "https://dev.opencode.ai/inference/openai/v1/chat/completions",
+      { method: "POST", headers: { "content-type": "application/json" }, body: '{"model":"big-pickle"}' },
+    );
+    assert.equal(res.status, 200);
+    assert.ok(calls.some((c) => c.url === "https://r2.example"), "must try the next relay");
+  } finally {
+    restore();
+  }
+});
+
 test("the stage spreads requests across relays instead of pinning one", async () => {
   // The stage's upstream bucket is per egress address, so consecutive
   // requests must land on DIFFERENT relays. Pinning one relay would drain

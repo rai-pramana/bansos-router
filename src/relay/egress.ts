@@ -105,7 +105,12 @@ const MAX_ALTERNATES = 2;
 // A spread target (the zen STAGE) has one bucket PER RELAY, so a 429 there
 // means "this relay's bucket is spent", not "every relay is spent". Trying
 // more alternates finds a fresh bucket instead of giving up.
-const MAX_SPREAD_ALTERNATES = 5;
+//
+// The count is generous because two different things skip a relay: a spent
+// bucket (429) and a deployment that does not know the target yet (403). A
+// fleet mid-deploy can have several of the latter, so the alternates have to
+// be enough to get past them.
+const MAX_SPREAD_ALTERNATES = 12;
 
 // Is this a free-tier quota rejection (as opposed to a burst rate limit)?
 // Both arrive as 429; only the quota one carries a long Retry-After or the
@@ -241,6 +246,22 @@ const SPREAD_TARGETS = new Set<string>([
   "https://dev.opencode.ai",
 ]);
 
+// A relay can refuse a target it has not been taught about: the fleet's
+// allowlist is per deployment, so a relay deployed before a new target was
+// added answers 403 "forbidden: target not allowlisted".
+//
+// That is a property of THAT relay, not of the target: another relay in the
+// fleet may well forward it. So a refusal must move on to the next relay
+// instead of ending the request - otherwise one stale deployment turns into
+// a fleet-wide failure for that target.
+//
+// Only 403 qualifies. A 400 is the UPSTREAM rejecting the request body, and
+// the upstream will reject the same body through every relay, so retrying it
+// just multiplies the round trips.
+function isRelayRefusal(status: number): boolean {
+  return status === 403;
+}
+
 function isSpreadTarget(origin: string): boolean {
   return SPREAD_TARGETS.has(origin);
 }
@@ -323,10 +344,26 @@ export async function relayFetch(
       if (i === candidates.length - 1) return fetch(targetUrl, init);
       continue;
     }
-    if (!RETRY_STATUS.has(res.status)) {
+    if (!RETRY_STATUS.has(res.status) && !isRelayRefusal(res.status)) {
       if (url !== state.url) _preferred = { url, until: Date.now() + PREFER_MS, origin: u.origin };
       else _preferred = null;
       return res;
+    }
+    // A refusal is not a quota verdict and not a broken relay: it is a
+    // deployment that does not know this target. Skip it (short penalty so
+    // it is retried rarely) and try the next relay.
+    if (isRelayRefusal(res.status)) {
+      _penalty.set(penaltyKey(url, u), Date.now() + PENALTY_MS);
+      try {
+        await res.body?.cancel();
+      } catch {
+        /* already closed */
+      }
+      if (i === candidates.length - 1) {
+        // No relay in the fleet forwards this target. Fall back to direct.
+        return fetch(targetUrl, init);
+      }
+      continue;
     }
     // Read the body BEFORE cancelling it. Returning the cancelled Response as
     // `last` used to surface as "Body is unusable: Body has already been read"
