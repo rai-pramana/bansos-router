@@ -113,7 +113,7 @@ test("GET /bansos/adapters/render renders harness config", async () => {
 });
 
 test("GET and POST /bansos/relay read and update relay state", async () => {
-  const originalState = loadRelayState();
+  const originalState = structuredClone(loadRelayState());
   const { baseUrl, close } = await setupTestServer();
   try {
     const resGet = await fetch(`${baseUrl}/bansos/relay`);
@@ -182,7 +182,7 @@ test("404 returns HTML for browser navigation and JSON for API requests", async 
 });
 
 test("POST /bansos/relay/probe enforces an SSRF allowlist", async () => {
-  const originalState = loadRelayState();
+  const originalState = structuredClone(loadRelayState());
   const { baseUrl, close } = await setupTestServer();
   try {
     // no active or saved relay

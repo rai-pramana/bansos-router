@@ -6,6 +6,11 @@ import { promisify } from "node:util";
 import { RELAY_STATE_FILE, readJson, writeJsonAtomic } from "../daemon/state";
 
 // only known keyless upstream origins may be targeted via the relay; each entry must equal an upstream chatUrl origin
+// must match each upstream's base-URL origin: LLM7_BASE_URL is
+// https://api.llm7.io/v1, so the allowlist entry has to be the api host —
+// a bare "https://llm7.io" silently routes llm7 direct (relayFetch's
+// origin check misses and falls through to fetch). test/relay-targets.test.ts
+// asserts this invariant against the real base URLs.
 export const ALLOWED_TARGETS = [
   "https://opencode.ai",
   // The zen STAGE deployment. It is a SEPARATE opencode app with its own
