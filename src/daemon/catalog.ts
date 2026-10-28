@@ -46,6 +46,15 @@ export class RuntimeCatalog {
   // The catalog entry used for each mirror-backed id, so a refresh can
   // re-publish it after the upstream dropped it.
   private readonly mirrorDefs = new Map<string, ModelDef>();
+  // Model ids the zen STAGE can serve under the SAME id. The stage is
+  // opencode's own console on another deployment with its own catalog, so it
+  // may carry an id the production catalog does not list (measured:
+  // muse-spark-1.3-contributor-free is on the stage and gone from
+  // production). Such an id stays published for the same reason a mirrored
+  // one does: the client asked for this id and the stage answers under it.
+  private readonly staged = new Set<string>();
+  // The catalog entry used for each stage-backed id.
+  private readonly stageDefs = new Map<string, ModelDef>();
   // Model ids the upstream retired (410 / "Model is unavailable"). Asking
   // that upstream again only buys the same rejection, so the request goes
   // straight to the mirror while the id stays published.
@@ -113,6 +122,28 @@ export class RuntimeCatalog {
     return [...this.mirrored].filter((id) => this.byId.has(id));
   }
 
+  // Declare which ids the zen stage can serve under the same id.
+  //
+  // The stage publishes its own catalog, which can carry an id the production
+  // catalog does not list. Such an id must stay published: the stage answers
+  // it under the SAME id, so dropping it would turn a working request into
+  // "unknown model".
+  setStagedModels(ids: Iterable<string>, describe?: (id: string) => ModelDef | undefined): void {
+    this.staged.clear();
+    for (const id of ids) this.staged.add(id);
+    for (const id of this.staged) {
+      const entry = this.byId.get(id) ?? this.pins.get(id) ?? describe?.(id);
+      if (!entry) continue;
+      this.stageDefs.set(id, entry);
+      if (!this.byId.has(id)) this.byId.set(id, entry);
+    }
+  }
+
+  // The ids the stage can serve, and that are published here.
+  get stagedIds(): string[] {
+    return [...this.staged].filter((id) => this.byId.has(id));
+  }
+
   // Remember that the upstream retired this id, so the next request skips
   // that upstream instead of paying for the same rejection again.
   markRetired(id: string): void {
@@ -141,6 +172,9 @@ export class RuntimeCatalog {
         // A mirror-backed id stays: the snapshot predates the retirement, and
         // the mirror still answers this id.
         if (this.mirrored.has(id)) continue;
+        // So does a stage-backed id: the stage publishes its own catalog, so
+        // an id it carries may never appear in a production snapshot.
+        if (this.staged.has(id)) continue;
         this.byId.delete(id);
       }
     }
@@ -338,6 +372,19 @@ export class RuntimeCatalog {
       if (entry) {
         this.byId.set(id, entry);
         this.log.info(`catalog: keeping retired model id, a mirror serves it`, {
+          model: id,
+          source,
+        });
+      }
+    }
+    // A stage-backed id stays published for the same reason: the stage has
+    // its own catalog and may carry an id the production upstream dropped.
+    for (const id of this.staged) {
+      if (this.byId.has(id)) continue;
+      const entry = this.stageDefs.get(id);
+      if (entry) {
+        this.byId.set(id, entry);
+        this.log.info(`catalog: keeping model id the stage still serves`, {
           model: id,
           source,
         });

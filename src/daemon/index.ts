@@ -19,11 +19,12 @@ import { createLogger, type Logger } from "../logger";
 import { assertBindAllowed } from "../security/policy";
 import { buildUpstreams, SEEDED_MODELS } from "../upstreams";
 import { createZenMirror } from "../upstreams/zen-mirror";
+import { createZenStage } from "../upstreams/zen-stage";
 import { VERSION } from "../update";
 import { RuntimeCatalog } from "./catalog";
 import { RateLimiter } from "./rate-limit";
 import { ActivityStore } from "./activity";
-import { createServer, setZenMirror } from "./server";
+import { createServer, setZenMirror, setZenStage } from "./server";
 import { zenQuotaClosedForMs, zenQuotaReason } from "./zen-gate";
 import { shutdownServer, SHUTDOWN_GRACE_MS } from "./shutdown";
 
@@ -170,6 +171,44 @@ function startServer(
       const kept = catalog.mirroredIds;
       if (kept.length > 0) {
         log.info("catalog: mirror-backed model ids published", { models: kept });
+      }
+    });
+  }
+
+  // The zen STAGE: opencode's own console on a different deployment, so it
+  // has its own daily free-tier bucket and answers the SAME model ids.
+  //
+  // This is the fix for a closed production bucket. The production bucket is
+  // keyed on the literal "unknown" (the edge does not forward x-real-ip), so
+  // it is shared with every anonymous OpenCode user on the internet - no
+  // egress identity escapes it. The stage's bucket is separate and still has
+  // room.
+  //
+  // BANSOS_ZEN_STAGE=0 disables it. The base url can be pointed at another
+  // stage (infra/stage.ts: <stage>.dev.opencode.ai) with
+  // BANSOS_ZEN_STAGE_URL.
+  const stageEnabled = !["0", "false", "off", "no"].includes(
+    (process.env.BANSOS_ZEN_STAGE ?? "").trim().toLowerCase(),
+  );
+  const stageUrl = (process.env.BANSOS_ZEN_STAGE_URL ?? "https://dev.opencode.ai").trim();
+  const stage = stageEnabled && stageUrl ? createZenStage({ baseUrl: stageUrl }) : null;
+  setZenStage(stage);
+  if (stage) {
+    // Resolve once at startup so the first request that hits the closed
+    // production pool does not pay for the discovery round trip.
+    void stage.ready().then(() => {
+      log.info("zen stage ready", {
+        upstream: stage.upstream.id,
+        url: stageUrl,
+        models: stage.ids(),
+      });
+      // An id the stage serves but the production catalog does not list stays
+      // published: the stage answers it under the SAME id, so dropping it
+      // would turn a working request into "unknown model".
+      catalog.setStagedModels(stage.ids(), (id) => stage.describe(id));
+      const kept = catalog.stagedIds;
+      if (kept.length > 0) {
+        log.info("catalog: stage-backed model ids published", { models: kept });
       }
     });
   }

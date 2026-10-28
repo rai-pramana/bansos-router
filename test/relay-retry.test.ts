@@ -71,6 +71,64 @@ test("a 429 from the active relay is retried on the next relay and served", asyn
   }
 });
 
+test("the stage spreads requests across relays instead of pinning one", async () => {
+  // The stage's upstream bucket is per egress address, so consecutive
+  // requests must land on DIFFERENT relays. Pinning one relay would drain
+  // one bucket and waste the other ~165.
+  const seen: string[] = [];
+  const { calls, restore } = stubFetch((url) => {
+    seen.push(url);
+    return 200;
+  });
+  try {
+    const st = state("https://r1.example", ["https://r2.example", "https://r3.example"]);
+    for (let i = 0; i < 3; i++) {
+      const res = await relayFetch(st, "https://dev.opencode.ai/inference/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"big-pickle"}',
+      });
+      assert.equal(res.status, 200);
+    }
+    const relays = seen.filter((u) => u.includes(".example"));
+    assert.equal(relays.length, 3);
+    assert.equal(new Set(relays).size, 3, "each request must use a different relay");
+  } finally {
+    restore();
+  }
+});
+
+test("a relay spent on production is still tried on the stage", async () => {
+  // The quota bucket is per (egress IP, deployment). Production and the
+  // STAGE are separate deployments with separate databases, so the SAME
+  // relay has a separate bucket on each. A production outage must not hide
+  // the stage's fresh buckets - that is exactly what the stage exists for.
+  const { calls, restore } = stubFetch((url) => (url.includes("r1") ? 429 : 200));
+  try {
+    // production: r1 answers 429, so it gets penalised
+    const prod = await relayFetch(state("https://r1.example", ["https://r2.example"]), TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"big-pickle"}',
+    });
+    assert.equal(prod.status, 200);
+    assert.ok(calls.some((c) => c.url === "https://r2.example"));
+
+    // the stage: r1 must be tried again, because its penalty was for
+    // opencode.ai, not for dev.opencode.ai
+    calls.length = 0;
+    const stage = await relayFetch(
+      state("https://r1.example", ["https://r2.example"]),
+      "https://dev.opencode.ai/inference/openai/v1/chat/completions",
+      { method: "POST", headers: { "content-type": "application/json" }, body: '{"model":"big-pickle"}' },
+    );
+    assert.equal(stage.status, 200);
+    assert.equal(calls[0]!.url, "https://r1.example", "the stage must try the relay the production penalty hid");
+  } finally {
+    restore();
+  }
+});
+
 test("the relay that served the retry is tried first on the next request", async () => {
   const { calls, restore } = stubFetch((url) => (url.includes("r1") ? 429 : 200));
   try {

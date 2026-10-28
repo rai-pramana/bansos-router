@@ -48,6 +48,7 @@ import {
   ZEN_MIRROR_REFUSAL,
   type ZenMirrorHandle,
 } from "../upstreams/zen-mirror";
+import type { ZenStageHandle } from "../upstreams/zen-stage";
 
 let activity: ActivityStore = new ActivityStore();
 
@@ -57,8 +58,24 @@ let activity: ActivityStore = new ActivityStore();
 // the upstream registry.
 let zenMirror: ZenMirrorHandle | null = null;
 
+// The zen STAGE deployment: opencode's own console, running against its own
+// database, so it has its own daily free-tier bucket. It serves the SAME
+// model ids production serves - only the transport changes - which keeps the
+// zen lane pure: a zen id is still answered by opencode, never by a
+// different provider under that id.
+//
+// It is the answer to a closed production bucket: the production bucket is
+// keyed on the literal "unknown" (the edge does not forward x-real-ip), so it
+// is shared with every anonymous OpenCode user on the internet and no egress
+// identity escapes it. The stage's bucket is separate and still has room.
+let zenStage: ZenStageHandle | null = null;
+
 export function setZenMirror(handle: ZenMirrorHandle | null): void {
   zenMirror = handle;
+}
+
+export function setZenStage(handle: ZenStageHandle | null): void {
+  zenStage = handle;
 }
 
 export interface StatusPayload {
@@ -72,6 +89,9 @@ export interface StatusPayload {
   // zen model id -> the free upstream ids that can serve it when opencode.ai's
   // daily pool is spent
   zenMirror?: Record<string, string[]>;
+  // the zen stage deployment: opencode's own console on a separate
+  // deployment, with its own daily free-tier bucket
+  zenStage?: { upstream: string; models: string[] };
   security?: {
     mode: "normal" | "strict";
     dlp: "redact" | "block";
@@ -1527,6 +1547,179 @@ async function tryZenMirrorOnce(
   });
 }
 
+// Try the zen STAGE deployment for a model id.
+//
+// The stage is opencode's own console on a different deployment, so it
+// speaks the same wire protocol and the same model ids - only the database
+// (and therefore the daily free-tier bucket) differs. It is used when
+// production's bucket is closed.
+//
+// The request is built exactly like the production one: the same session
+// identity, the same fingerprint headers, the same body shape (including the
+// read+shell tool names the console's gate expects), and the same wire per
+// model (chat vs responses). The answer is converted back to the shape the
+// caller asked for, exactly like the production path does.
+//
+// Returns the answer, or null when the stage cannot serve this request (the
+// caller then falls through to its normal error path).
+async function tryZenStage(
+  model: ModelDef,
+  stage: ZenStageHandle,
+  sanitizedBody: Record<string, unknown>,
+  req: http.IncomingMessage,
+  log: Logger,
+  requestStartedAt: number,
+  callerTools: CallerTools,
+  security: SecurityConfig,
+  relay: RelayState,
+): Promise<Response | null> {
+  // The stage's catalog decides which ids it can serve. An id it does not
+  // carry answers "Model is unavailable" (400), which is a refusal, not a
+  // transport failure - so the id is checked BEFORE a request is spent.
+  if (!stage.serves(model.id)) return null;
+
+  const responsesWire = model.wireApi === "responses" && !!stage.upstream.responsesUrl;
+  const outboundUrl = responsesWire ? stage.upstream.responsesUrl! : stage.upstream.chatUrl;
+  const headers = new Headers({
+    "content-type": "application/json",
+    ...stage.upstream.requestHeaders(model, req.headers as Record<string, string | string[] | undefined>),
+  });
+  const transformedBody = stage.upstream.transformRequestBody
+    ? stage.upstream.transformRequestBody({ ...sanitizedBody, model: model.id }, model)
+    : { ...sanitizedBody, model: model.id };
+  let outboundBody = JSON.stringify(
+    responsesWire ? chatToResponsesBody(transformedBody, model.id) : transformedBody,
+  );
+
+  // The stage is an external upstream, so the same secret guard applies:
+  // answering from the stage must not become a way around the DLP.
+  if (isStrictSecurity(security) && !security.disableSecretGuard) {
+    const secretScan = scanRequestBody(outboundBody);
+    const redaction = secretScan.blocked && security.dlp === "redact" ? redactRequestBody(outboundBody) : null;
+    if (redaction) {
+      outboundBody = redaction.body;
+      log.warn("secret guard redacted request", {
+        model: model.id,
+        upstream: stage.upstream.id,
+        dlpRedacted: true,
+        redactions: redaction.count,
+        secretTypes: redaction.secretTypes,
+      });
+    } else if (secretScan.blocked) {
+      log.warn("request blocked by secret guard", {
+        model: model.id,
+        upstream: stage.upstream.id,
+        status: 422,
+        durationMs: Date.now() - requestStartedAt,
+        dlpBlocked: true,
+        secretTypes: secretScan.secretTypes,
+      });
+      return new Response(
+        JSON.stringify({
+          error: { message: "request blocked by secret guard", type: "security_policy_error" },
+        }),
+        { status: 422, headers: { "content-type": "application/json" } },
+      );
+    }
+  }
+
+  let res: Response;
+  const ctl = new AbortController();
+  // A headers deadline, like the production path: a stage that accepts the
+  // connection and then stalls must not hold the request open forever.
+  const timer = setTimeout(() => ctl.abort(), 90_000);
+  try {
+    // The stage goes through the relay fleet, exactly like production.
+    //
+    // The upstream limiter keys its daily bucket on the request's x-real-ip,
+    // and the edge stamps the RELAY's egress address there when the client
+    // does not send x-real-ip itself. The fleet handler strips x-real-ip, so
+    // every relay gets its own bucket - and the stage's database has never
+    // seen those addresses, so they are all virgin. A direct fetch would put
+    // every request in THIS box's single bucket and the stage would drain
+    // within minutes.
+    res = await relayFetch(
+      relay,
+      outboundUrl,
+      {
+        method: "POST",
+        headers,
+        body: outboundBody,
+        duplex: "half",
+        signal: ctl.signal,
+      },
+      stage.upstream.relayAllowed && isRelayAllowed(security),
+    );
+  } catch (err) {
+    clearTimeout(timer);
+    log.warn("zen stage request failed", {
+      model: model.id,
+      upstream: stage.upstream.id,
+      error: String((err as Error)?.message ?? err).slice(0, 120),
+      durationMs: Date.now() - requestStartedAt,
+    });
+    return null;
+  }
+  clearTimeout(timer);
+
+  if (res.status >= 400) {
+    const text = await res.text().catch(() => "");
+    log.warn("zen stage rejected", {
+      model: model.id,
+      upstream: stage.upstream.id,
+      status: res.status,
+      upstreamError: text.slice(0, 160),
+      durationMs: Date.now() - requestStartedAt,
+    });
+    return null;
+  }
+
+  // The answer is converted back to what the caller asked for, the same way
+  // the production path does it.
+  const forcedStream = !sanitizedBody.stream && transformedBody.stream === true;
+  let finalResponse = res;
+  if (responsesWire) {
+    finalResponse = await toChatResponse(
+      res,
+      model.id,
+      sanitizedBody.stream === true || forcedStream,
+    );
+    if (forcedStream) {
+      finalResponse = await streamToChatResponse(finalResponse, model.id, callerTools);
+    }
+  } else if (forcedStream) {
+    finalResponse = await streamToChatResponse(res, model.id, callerTools);
+  }
+
+  log.info("zen stage served model", {
+    model: model.id,
+    upstream: stage.upstream.id,
+    durationMs: Date.now() - requestStartedAt,
+  });
+  return finalResponse;
+}
+
+// Try the zen stage for a model whose production bucket is closed. The
+// stage's model list is resolved on demand: the daemon may have restarted
+// while the park survived on disk.
+async function tryZenStageFor(
+  model: ModelDef,
+  stage: ZenStageHandle,
+  sanitizedBody: Record<string, unknown>,
+  req: http.IncomingMessage,
+  log: Logger,
+  requestStartedAt: number,
+  callerTools: CallerTools,
+  security: SecurityConfig,
+  relay: RelayState,
+): Promise<Response | null> {
+  if (!stage.serves(model.id)) {
+    await stage.ready();
+    if (!stage.serves(model.id)) return null;
+  }
+  return tryZenStage(model, stage, sanitizedBody, req, log, requestStartedAt, callerTools, security, relay);
+}
+
 // The mirror for a parked zen model. Unlike the 429 path, the mirror list may
 // not have been resolved yet (the daemon may have restarted while the park
 // survived on disk), so the lookup refreshes once when it comes up empty.
@@ -1620,21 +1813,53 @@ async function runChatForward(
   const zenFailoverAllowed = !["0", "false", "off", "no"].includes(
     (process.env.BANSOS_ZEN_FAILOVER ?? "").trim().toLowerCase(),
   );
+  // The zen STAGE is governed by its OWN switch (BANSOS_ZEN_STAGE), not by
+  // the cross-provider failover switch: the stage is opencode's own console on
+  // a different deployment, so a zen id is still answered by opencode under
+  // that id. BANSOS_ZEN_FAILOVER=0 exists to keep a DIFFERENT provider from
+  // answering a zen id, and the stage is not that.
+  //
+  // The per-request opt-out still applies: a caller that pins the request to
+  // one upstream gets that upstream.
+  const zenStageAllowed = zenStage !== null && req.headers["x-bansos-no-failover"] !== "1";
+  // The caller's own tool names, needed by every path that has to rebuild the
+  // answer (the stage and the mirror both answer under a different transport).
+  const callerTools = callerToolsFromBody(sanitizedBody);
   // An upstream that RETIRED this model id will never answer it again, and a
-  // mirror serves the SAME id from another transport. So a known retirement
-  // goes straight to the mirror: asking the upstream again would only buy
-  // the same rejection.
-  if (catalog.isRetired(model.id) && zenMirror && upstream.id === "zen" && zenFailoverAllowed) {
-    const mirrored = await tryZenMirrorForParked(
-      model,
-      zenMirror,
-      sanitizedBody,
-      req,
-      log,
-      requestStartedAt,
-    );
-    if (mirrored) {
-      return { response: mirrored, model, upstream: zenMirror.upstream, relay: "" };
+  // stage or mirror serves the SAME id from another transport. So a known
+  // retirement goes straight to the stage, then the mirror: asking the
+  // upstream again would only buy the same rejection.
+  if (catalog.isRetired(model.id) && upstream.id === "zen") {
+    // The stage is opencode's own console, so it answers under its own gate.
+    if (zenStage && zenStageAllowed) {
+      const staged = await tryZenStageFor(
+        model,
+        zenStage,
+        sanitizedBody,
+        req,
+        log,
+        requestStartedAt,
+        callerTools,
+        security,
+        relay,
+      );
+      if (staged) {
+        return { response: staged, model, upstream: zenStage.upstream, relay: "" };
+      }
+    }
+    // The mirror is a DIFFERENT provider, so it keeps the cross-provider gate.
+    if (zenMirror && zenFailoverAllowed) {
+      const mirrored = await tryZenMirrorForParked(
+        model,
+        zenMirror,
+        sanitizedBody,
+        req,
+        log,
+        requestStartedAt,
+      );
+      if (mirrored) {
+        return { response: mirrored, model, upstream: zenMirror.upstream, relay: "" };
+      }
     }
   }
   // Which egress served this request. The watchdog can only attribute failures
@@ -1656,7 +1881,6 @@ async function runChatForward(
   let current: ModelDef = model;
   let currentUpstream = upstream;
   let transientError: ForwardError | null = null;
-  const callerTools = callerToolsFromBody(sanitizedBody);
   const needsTools = declaredToolNames(sanitizedBody).size > 0;
   const needsVision = hasImageInput(sanitizedBody);
   const incapable = (m: ModelDef) =>
@@ -1733,9 +1957,30 @@ async function runChatForward(
       // No substitute: answer from the park instead of paying for the same 429
       // again. The client gets the original model's own refill deadline.
       //
-      // The zen mirror is the one exception: it answers the SAME model id from
+      // The zen STAGE is the first place to look: it is opencode's own
+      // console on a different deployment, so it answers the SAME model id
+      // from its own (separate) daily bucket. It comes before the mirror
+      // because it keeps the lane pure - the answer still comes from
+      // opencode, not from a different provider under the same id.
+      if (currentUpstream.id === "zen" && zenStage && zenStageAllowed) {
+        const staged = await tryZenStageFor(
+          current,
+          zenStage,
+          sanitizedBody,
+          req,
+          log,
+          requestStartedAt,
+          callerTools,
+          security,
+        relay,
+        );
+        if (staged) {
+          return { response: staged, model: current, upstream: zenStage.upstream, relay: "" };
+        }
+      }
+      // The zen mirror is the next place: it answers the SAME model id from
       // an upstream whose own bucket still has room, so it is not "paying for
-      // the same 429 again" — it is taking the request somewhere that can
+      // the same 429 again" - it is taking the request somewhere that can
       // actually serve it. Trying it here is what makes a closed zen pool a
       // working lane instead of a 429 wall.
       if (currentUpstream.id === "zen" && zenMirror && zenFailoverAllowed) {
@@ -1976,6 +2221,31 @@ async function runChatForward(
       // The same applies when the upstream RETIRED the model (410
       // ModelDeprecated, or 400 "Model is unavailable"): that upstream will
       // never answer this id again, but a mirror still can, under the same id.
+      //
+      // The zen STAGE comes first: it is opencode's own console on a
+      // different deployment, so it answers the SAME id from its own daily
+      // bucket. A closed production bucket is exactly the case it exists for.
+      if (
+        currentUpstream.id === "zen" &&
+        zenStage &&
+        zenStageAllowed &&
+        (upstreamRes.status === 429 || zenRetired)
+      ) {
+        const staged = await tryZenStageFor(
+          current,
+          zenStage,
+          sanitizedBody,
+          req,
+          log,
+          requestStartedAt,
+          callerTools,
+          security,
+        relay,
+        );
+        if (staged) {
+          return { response: staged, model: current, upstream: zenStage.upstream, relay: "" };
+        }
+      }
       if (
         currentUpstream.id === "zen" &&
         zenMirror &&
@@ -2820,6 +3090,9 @@ export function createServer(opts: ServerOptions): http.Server {
         relay: { enabled: relay.enabled, url: relay.url },
         ...(zenMirror
           ? { zenMirror: Object.fromEntries(zenMirror.mirrors) }
+          : {}),
+        ...(zenStage
+          ? { zenStage: { upstream: zenStage.upstream.id, models: zenStage.ids() } }
           : {}),
         security: {
           mode: security.mode,

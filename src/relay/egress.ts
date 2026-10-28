@@ -8,6 +8,12 @@ import { RELAY_STATE_FILE, readJson, writeJsonAtomic } from "../daemon/state";
 // only known keyless upstream origins may be targeted via the relay; each entry must equal an upstream chatUrl origin
 export const ALLOWED_TARGETS = [
   "https://opencode.ai",
+  // The zen STAGE deployment. It is a SEPARATE opencode app with its own
+  // database, so the per-IP daily bucket is a different row set than
+  // production's. The fleet's egress addresses have never been counted
+  // there, so a relay that is spent on production still has room on the
+  // stage.
+  "https://dev.opencode.ai",
   "https://api.kilo.ai",
   "https://api.llm7.io",
 ];
@@ -91,6 +97,10 @@ const PREFER_MS = 2 * 60_000;
 // Two alternates: enough to cross a dead region, small enough that a global 429
 // (every relay spent) does not turn into a stampede of probes per request.
 const MAX_ALTERNATES = 2;
+// A spread target (the zen STAGE) has one bucket PER RELAY, so a 429 there
+// means "this relay's bucket is spent", not "every relay is spent". Trying
+// more alternates finds a fresh bucket instead of giving up.
+const MAX_SPREAD_ALTERNATES = 5;
 
 // Is this a free-tier quota rejection (as opposed to a burst rate limit)?
 // Both arrive as 429; only the quota one carries a long Retry-After or the
@@ -108,8 +118,21 @@ function quotaPenaltyMs(res: Response, bodyText: string): number {
   return Math.min(Math.max(ms, QUOTA_PENALTY_MIN_MS), QUOTA_PENALTY_MAX_MS);
 }
 
-let _preferred: { url: string; until: number } | null = null;
+let _preferred: { url: string; until: number; origin?: string } | null = null;
 const _penalty = new Map<string, number>();
+
+// The penalty map is keyed by relay URL only, but the quota bucket is NOT:
+// the upstream limiter keys it on the request's x-real-ip, and the relay's
+// egress address is what the edge stamps there. Production
+// (opencode.ai) and the STAGE (dev.opencode.ai) are separate deployments
+// with separate databases, so the SAME relay has a separate bucket on each.
+//
+// A relay spent on production is therefore NOT spent on the stage. Keying
+// the penalty by target as well keeps a production outage from hiding the
+// stage's fresh buckets - which is the exact situation the stage exists for.
+function penaltyKey(url: string, target: URL): string {
+  return `${target.origin}|${url}`;
+}
 
 // The fleet scheduler (bansos_relay_rotate.sh) publishes the ranking it computed
 // each tick: ready for the model in use, under the FOT cap, lowest usage first.
@@ -155,14 +178,18 @@ function rankedRelays(): string[] {
   }
 }
 
-function penalized(url: string, now: number): boolean {
-  const until = _penalty.get(url);
-  if (until === undefined) return false;
-  if (until <= now) {
-    _penalty.delete(url);
-    return false;
+function penalized(url: string, now: number, target?: URL): boolean {
+  const keys = target ? [penaltyKey(url, target)] : [url];
+  for (const key of keys) {
+    const until = _penalty.get(key);
+    if (until === undefined) continue;
+    if (until <= now) {
+      _penalty.delete(key);
+      continue;
+    }
+    return true;
   }
-  return true;
+  return false;
 }
 
 // Exposed for `bansos doctor` and tests; not part of the request path.
@@ -170,27 +197,79 @@ export function relayRetryState(): { preferred: string; penalized: string[] } {
   const now = Date.now();
   return {
     preferred: _preferred && _preferred.until > now ? _preferred.url : "",
-    penalized: [..._penalty.entries()].filter(([, u]) => u > now).map(([u]) => u),
+    // The penalty keys are "<target origin>|<relay url>" so a relay spent on
+    // production is not hidden from the stage. Report the relay URL alone:
+    // that is what a caller wants to know.
+    penalized: [..._penalty.entries()]
+      .filter(([, u]) => u > now)
+      .map(([key]) => key.slice(key.indexOf("|") + 1)),
   };
+}
+
+// Round-robin cursors, one per target origin.
+//
+// A relay's upstream bucket is per egress address, so a target that is
+// reached through many relays (the zen STAGE, whose database has never seen
+// the fleet's addresses) can serve far more traffic when consecutive
+// requests land on DIFFERENT relays. The cursor is what makes that happen:
+// without it the first candidate keeps winning and a single relay's bucket
+// is the only one ever used.
+const _spreadCursor = new Map<string, number>();
+
+function nextSpreadOffset(origin: string, count: number): number {
+  if (count <= 0) return 0;
+  const cur = _spreadCursor.get(origin) ?? 0;
+  _spreadCursor.set(origin, (cur + 1) % count);
+  return cur % count;
+}
+
+// Targets whose upstream quota bucket is per egress address, so spreading
+// requests across relays multiplies the allowance.
+//
+// The zen STAGE qualifies: it is a separate opencode deployment with its own
+// database, and the fleet's egress addresses have never been counted there.
+// Production does NOT qualify in the same way - its bucket is shared with
+// every anonymous client on the internet - but spreading there is harmless
+// and keeps the fleet's addresses off the "unknown" bucket, so it is
+// included too.
+const SPREAD_TARGETS = new Set<string>([
+  "https://dev.opencode.ai",
+]);
+
+function isSpreadTarget(origin: string): boolean {
+  return SPREAD_TARGETS.has(origin);
 }
 
 export function resetRelayRetryState(): void {
   _preferred = null;
   _penalty.clear();
+  _spreadCursor.clear();
 }
 
-function relayCandidates(state: RelayState, now: number): string[] {
+function relayCandidates(state: RelayState, now: number, target?: URL): string[] {
   const out: string[] = [];
   const push = (u: string) => {
-    if (!u || out.includes(u) || penalized(u, now)) return;
+    if (!u || out.includes(u) || penalized(u, now, target)) return;
     out.push(u);
   };
-  if (_preferred && _preferred.until > now) push(_preferred.url);
+  // The preferred relay is only pinned when it is NOT a per-egress-bucket
+  // target. The STAGE's whole value is that each relay has its own fresh
+  // bucket there, so sticking to one relay throws that away.
+  const spread = target ? isSpreadTarget(target.origin) : false;
+  if (!spread && _preferred && _preferred.until > now && (!target || !_preferred.origin || _preferred.origin === target.origin)) {
+    push(_preferred.url);
+  }
   push(state.url);
   // Scheduler ranking first (coolest healthy accounts), then the raw fleet order as
   // a fallback for relays the last tick did not rank.
-  for (const u of rankedRelays()) push(u);
+  const ranked = rankedRelays();
+  for (const u of ranked) push(u);
   for (const r of state.relays) push(r.url);
+  if (spread && out.length > 1) {
+    // Rotate the list so consecutive requests start on a different relay.
+    const off = nextSpreadOffset(target!.origin, out.length);
+    return out.slice(off).concat(out.slice(0, off));
+  }
   return out;
 }
 
@@ -214,7 +293,9 @@ export async function relayFetch(
   }
 
   const now = Date.now();
-  const candidates = relayCandidates(state, now).slice(0, 1 + MAX_ALTERNATES);
+  const spread = isSpreadTarget(u.origin);
+  const maxAlternates = spread ? MAX_SPREAD_ALTERNATES : MAX_ALTERNATES;
+  const candidates = relayCandidates(state, now, u).slice(0, 1 + maxAlternates);
   // Every candidate is currently marked spent: its egress IP's allowance is
   // used up. Do NOT re-probe one of them — go straight to this machine's own
   // address, which is a different client identity with its own allowance.
@@ -233,12 +314,12 @@ export async function relayFetch(
     } catch {
       // Transport failure (dead deployment, DNS, reset). Try the next relay; if
       // none is left, the caller's direct-fetch fallback still applies.
-      _penalty.set(url, Date.now() + PENALTY_MS);
+      _penalty.set(penaltyKey(url, u), Date.now() + PENALTY_MS);
       if (i === candidates.length - 1) return fetch(targetUrl, init);
       continue;
     }
     if (!RETRY_STATUS.has(res.status)) {
-      if (url !== state.url) _preferred = { url, until: Date.now() + PREFER_MS };
+      if (url !== state.url) _preferred = { url, until: Date.now() + PREFER_MS, origin: u.origin };
       else _preferred = null;
       return res;
     }
@@ -257,7 +338,7 @@ export async function relayFetch(
     // 5 minutes, so the next call does not pay the same dead round-trip again.
     const penalty = quotaPenaltyMs(res, lastText);
     if (res.status === 429 && penalty > PENALTY_MS) quotaHit = true;
-    _penalty.set(url, Date.now() + penalty);
+    _penalty.set(penaltyKey(url, u), Date.now() + penalty);
     last = new Response(lastText, { status: res.status, headers: res.headers });
     try {
       await res.body?.cancel();
