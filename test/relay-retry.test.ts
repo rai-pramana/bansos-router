@@ -7,6 +7,8 @@ import {
   relayFetch,
   relayRetryState,
   resetRelayRetryState,
+  deploymentEssentiallySpent,
+  FLEET_EXHAUSTED_HEADER,
   type RelayState,
 } from "../src/relay/egress";
 
@@ -117,6 +119,279 @@ test("the stage spreads requests across relays instead of pinning one", async ()
   }
 });
 
+// PRODUCTION is a per-egress-address bucket too. The upstream limiter keys
+// its daily row on the request's x-real-ip (util_handler.ts:99 ->
+// util_ipRateLimiter.ts:22) and the fleet handler strips x-real-ip, so the
+// relay's own egress address is what lands in that row. Measured 2026-10-29
+// with the canonical contract, same model, same body, same minute: through a
+// relay 200 billing_source=free, direct from HOME 429 FreeUsageLimitError.
+//
+// Pinning production to one relay therefore drains one address's bucket and
+// leaves the other ~159 untouched. One address's allowance was measured at
+// >= 800 requests/day, so the fleet is worth two orders of magnitude more
+// than a pin.
+test("production spreads across relays too, because its bucket is per egress address", async () => {
+  const seen: string[] = [];
+  const { restore } = stubFetch((url) => {
+    seen.push(url);
+    return 200;
+  });
+  try {
+    const st = state("https://r1.example", ["https://r2.example", "https://r3.example"]);
+    for (let i = 0; i < 3; i++) {
+      const res = await relayFetch(st, TARGET, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"deepseek-v4.1-flash-free"}',
+      });
+      assert.equal(res.status, 200);
+    }
+    const relays = seen.filter((u) => u.includes(".example"));
+    assert.equal(relays.length, 3);
+    assert.equal(
+      new Set(relays).size,
+      3,
+      "production must not pin one relay: each address is an independent daily bucket",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// The production bucket is also split PER MODEL (util_ipRateLimiter.ts:
+// dailyInterval = YYYYMMDD + modelId.slice(0,2) for a model with its own
+// rateLimit), so a 429 on one id says nothing about the others. Measured:
+// deepseek-v4.1-flash-free answered 200 on 10/160 addresses in the same
+// minute that four other ids answered 429 on 160/160.
+//
+// The penalty is therefore keyed by address AND model: an address that is
+// spent for one id stays usable for another.
+test("a 429 on one model does not park that address for the other models", async () => {
+  const { calls, restore } = stubFetch((url, n) => (n === 1 ? 429 : 200));
+  try {
+    const st = state("https://r1.example", ["https://r2.example"]);
+    const first = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(first.status, 200);
+    // a DIFFERENT model must not inherit r1's penalty
+    calls.length = 0;
+    const second = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"beam-free"}',
+    });
+    assert.equal(second.status, 200);
+    assert.ok(
+      calls.some((c) => c.url === "https://r1.example"),
+      "an address spent for one model must stay usable for another model",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// A 429 on the addresses this request happened to try must NOT claim the
+// whole fleet is spent. The daemon parks a model fleet-wide on that signal,
+// and a false "exhausted" kills a lane whose other ~147 addresses still have
+// room (measured: one address served >= 800 requests/day without a 429).
+test("a 429 on part of the fleet is not reported as fleet exhaustion", async () => {
+  const { restore } = stubFetch((url, n) => (n <= 13 ? 429 : 200));
+  try {
+    const relays = Array.from({ length: 40 }, (_, i) => `https://r${i}.example`);
+    const res = await relayFetch(state(relays[0]!, relays.slice(1)), TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(
+      res.headers.get(FLEET_EXHAUSTED_HEADER),
+      null,
+      "a served request must not claim the fleet is exhausted",
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("every address answering 429 is reported as fleet exhaustion", async () => {
+  const { restore } = stubFetch(() => 429);
+  try {
+    const relays = ["https://r1.example", "https://r2.example"];
+    const res = await relayFetch(state(relays[0]!, relays.slice(1)), TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(res.status, 429);
+    assert.equal(
+      res.headers.get(FLEET_EXHAUSTED_HEADER),
+      "1",
+      "when every address is spent the model may be parked fleet-wide",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// A deployment that is closed for a model must be recognisable BEFORE the
+// request is sent, so the daemon can go to another deployment (the stage)
+// instead of paying the dead round-trips.
+//
+// Measured 2026-10-29: production opencode.ai answered 429 on all 160
+// relays for all 8 anonymous-free ids, so every request paid ~26s of
+// round-trips before the stage answered in ~3s.
+//
+// The evidence is per (deployment, model): a 429 on one deployment says
+// nothing about the other one, and a 429 on one model says nothing about
+// the others.
+test("a closed deployment is recognised for its own model only", async () => {
+  const { restore } = stubFetch(() => 429);
+  try {
+    const relays = ["https://r1.example", "https://r2.example", "https://r3.example"];
+    const st = state(relays[0]!, relays.slice(1));
+    const res = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(res.status, 429);
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
+      true,
+      "every address answered 429, so the deployment is closed for this model",
+    );
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "beam-free"),
+      false,
+      "a different model has its own row and must not inherit the verdict",
+    );
+    assert.equal(
+      deploymentEssentiallySpent(st, "https://dev.opencode.ai", "deepseek-v4.1-flash-free"),
+      false,
+      "a different deployment has its own rows and must not inherit the verdict",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// One address is not evidence about a fleet of ~160. A single 429 must not
+// close the deployment.
+test("a single rejected address does not close a deployment", async () => {
+  const { calls, restore } = stubFetch((url, n) => (n === 1 ? 429 : 200));
+  try {
+    const relays = Array.from({ length: 40 }, (_, i) => `https://r${i}.example`);
+    const st = state(relays[0]!, relays.slice(1));
+    const res = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
+      false,
+      "one spent address must not close a 40-address fleet",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// The upstream row is keyed by the FIRST TWO CHARACTERS of the model id
+// (util_ipRateLimiter.ts:25: dailyInterval = YYYYMMDD + modelId.slice(0,2)),
+// so two ids sharing a prefix are ONE budget. A penalty on
+// "deepseek-v4.1-flash-free" must therefore also hide
+// "deepseek-v4-flash" on that address - they spend the same "de" row.
+test("a penalty covers the ids that share the upstream's two-character row", async () => {
+  const { calls, restore } = stubFetch((url, n) => (n === 1 ? 429 : 200));
+  try {
+    const st = state("https://r1.example", ["https://r2.example"]);
+    const first = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(first.status, 200);
+    // a DIFFERENT prefix must still be usable on the same address
+    calls.length = 0;
+    const other = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"beam-free"}',
+    });
+    assert.equal(other.status, 200);
+    assert.ok(calls.some((c) => c.url === "https://r1.example"), "a different prefix must not be hidden");
+    // ...but the SAME prefix must be hidden on that address
+    calls.length = 0;
+    const same = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4-flash"}',
+    });
+    assert.equal(same.status, 200);
+    assert.ok(
+      !calls.some((c) => c.url === "https://r1.example"),
+      "an id sharing the two-character prefix must not reuse the spent address",
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("a quota 429 on a few addresses does NOT declare the fleet exhausted", async () => {
+  const { calls, restore } = stubFetch((url, n) => (n <= 2 ? 429 : 200));
+  try {
+    const st = state("https://r1.example", [
+      "https://r2.example",
+      "https://r3.example",
+      "https://r4.example",
+      "https://r5.example",
+    ]);
+    const res = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(res.status, 200);
+    assert.notEqual(
+      res.headers.get("x-bansos-fleet-exhausted"),
+      "1",
+      "a handful of spent addresses must not park the model fleet-wide",
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("the fleet is only declared exhausted when every address is spent", async () => {
+  const { calls, restore } = stubFetch(() => 429);
+  try {
+    const st = state("https://r1.example", ["https://r2.example", "https://r3.example"]);
+    // drain every address so each one carries a penalty
+    for (let i = 0; i < 3; i++) {
+      const res = await relayFetch(st, TARGET, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"deepseek-v4.1-flash-free"}',
+      });
+      assert.equal(res.status, 429);
+    }
+    const res = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(res.headers.get("x-bansos-fleet-exhausted"), "1");
+  } finally {
+    restore();
+  }
+});
+
 test("a relay spent on production is still tried on the stage", async () => {
   // The quota bucket is per (egress IP, deployment). Production and the
   // STAGE are separate deployments with separate databases, so the SAME
@@ -189,13 +464,22 @@ test("when every relay is spent the last 429 is returned, not an invented succes
       { method: "POST", body: "{}" },
     );
     assert.equal(res.status, 429);
-    // one active + two alternates: a global 429 must not fan out over the fleet
+    // Production spreads now (its bucket is per egress address), so the
+    // request walks the whole candidate list instead of a fixed two
+    // alternates. What matters is that every relay answered 429 and the
+    // answer is the LAST one, not an invented success.
     const relayCalls = calls.filter((c) => c.url !== TARGET);
-    assert.equal(relayCalls.length, 3);
-    // ...but the machine's own address is a DIFFERENT client identity with its
+    assert.equal(relayCalls.length, 4);
+    assert.deepEqual(relayCalls.map((c) => c.url), [
+      "https://r1.example",
+      "https://r2.example",
+      "https://r3.example",
+      "https://r4.example",
+    ]);
+    // ...and the machine's own address is a DIFFERENT client identity with its
     // own allowance, so it gets exactly one last attempt before the 429 surfaces.
     assert.equal(calls.filter((c) => c.url === TARGET).length, 1);
-    assert.equal(calls.length, 4);
+    assert.equal(calls.length, 5);
   } finally {
     restore();
   }

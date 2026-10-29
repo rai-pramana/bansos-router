@@ -14,18 +14,29 @@ import type { ModelDef, Upstream } from "./types";
 // picks the "opencode-dev" AWS profile for every non-production stage), so
 // every stage has its OWN free-tier bucket.
 //
-// Why the production bucket is closed for everyone but the stage is not:
+// Why production is exhausted while the stage still answers:
 // the upstream limiter keys the daily bucket on the request's `x-real-ip`
-// header (util_handler.ts:99 -> util_ipRateLimiter.ts:22), and the edge does
-// not forward that header. Every anonymous request therefore lands in ONE
-// bucket whose key is the literal "unknown" (util_ipRateLimiter.ts:22), and
-// the production "unknown" bucket is shared with every anonymous OpenCode
-// user on the internet. Measured: 163 different egress identities, 296
-// spent relay/IP pairs, 122 model x route combinations - all 429.
+// header (util_handler.ts:99 -> util_ipRateLimiter.ts:22), falling back to
+// the literal "unknown" only when that header is ABSENT. The fleet handler
+// strips x-real-ip from the inbound request (bansos-relay/api/index.js:30),
+// so the edge stamps the RELAY's own egress address there
+// (inference-ip.ts: cf-connecting-ip). One relay = one address = one bucket.
 //
-// The stage's "unknown" bucket is shared with far fewer users, so it still
-// has room. Measured on dev.opencode.ai: 220 consecutive requests from one
-// egress IP, all HTTP 200, zero 429.
+// Measured 2026-10-29:
+//   * 160 relay URLs -> 159 distinct egress addresses;
+//   * one relay URL -> one stable egress address (100.52.203.58, 60/60 calls
+//     on it), so a relay is a bucket, not a lottery;
+//   * address A answered 2446 requests then 429'd while address B was
+//     polled 193 times in the same window and kept answering 200 - so the
+//     rows are PER ADDRESS;
+//   * the bucket is also split PER MODEL, keyed by the FIRST TWO CHARACTERS
+//     of the id (util_ipRateLimiter.ts:25), so "deepseek-*" ids share one
+//     row and "bi" (big-pickle) / "be" (beam-free) are different rows;
+//   * the row resets at 00:00 UTC (retry-after points there).
+//
+// So production is not a single shared bucket - it is 159 buckets that each
+// fill up. The stage is the same thing with a different database, so its
+// buckets are a separate row set entirely.
 //
 // The stage is the SAME product and the SAME model ids (big-pickle,
 // muse-spark-1.3-contributor-free). It is a transport change, not a provider

@@ -35,6 +35,8 @@ import {
   removeRelay,
   relayFetch,
   relayRetryState,
+  deploymentEssentiallySpent,
+  FLEET_EXHAUSTED_HEADER,
   type RelayState,
 } from "../relay/egress";
 import { ADAPTERS, buildSetupContext, findAdapter } from "../adapters";
@@ -315,6 +317,19 @@ function isValidRelayUrl(value: unknown): value is string {
   if (u.protocol !== "http:" && u.protocol !== "https:") return false;
   if (u.username || u.password) return false;
   return u.hostname.length > 0;
+}
+
+// The origin of an upstream URL, or "" when the URL cannot be parsed.
+//
+// The relay layer keys its spent-evidence by the deployment's origin, so the
+// daemon has to name that origin exactly. A malformed URL must not throw
+// here: the request path would die before it could answer.
+function safeOrigin(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -2021,6 +2036,48 @@ async function runChatForward(
       });
     }
 
+    // The STAGE first, when production is known to be closed for this model.
+    //
+    // Production opencode.ai and the stage dev.opencode.ai are separate
+    // deployments with separate daily rows, and the stage still has room.
+    // But production is tried FIRST, and every relay round-trip to a spent
+    // production address costs ~2s. Measured 2026-10-29: production answered
+    // 429 on all 160 relays for all 8 anonymous-free ids, so every request
+    // paid 13 x ~2s = ~26s of dead round-trips before the stage answered.
+    //
+    // The stage is opencode's own console, so this is not a cross-provider
+    // failover: it is the SAME provider on a different deployment, serving
+    // the SAME model id. It therefore stays under the stage's own switch
+    // (BANSOS_ZEN_STAGE) and the per-request x-bansos-no-failover opt-out.
+    //
+    // The "known to be closed" evidence is the relay layer's distinct-address
+    // quota counter: a MAJORITY of the fleet's addresses have answered a
+    // quota 429 for this (deployment, model). One address is not enough.
+    const zenOrigin = safeOrigin(currentUpstream.chatUrl);
+    if (
+      currentUpstream.id === "zen" &&
+      zenStage &&
+      zenStageAllowed &&
+      attempt === 0 &&
+      zenOrigin !== "" &&
+      deploymentEssentiallySpent(relay, zenOrigin, current.id)
+    ) {
+      const staged = await tryZenStageFor(
+        current,
+        zenStage,
+        sanitizedBody,
+        req,
+        log,
+        requestStartedAt,
+        callerTools,
+        security,
+        relay,
+      );
+      if (staged) {
+        return { response: staged, model: current, upstream: zenStage.upstream, relay: "" };
+      }
+    }
+
     if (!isUpstreamAllowed(security, currentUpstream.id)) {
       log.warn("upstream blocked by strict security policy", {
         model: current.id,
@@ -2188,7 +2245,20 @@ async function runChatForward(
         // model until the upstream's refill moment instead of the flat 15
         // minutes, so the next request and every probe tick stop paying to
         // relearn that the bucket is empty.
-        if (isQuotaExhaustion(upstreamRes.status, text, retryAfterMs)) {
+        //
+        // But the upstream's bucket is keyed by (egress address, model) - the
+        // fleet has ~160 addresses, each with its own daily row (measured:
+        // one address served >= 800 requests/day without a 429). A 429 on the
+        // addresses this request happened to try is therefore NOT evidence
+        // that the model is exhausted fleet-wide, and parking it on that
+        // evidence kills a lane whose other addresses still have room.
+        //
+        // relayFetch says which case it is: the FLEET_EXHAUSTED_HEADER is set
+        // only when every candidate address was tried and every one of them
+        // answered 429. Without that header the model stays alive and the
+        // NEXT request spreads onto a different address.
+        const fleetExhausted = upstreamRes.headers.get(FLEET_EXHAUSTED_HEADER) === "1";
+        if (isQuotaExhaustion(upstreamRes.status, text, retryAfterMs) && fleetExhausted) {
           catalog.markQuotaExhausted(current.id, retryAfterMs, { status: upstreamRes.status, message: errorMsg });
           // Close the probe lane for the upstream's own refill window so the
           // watchers stop spending requests from an empty bucket. Without this
@@ -2196,7 +2266,10 @@ async function runChatForward(
           if (currentUpstream.id === "zen") {
             noteZenQuotaExhausted(retryAfterMs);
           }
-        } else {
+        } else if (upstreamRes.status === 429) {
+          // Either a burst limit, or one address's bucket is spent while the
+          // rest of the fleet still has room. Park it briefly (not for the
+          // daily window) so the next request moves on to another address.
           catalog.markRateLimited(current.id, retryAfterMs, { status: upstreamRes.status, message: errorMsg });
         }
       }

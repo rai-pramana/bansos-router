@@ -112,6 +112,22 @@ const MAX_ALTERNATES = 2;
 // be enough to get past them.
 const MAX_SPREAD_ALTERNATES = 12;
 
+// How many relays a SINGLE request may try before the fleet is declared spent
+// for that (deployment, model).
+//
+// The fleet has ~160 relays and the upstream's daily row is per egress
+// ADDRESS, so a 429 on the first few addresses is not fleet-wide exhaustion -
+// the next addresses still have room. The walk therefore continues over the
+// whole candidate list.
+//
+// The latency of a CLOSED deployment is handled one level up: the daemon asks
+// the relay layer whether the deployment is already known to be spent, and if
+// so it goes to the stage FIRST instead of paying the dead round-trips here.
+// Measured 2026-10-29: production opencode.ai answered 429 on all 160 relays
+// for all 8 anonymous-free ids (~26s of round-trips per request), while the
+// stage answered in ~3s.
+const MAX_FLEET_PROBE_ATTEMPTS = 4;
+
 // Is this a free-tier quota rejection (as opposed to a burst rate limit)?
 // Both arrive as 429; only the quota one carries a long Retry-After or the
 // FreeUsageLimitError body.
@@ -140,8 +156,26 @@ const _penalty = new Map<string, number>();
 // A relay spent on production is therefore NOT spent on the stage. Keying
 // the penalty by target as well keeps a production outage from hiding the
 // stage's fresh buckets - which is the exact situation the stage exists for.
-function penaltyKey(url: string, target: URL): string {
-  return `${target.origin}|${url}`;
+//
+// The bucket is ALSO split per model, but not by the whole id: the upstream
+// row for a model that carries its own rateLimit is
+// YYYYMMDD + modelId.slice(0,2) (util_ipRateLimiter.ts:25), so the row is
+// keyed by the FIRST TWO CHARACTERS of the id. Ids sharing a prefix share a
+// row: "deepseek-v4.1-flash-free" and "deepseek-v4-flash" both land on "de".
+//
+// Keying the penalty by the same prefix is what makes the penalty mean
+// something upstream agrees with. Keying by the whole id would let the
+// daemon keep using an address whose "de" row is already spent, and would
+// miss the fact that two different ids are one budget.
+//
+// Measured 2026-10-29: a 429 on one id must not hide the other ids on the
+// same address, but it MUST hide the ids that share its two-character
+// prefix.
+function penaltyKey(url: string, target: URL, model?: string): string {
+  // The prefix is what the upstream keys on. Two characters is what
+  // util_ipRateLimiter.ts uses, so "de" is the row for every deepseek-*.
+  const prefix = model ? model.slice(0, 2) : "";
+  return prefix ? `${target.origin}|${url}|${prefix}` : `${target.origin}|${url}`;
 }
 
 // The fleet scheduler (bansos_relay_rotate.sh) publishes the ranking it computed
@@ -188,8 +222,15 @@ function rankedRelays(): string[] {
   }
 }
 
-function penalized(url: string, now: number, target?: URL): boolean {
-  const keys = target ? [penaltyKey(url, target)] : [url];
+function penalized(url: string, now: number, target?: URL, model?: string): boolean {
+  // A model-scoped penalty must not hide the address for the other models
+  // (the bucket is per address AND per model), and an address-scoped penalty
+  // must not hide it for another deployment. So a candidate is skipped when
+  // ANY of its keys is live: the unscoped key (deployment-wide), the
+  // model-scoped key, and the bare URL (the legacy shape).
+  const keys = target
+    ? [penaltyKey(url, target), ...(model ? [penaltyKey(url, target, model)] : []), url]
+    : [url];
   for (const key of keys) {
     const until = _penalty.get(key);
     if (until === undefined) continue;
@@ -201,48 +242,74 @@ function penalized(url: string, now: number, target?: URL): boolean {
   }
   return false;
 }
-
 // Exposed for `bansos doctor` and tests; not part of the request path.
 export function relayRetryState(): { preferred: string; penalized: string[] } {
   const now = Date.now();
   return {
     preferred: _preferred && _preferred.until > now ? _preferred.url : "",
-    // The penalty keys are "<target origin>|<relay url>" so a relay spent on
-    // production is not hidden from the stage. Report the relay URL alone:
-    // that is what a caller wants to know.
+    // The penalty keys are "<target origin>|<relay url>" or
+    // "<target origin>|<relay url>|<model id>" so a relay spent on production
+    // is not hidden from the stage, and a relay spent for one model is not
+    // hidden for the others. Report the relay URL alone: that is what a
+    // caller wants to know.
     penalized: [..._penalty.entries()]
       .filter(([, u]) => u > now)
-      .map(([key]) => key.slice(key.indexOf("|") + 1)),
+      .map(([key]) => key.slice(key.indexOf("|") + 1).split("|")[0] ?? key),
   };
 }
 
-// Round-robin cursors, one per target origin.
+// Round-robin cursors, one per (target origin, model).
 //
 // A relay's upstream bucket is per egress address, so a target that is
-// reached through many relays (the zen STAGE, whose database has never seen
-// the fleet's addresses) can serve far more traffic when consecutive
-// requests land on DIFFERENT relays. The cursor is what makes that happen:
-// without it the first candidate keeps winning and a single relay's bucket
-// is the only one ever used.
+// reached through many relays (both opencode deployments: the fleet's
+// addresses each land in their own daily row) can serve far more traffic
+// when consecutive requests land on DIFFERENT relays. The cursor is what
+// makes that happen: without it the first candidate keeps winning and a
+// single relay's bucket is the only one ever used.
+//
+// Per model as well: each model has its own bucket per address, so two
+// models must not share one cursor position - they would hit the same
+// address together.
 const _spreadCursor = new Map<string, number>();
 
-function nextSpreadOffset(origin: string, count: number): number {
+function nextSpreadOffset(origin: string, model: string | undefined, count: number): number {
   if (count <= 0) return 0;
-  const cur = _spreadCursor.get(origin) ?? 0;
-  _spreadCursor.set(origin, (cur + 1) % count);
+  const key = model ? `${origin}|${model}` : origin;
+  const cur = _spreadCursor.get(key) ?? 0;
+  _spreadCursor.set(key, (cur + 1) % count);
   return cur % count;
 }
 
 // Targets whose upstream quota bucket is per egress address, so spreading
 // requests across relays multiplies the allowance.
 //
-// The zen STAGE qualifies: it is a separate opencode deployment with its own
-// database, and the fleet's egress addresses have never been counted there.
-// Production does NOT qualify in the same way - its bucket is shared with
-// every anonymous client on the internet - but spreading there is harmless
-// and keeps the fleet's addresses off the "unknown" bucket, so it is
-// included too.
+// The bucket key is the request's x-real-ip header (upstream
+// util_handler.ts:99 -> util_ipRateLimiter.ts:22), falling back to the
+// literal "unknown" when the header is absent. The fleet handler strips
+// x-real-ip, so every relay's request arrives WITHOUT it and the upstream
+// stamps the RELAY's own egress address there. One address = one bucket.
+//
+// Verified 2026-10-29 with the canonical contract, same model, same body,
+// same minute: relay = 200 billing_source=free, HOME-direct = 429
+// FreeUsageLimitError. Two addresses, two buckets. The bucket is also split
+// PER MODEL (dailyInterval = YYYYMMDD + modelId.slice(0,2) for a model
+// with its own rateLimit) and resets at 00:00 UTC.
+//
+// So BOTH opencode deployments qualify:
+//   * production (opencode.ai) - the fleet's addresses are independent
+//     buckets there too. Pinning one relay for 2 minutes drains one bucket
+//     and leaves 159 untouched; spreading multiplies the lane's daily
+//     capacity by the fleet size.
+//   * the STAGE (dev.opencode.ai) - a separate deployment with its own
+//     database, so its buckets are a different row set entirely.
+//
+// The old comment here claimed production "is shared with every anonymous
+// client on the internet" and therefore does not qualify. That was the
+// misread that kept the fleet pinned to one address: a shared "unknown" row
+// exists for requests that arrive with NO x-real-ip, but a relayed request
+// is stamped with the relay's address, so it never touches that row.
 const SPREAD_TARGETS = new Set<string>([
+  "https://opencode.ai",
   "https://dev.opencode.ai",
 ]);
 
@@ -270,17 +337,23 @@ export function resetRelayRetryState(): void {
   _preferred = null;
   _penalty.clear();
   _spreadCursor.clear();
+  // The spent-evidence counter is per (deployment, model): a reset means the
+  // operator wants the fleet re-probed from scratch, so the accumulated
+  // "this deployment is closed" evidence must go with it.
+  _quotaRejected.clear();
 }
 
-function relayCandidates(state: RelayState, now: number, target?: URL): string[] {
+function relayCandidates(state: RelayState, now: number, target?: URL, model?: string): string[] {
   const out: string[] = [];
   const push = (u: string) => {
-    if (!u || out.includes(u) || penalized(u, now, target)) return;
+    if (!u || out.includes(u) || penalized(u, now, target, model)) return;
     out.push(u);
   };
   // The preferred relay is only pinned when it is NOT a per-egress-bucket
-  // target. The STAGE's whole value is that each relay has its own fresh
-  // bucket there, so sticking to one relay throws that away.
+  // target. Both opencode deployments qualify now: the upstream bucket is
+  // keyed on the request's x-real-ip, and the fleet strips that header, so
+  // the relay's own egress address lands in the row. Sticking to one relay
+  // throws away the other ~159 buckets.
   const spread = target ? isSpreadTarget(target.origin) : false;
   if (!spread && _preferred && _preferred.until > now && (!target || !_preferred.origin || _preferred.origin === target.origin)) {
     push(_preferred.url);
@@ -293,15 +366,40 @@ function relayCandidates(state: RelayState, now: number, target?: URL): string[]
   for (const r of state.relays) push(r.url);
   if (spread && out.length > 1) {
     // Rotate the list so consecutive requests start on a different relay.
-    const off = nextSpreadOffset(target!.origin, out.length);
+    // The cursor is per (origin, model): each model has its own daily bucket
+    // per address, so two different models must not share one rotation
+    // position - they would land on the same address together and drain it
+    // twice as fast.
+    const off = nextSpreadOffset(target!.origin, model, out.length);
     return out.slice(off).concat(out.slice(0, off));
   }
   return out;
 }
 
+// The model id in a request body, when the body is a JSON string.
+//
+// The upstream counts a request against a daily bucket keyed by (egress
+// address, model), so the penalty and the spread rotation must know which
+// model is being asked for. The body is a string on this path (the daemon
+// passes a JSON string so a retry can replay it), and a non-JSON or
+// stream body simply yields undefined - the penalty then stays
+// deployment-scoped, which is the conservative choice.
+function bodyModel(body: BodyInit | null | undefined): string | undefined {
+  if (typeof body !== "string") return undefined;
+  // A cheap pre-check: the model id is always inside a JSON object, so a
+  // body that cannot contain it is skipped without parsing.
+  if (!body.includes('"model"')) return undefined;
+  try {
+    const parsed = JSON.parse(body) as { model?: unknown };
+    return typeof parsed.model === "string" && parsed.model ? parsed.model : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // relay-aware fetch: direct when disabled, else POST via the relay, falling back
-// to the next relay on a retryable status and finally to a direct fetch on a
-// transport error. `init.body` must be replayable (server.ts passes a string).
+// to the next relay on a retryable status and finally to a direct fetch on
+// a transport error. `init.body` must be replayable (server.ts passes a string).
 export async function relayFetch(
   state: RelayState,
   targetUrl: string,
@@ -321,17 +419,44 @@ export async function relayFetch(
   const now = Date.now();
   const spread = isSpreadTarget(u.origin);
   const maxAlternates = spread ? MAX_SPREAD_ALTERNATES : MAX_ALTERNATES;
-  const candidates = relayCandidates(state, now, u).slice(0, 1 + maxAlternates);
+  // The model id decides WHICH daily bucket the upstream counts this request
+  // against (util_ipRateLimiter.ts: dailyInterval = YYYYMMDD +
+  // modelId.slice(0,2) for a model with its own rateLimit), so the penalty
+  // and the spread cursor are both scoped to it.
+  const model = bodyModel(init.body);
+  // The FULL candidate list is the denominator for "is this model really
+  // exhausted?": the fleet has ~160 addresses, and a 429 on the first 13 of
+  // them says nothing about the other 147. The daemon must not park a model
+  // fleet-wide on that evidence, or the lane dies while most of the fleet is
+  // still fresh.
+  const allCandidates = relayCandidates(state, now, u, model);
+  const candidates = allCandidates.slice(0, 1 + maxAlternates);
   // Every candidate is currently marked spent: its egress IP's allowance is
   // used up. Do NOT re-probe one of them — go straight to this machine's own
   // address, which is a different client identity with its own allowance.
-  if (candidates.length === 0) return fetch(targetUrl, init);
-
+  if (candidates.length === 0) {
+    const res = await fetch(targetUrl, init);
+    // The fleet is spent for this model (every relay carries a live penalty),
+    // so the verdict still has to travel to the daemon - otherwise the model
+    // would never be parked and every request would keep paying for a direct
+    // fetch that also fails.
+    return markFleetExhausted(res, fleetIsSpent(state, u, model));
+  }
   // Compress once and reuse across attempts (a retry must not re-pay the CPU).
   const packed = await packBody(init.body);
 
   let last: Response | null = null;
   let quotaHit = false;
+  // The walk continues over the whole candidate list: a 429 on the first few
+  // addresses says nothing about the rest, and the fleet has ~160 addresses
+  // with their own daily rows. Stopping early would kill a lane whose other
+  // addresses still have room.
+  //
+  // The latency of a CLOSED deployment is handled one level up: the daemon
+  // asks the relay layer whether the deployment is already known to be spent,
+  // and if so it goes to the stage FIRST instead of paying the dead round-trips
+  // here. Measured 2026-10-29: production opencode.ai answered 429 on all 160
+  // relays for all 8 anonymous-free ids, and the stage answered in ~3s.
   for (let i = 0; i < candidates.length; i++) {
     const url = candidates[i]!;
     let res: Response;
@@ -347,6 +472,9 @@ export async function relayFetch(
     if (!RETRY_STATUS.has(res.status) && !isRelayRefusal(res.status)) {
       if (url !== state.url) _preferred = { url, until: Date.now() + PREFER_MS, origin: u.origin };
       else _preferred = null;
+      // This address answered: its bucket still has room, so it is not part of
+      // the spent evidence for this (deployment, model).
+      noteQuotaServed(u, model, url);
       return res;
     }
     // A refusal is not a quota verdict and not a broken relay: it is a
@@ -378,9 +506,24 @@ export async function relayFetch(
     // A quota 429 (free allowance spent on that egress IP) is not a relay
     // failure: park the relay until the upstream Retry-After instead of the flat
     // 5 minutes, so the next call does not pay the same dead round-trip again.
+    //
+    // The park is scoped to (address, model): the upstream counts each request
+    // against a bucket keyed by the egress address AND the model id, so an
+    // address that is spent for one id still has room for the others. Measured
+    // 2026-10-29: deepseek-v4.1-flash-free answered 200 on 10/160 addresses
+    // in the same minute that four other ids answered 429 on 160/160.
+    //
+    // A NON-quota 429 (a burst limit) stays deployment-scoped: it is not
+    // evidence about the model's bucket, and hiding the address for every
+    // model would throw away the fleet.
     const penalty = quotaPenaltyMs(res, lastText);
     if (res.status === 429 && penalty > PENALTY_MS) quotaHit = true;
-    _penalty.set(penaltyKey(url, u), Date.now() + penalty);
+    const quotaScoped = res.status === 429 && penalty > PENALTY_MS && model;
+    if (quotaScoped) noteQuotaRejected(u, model, url);
+    _penalty.set(
+      quotaScoped ? penaltyKey(url, u, model) : penaltyKey(url, u),
+      Date.now() + penalty,
+    );
     last = new Response(lastText, { status: res.status, headers: res.headers });
     try {
       await res.body?.cancel();
@@ -400,7 +543,152 @@ export async function relayFetch(
       /* transport failure on the direct path: keep the relay's answer */
     }
   }
-  return last ?? fetch(targetUrl, init);
+  const final = last ?? (await fetch(targetUrl, init));
+  // Did the WHOLE fleet run out, or only the addresses this request happened
+  // to try? The caller parks the model fleet-wide on a quota 429, so it must
+  // know the difference: a 429 on 13 of 160 addresses is not exhaustion.
+  //
+  // Two pieces of evidence, and the stronger one wins:
+  //   * every relay carries a live penalty for this deployment and model;
+  //   * a MAJORITY of the fleet's addresses have answered a quota 429 for it.
+  //
+  // The second is the one that works in practice: a request stops walking the
+  // fleet after a few quota rejections (each attempt costs ~2s), so the
+  // penalty map only covers the addresses that request touched. The counter
+  // accumulates across requests, so a genuinely closed deployment is
+  // recognised after a handful of requests instead of never.
+  //
+  // Until then the model stays alive and the NEXT request lands on another
+  // address.
+  const fleetExhausted =
+    quotaHit && (fleetIsSpent(state, u, model) || fleetIsEssentiallySpent(state, u, model));
+  return markFleetExhausted(final, fleetExhausted);
+}
+
+// Is EVERY relay in the fleet spent for this deployment and model?
+//
+// This is the question the daemon needs answered before it parks a model
+// for the whole upstream refill window: the upstream counts each request
+// against a daily bucket keyed by (egress address, model), and the fleet
+// has ~160 addresses with their own rows. A 429 on the addresses one
+// request happened to try says nothing about the rest, so the model must
+// stay alive and the NEXT request must land on another address.
+//
+// An address counts as spent when it carries a live penalty for this
+// deployment and this model.
+function fleetIsSpent(state: RelayState, target: URL, model?: string): boolean {
+  if (!state.relays.length) return false;
+  const now = Date.now();
+  return state.relays.every((r) => penalized(r.url, now, target, model));
+}
+
+// How many DISTINCT addresses have answered a quota 429 for this
+// (deployment, model) since the last reset.
+//
+// This is the cross-request evidence that the penalty map alone cannot give:
+// the penalty map is keyed by relay URL, and the fleet-exhaustion test asks
+// whether EVERY relay carries a live penalty. But the penalty map is only
+// populated for the addresses a request actually touched, so on a request
+// that stopped early (see MAX_FLEET_PROBE_ATTEMPTS) most of the fleet has no
+// penalty yet and the fleet never looks exhausted.
+//
+// Counting distinct quota-rejected addresses gives a real answer: production
+// opencode.ai was measured at 429 on all 160 relays for all 8 anonymous-free
+// ids, so the fleet IS exhausted there, and the daemon should park the model
+// and fall through to the stage instead of paying the dead round-trips on
+// every request.
+//
+// The counter is per (deployment, model) and resets as soon as an address
+// answers with anything else, so a deployment that recovers is noticed.
+const _quotaRejected = new Map<string, Set<string>>();
+
+function quotaTrackKey(target: URL, model?: string): string {
+  return model ? `${target.origin}|${model}` : target.origin;
+}
+
+function noteQuotaRejected(target: URL, model: string | undefined, url: string): void {
+  const key = quotaTrackKey(target, model);
+  let set = _quotaRejected.get(key);
+  if (!set) {
+    set = new Set();
+    _quotaRejected.set(key, set);
+  }
+  set.add(url);
+}
+
+function noteQuotaServed(target: URL, model: string | undefined, url: string): void {
+  const key = quotaTrackKey(target, model);
+  const set = _quotaRejected.get(key);
+  if (!set) return;
+  set.delete(url);
+}
+
+// How many DISTINCT addresses are known to be spent for this
+// (deployment, model)?
+//
+// The count drives the per-request probe budget: the more addresses are
+// known to be spent, the fewer probes a request should pay for before it
+// gives up and lets the daemon fall through to another deployment.
+function quotaRejectedCount(target: URL, model?: string): number {
+  return _quotaRejected.get(quotaTrackKey(target, model))?.size ?? 0;
+}
+
+// Has a MAJORITY of the fleet's addresses answered a quota 429 for this
+// (deployment, model)?
+//
+// A majority - not all - is the threshold, because the fleet is large and
+// addresses are heterogeneous: one relay may still have room while the rest
+// are spent. But a majority means the deployment is essentially closed, and
+// the remaining minority is worth probing only occasionally.
+//
+// The count is over DISTINCT addresses, so repeating the same relay does not
+// manufacture evidence.
+function fleetIsEssentiallySpent(state: RelayState, target: URL, model?: string): boolean {
+  return deploymentEssentiallySpent(state, target.origin, model);
+}
+
+// Is this deployment closed for this model, as far as the daemon can tell?
+//
+// The daemon needs this BEFORE it sends the request, because a closed
+// deployment should not be tried at all: the prod path costs ~2s per relay
+// and, measured on 2026-10-29, production opencode.ai answered 429 on all
+// 160 relays for all 8 anonymous-free ids. Trying it first means every
+// request pays the dead round-trips before the stage - the one deployment
+// that still has room - is reached.
+//
+// The counter is per (deployment, model) and counts DISTINCT addresses that
+// answered a quota 429, so a single unlucky request cannot close a lane: the
+// threshold is a MAJORITY of the fleet, not one address.
+export function deploymentEssentiallySpent(
+  state: RelayState,
+  origin: string,
+  model?: string,
+): boolean {
+  if (!state.relays.length) return false;
+  const key = model ? `${origin}|${model}` : origin;
+  const set = _quotaRejected.get(key);
+  if (!set || set.size === 0) return false;
+  return set.size * 2 >= state.relays.length;
+}
+
+// The fleet-exhaustion verdict travels on a response header, because the
+// response body is the upstream's own error text and the daemon reads it
+// verbatim for the client.
+export const FLEET_EXHAUSTED_HEADER = "x-bansos-fleet-exhausted";
+
+// Mark a response as "the whole fleet is spent for this model". The daemon
+// reads this to decide whether the model may be parked fleet-wide.
+function markFleetExhausted(res: Response, exhausted: boolean): Response {
+  if (!exhausted) return res;
+  try {
+    const headers = new Headers(res.headers);
+    headers.set(FLEET_EXHAUSTED_HEADER, "1");
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  } catch {
+    // A body that cannot be re-wrapped (already consumed): the verdict is
+    // lost, and the caller falls back to the conservative behaviour.
+    return res;
+  }
 }
 
 // bansos-opt4: Vercel's Fast Origin Transfer meter counts bytes on the WIRE, not
