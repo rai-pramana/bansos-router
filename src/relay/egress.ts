@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 import { promisify } from "node:util";
-import { RELAY_STATE_FILE, readJson, writeJsonAtomic } from "../daemon/state";
+import { BANSOS_DIR, RELAY_STATE_FILE, readJson, writeJsonAtomic } from "../daemon/state";
 
 // only known keyless upstream origins may be targeted via the relay; each entry must equal an upstream chatUrl origin
 // must match each upstream's base-URL origin: LLM7_BASE_URL is
@@ -111,22 +111,6 @@ const MAX_ALTERNATES = 2;
 // fleet mid-deploy can have several of the latter, so the alternates have to
 // be enough to get past them.
 const MAX_SPREAD_ALTERNATES = 12;
-
-// How many relays a SINGLE request may try before the fleet is declared spent
-// for that (deployment, model).
-//
-// The fleet has ~160 relays and the upstream's daily row is per egress
-// ADDRESS, so a 429 on the first few addresses is not fleet-wide exhaustion -
-// the next addresses still have room. The walk therefore continues over the
-// whole candidate list.
-//
-// The latency of a CLOSED deployment is handled one level up: the daemon asks
-// the relay layer whether the deployment is already known to be spent, and if
-// so it goes to the stage FIRST instead of paying the dead round-trips here.
-// Measured 2026-10-29: production opencode.ai answered 429 on all 160 relays
-// for all 8 anonymous-free ids (~26s of round-trips per request), while the
-// stage answered in ~3s.
-const MAX_FLEET_PROBE_ATTEMPTS = 4;
 
 // Is this a free-tier quota rejection (as opposed to a burst rate limit)?
 // Both arrive as 429; only the quota one carries a long Retry-After or the
@@ -339,8 +323,13 @@ export function resetRelayRetryState(): void {
   _spreadCursor.clear();
   // The spent-evidence counter is per (deployment, model): a reset means the
   // operator wants the fleet re-probed from scratch, so the accumulated
-  // "this deployment is closed" evidence must go with it.
+  // "this deployment is closed" evidence must go with it - on disk too.
   _quotaRejected.clear();
+  try {
+    fs.rmSync(QUOTA_EVIDENCE_FILE, { force: true });
+  } catch {
+    // A missing file is the expected state.
+  }
 }
 
 function relayCandidates(state: RelayState, now: number, target?: URL, model?: string): string[] {
@@ -447,16 +436,17 @@ export async function relayFetch(
 
   let last: Response | null = null;
   let quotaHit = false;
-  // The walk continues over the whole candidate list: a 429 on the first few
-  // addresses says nothing about the rest, and the fleet has ~160 addresses
-  // with their own daily rows. Stopping early would kill a lane whose other
-  // addresses still have room.
+  // The walk visits the whole candidate list: a 429 on the first addresses
+  // says nothing about the rest of the fleet (~160 addresses, each with its
+  // own daily row). Stopping early would kill a lane whose other addresses
+  // still have room - measured, one address served >= 800 requests/day
+  // without a 429 while others were spent.
   //
-  // The latency of a CLOSED deployment is handled one level up: the daemon
+  // The candidate list itself is bounded (13 relays for a spread target), and
+  // the LATENCY of a closed deployment is handled one level up: the daemon
   // asks the relay layer whether the deployment is already known to be spent,
-  // and if so it goes to the stage FIRST instead of paying the dead round-trips
-  // here. Measured 2026-10-29: production opencode.ai answered 429 on all 160
-  // relays for all 8 anonymous-free ids, and the stage answered in ~3s.
+  // and if so it goes to the stage FIRST instead of paying the dead
+  // round-trips here.
   for (let i = 0; i < candidates.length; i++) {
     const url = candidates[i]!;
     let res: Response;
@@ -550,12 +540,11 @@ export async function relayFetch(
   //
   // Two pieces of evidence, and the stronger one wins:
   //   * every relay carries a live penalty for this deployment and model;
-  //   * a MAJORITY of the fleet's addresses have answered a quota 429 for it.
+  //   * every address a single request can WALK has answered a quota 429.
   //
-  // The second is the one that works in practice: a request stops walking the
-  // fleet after a few quota rejections (each attempt costs ~2s), so the
-  // penalty map only covers the addresses that request touched. The counter
-  // accumulates across requests, so a genuinely closed deployment is
+  // The second is the one that works in practice: the walk is bounded, so
+  // the penalty map only covers the addresses that request touched. The
+  // counter accumulates across requests, so a genuinely closed deployment is
   // recognised after a handful of requests instead of never.
   //
   // Until then the model stays alive and the NEXT request lands on another
@@ -588,9 +577,8 @@ function fleetIsSpent(state: RelayState, target: URL, model?: string): boolean {
 // This is the cross-request evidence that the penalty map alone cannot give:
 // the penalty map is keyed by relay URL, and the fleet-exhaustion test asks
 // whether EVERY relay carries a live penalty. But the penalty map is only
-// populated for the addresses a request actually touched, so on a request
-// that stopped early (see MAX_FLEET_PROBE_ATTEMPTS) most of the fleet has no
-// penalty yet and the fleet never looks exhausted.
+// populated for the addresses a request actually touched, and one request
+// touches 13 of the ~160, so the fleet never looks exhausted on its own.
 //
 // Counting distinct quota-rejected addresses gives a real answer: production
 // opencode.ai was measured at 429 on all 160 relays for all 8 anonymous-free
@@ -598,12 +586,76 @@ function fleetIsSpent(state: RelayState, target: URL, model?: string): boolean {
 // and fall through to the stage instead of paying the dead round-trips on
 // every request.
 //
-// The counter is per (deployment, model) and resets as soon as an address
+// The counter is per (deployment, model ROW) and resets as soon as an address
 // answers with anything else, so a deployment that recovers is noticed.
 const _quotaRejected = new Map<string, Set<string>>();
 
+// How many (deployment, model row) pairs are tracked at once. The catalog is
+// small, but relayFetch takes the model id from the request body, so an
+// unbounded key space is reachable from outside. The cap keeps a flood of
+// one-off ids from growing the map without limit; the oldest entries go
+// first, and a real lane's entry is refreshed on every use.
+const MAX_QUOTA_TRACK_KEYS = 256;
+
+// The spent evidence is written to disk so a daemon restart does not have to
+// relearn it.
+//
+// Measured 2026-10-29: the first request after a restart paid ~26s of dead
+// production round-trips before the stage answered, because the evidence was
+// in memory only. The upstream's daily row refills at 00:00 UTC, so the
+// evidence is valid for the rest of the UTC day - exactly as long as the
+// upstream's own penalty.
+const QUOTA_EVIDENCE_FILE = path.join(BANSOS_DIR, "quota-evidence.json");
+
+interface QuotaEvidenceFile {
+  // "<origin>|<prefix>" -> { spent: string[]; until: epochMs }
+  rows: Record<string, { spent: string[]; until: number }>;
+}
+
+function quotaEvidenceUntil(now = Date.now()): number {
+  // The upstream's row refills at 00:00 UTC, so the evidence cannot outlive
+  // the UTC day it was collected in.
+  const nextMidnight = Date.UTC(
+    new Date(now).getUTCFullYear(),
+    new Date(now).getUTCMonth(),
+    new Date(now).getUTCDate() + 1,
+  );
+  return nextMidnight;
+}
+
+function persistQuotaEvidence(): void {
+  const until = quotaEvidenceUntil();
+  const rows: Record<string, { spent: string[]; until: number }> = {};
+  for (const [key, set] of _quotaRejected) {
+    if (set.size === 0) continue;
+    rows[key] = { spent: [...set], until };
+  }
+  try {
+    writeJsonAtomic(QUOTA_EVIDENCE_FILE, { rows }, 0);
+  } catch {
+    // A failed write only costs the next restart its shortcut.
+  }
+}
+
+function restoreQuotaEvidence(): void {
+  const file = readJson<QuotaEvidenceFile>(QUOTA_EVIDENCE_FILE);
+  if (!file || typeof file.rows !== "object" || file.rows === null) return;
+  const now = Date.now();
+  for (const [key, entry] of Object.entries(file.rows)) {
+    if (!entry || typeof entry.until !== "number" || entry.until <= now) continue;
+    const set = new Set<string>((entry.spent ?? []).filter((u) => typeof u === "string"));
+    if (set.size) _quotaRejected.set(key, set);
+  }
+}
+
 function quotaTrackKey(target: URL, model?: string): string {
-  return model ? `${target.origin}|${model}` : target.origin;
+  // The upstream row is keyed by the FIRST TWO CHARACTERS of the id
+  // (util_ipRateLimiter.ts:25), so two ids sharing a prefix are ONE budget.
+  // The tracker uses the same key, otherwise "deepseek-v4.1-flash-free" and
+  // "deepseek-v4-flash" would each look like their own row and the spent
+  // evidence would be undercounted.
+  const prefix = model ? model.slice(0, 2) : "";
+  return prefix ? `${target.origin}|${prefix}` : target.origin;
 }
 
 function noteQuotaRejected(target: URL, model: string | undefined, url: string): void {
@@ -612,15 +664,23 @@ function noteQuotaRejected(target: URL, model: string | undefined, url: string):
   if (!set) {
     set = new Set();
     _quotaRejected.set(key, set);
+    // Bound the key space: the oldest key is dropped when the cap is hit.
+    while (_quotaRejected.size > MAX_QUOTA_TRACK_KEYS) {
+      const oldest = _quotaRejected.keys().next();
+      if (oldest.done) break;
+      _quotaRejected.delete(oldest.value);
+    }
   }
   set.add(url);
+  persistQuotaEvidence();
 }
 
 function noteQuotaServed(target: URL, model: string | undefined, url: string): void {
   const key = quotaTrackKey(target, model);
   const set = _quotaRejected.get(key);
   if (!set) return;
-  set.delete(url);
+  if (set.delete(url) && set.size === 0) _quotaRejected.delete(key);
+  persistQuotaEvidence();
 }
 
 // How many DISTINCT addresses are known to be spent for this
@@ -650,25 +710,33 @@ function fleetIsEssentiallySpent(state: RelayState, target: URL, model?: string)
 // Is this deployment closed for this model, as far as the daemon can tell?
 //
 // The daemon needs this BEFORE it sends the request, because a closed
-// deployment should not be tried at all: the prod path costs ~2s per relay
+// deployment should not be tried first: the prod path costs ~2s per relay
 // and, measured on 2026-10-29, production opencode.ai answered 429 on all
 // 160 relays for all 8 anonymous-free ids. Trying it first means every
-// request pays the dead round-trips before the stage - the one deployment
-// that still has room - is reached.
+// request pays ~26s of dead round-trips before the stage - the one
+// deployment that still has room - is reached.
 //
-// The counter is per (deployment, model) and counts DISTINCT addresses that
-// answered a quota 429, so a single unlucky request cannot close a lane: the
-// threshold is a MAJORITY of the fleet, not one address.
+// The threshold is the number of addresses a single request can WALK: the
+// deployment rejected every address this request could reach, so there is no
+// fresh address in reach.
+//
+// The walk visits up to MAX_SPREAD_ALTERNATES + 1 = 13 relays for a spread
+// target, so 13 distinct rejections mean the whole reachable set is spent.
+// The fleet itself has ~160 relays, but they are reached over several
+// requests - the candidates rotate, and each rejection parks its address.
+//
+// A false "closed" is harmless here: the stage-first attempt falls through
+// to the normal path when the stage does not serve the model, so a wrong
+// verdict only reorders two attempts.
 export function deploymentEssentiallySpent(
   state: RelayState,
   origin: string,
   model?: string,
 ): boolean {
   if (!state.relays.length) return false;
-  const key = model ? `${origin}|${model}` : origin;
-  const set = _quotaRejected.get(key);
+  const set = _quotaRejected.get(quotaTrackKey(new URL(origin), model));
   if (!set || set.size === 0) return false;
-  return set.size * 2 >= state.relays.length;
+  return set.size >= MAX_SPREAD_ALTERNATES + 1;
 }
 
 // The fleet-exhaustion verdict travels on a response header, because the
@@ -805,3 +873,14 @@ export function removeRelay(state: RelayState, url: string): RelayState {
   if (state.url === url) state.url = "";
   return state;
 }
+
+// Restore the spent evidence from disk at module load.
+//
+// The daemon is restarted often (an install, a config change, a crash), and
+// without this every restart pays the full dead-production walk once more:
+// measured 2026-10-29, ~26s before the stage answered.
+//
+// The file is only written by this module, and it expires at 00:00 UTC with
+// the upstream's own row, so a stale file cannot close a lane for longer
+// than the upstream's own budget lasts.
+restoreQuotaEvidence();

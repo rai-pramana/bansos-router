@@ -245,13 +245,13 @@ test("every address answering 429 is reported as fleet exhaustion", async () => 
 // relays for all 8 anonymous-free ids, so every request paid ~26s of
 // round-trips before the stage answered in ~3s.
 //
-// The evidence is per (deployment, model): a 429 on one deployment says
-// nothing about the other one, and a 429 on one model says nothing about
-// the others.
+// The evidence is per (deployment, model ROW): a 429 on one deployment says
+// nothing about the other one, and the upstream keys the row by the first
+// two characters of the id.
 test("a closed deployment is recognised for its own model only", async () => {
   const { restore } = stubFetch(() => 429);
   try {
-    const relays = ["https://r1.example", "https://r2.example", "https://r3.example"];
+    const relays = Array.from({ length: 13 }, (_, i) => `https://r${i}.example`);
     const st = state(relays[0]!, relays.slice(1));
     const res = await relayFetch(st, TARGET, {
       method: "POST",
@@ -262,12 +262,12 @@ test("a closed deployment is recognised for its own model only", async () => {
     assert.equal(
       deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
       true,
-      "every address answered 429, so the deployment is closed for this model",
+      "every reachable address answered 429, so the deployment is closed for this model",
     );
     assert.equal(
       deploymentEssentiallySpent(st, new URL(TARGET).origin, "beam-free"),
       false,
-      "a different model has its own row and must not inherit the verdict",
+      "a different model row has its own budget and must not inherit the verdict",
     );
     assert.equal(
       deploymentEssentiallySpent(st, "https://dev.opencode.ai", "deepseek-v4.1-flash-free"),

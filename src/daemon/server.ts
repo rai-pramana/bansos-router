@@ -2036,6 +2036,23 @@ async function runChatForward(
       });
     }
 
+    if (!isUpstreamAllowed(security, currentUpstream.id)) {
+      log.warn("upstream blocked by strict security policy", {
+        model: current.id,
+        upstream: currentUpstream.id,
+        status: 403,
+        durationMs: Date.now() - requestStartedAt,
+        failoverBlocked: true,
+      });
+      return {
+        status: 403,
+        type: "security_policy_error",
+        message: security.allowedUpstreams.length === 0
+          ? "strict security mode blocks external LLM requests until security.allowedUpstreams explicitly permits a provider"
+          : `upstream "${currentUpstream.id}" is not allowed by strict security policy`,
+      };
+    }
+
     // The STAGE first, when production is known to be closed for this model.
     //
     // Production opencode.ai and the stage dev.opencode.ai are separate
@@ -2050,9 +2067,12 @@ async function runChatForward(
     // the SAME model id. It therefore stays under the stage's own switch
     // (BANSOS_ZEN_STAGE) and the per-request x-bansos-no-failover opt-out.
     //
+    // It sits AFTER the security check above: a strict policy that does not
+    // allow the zen upstream must not be answered through the stage either.
+    //
     // The "known to be closed" evidence is the relay layer's distinct-address
-    // quota counter: a MAJORITY of the fleet's addresses have answered a
-    // quota 429 for this (deployment, model). One address is not enough.
+    // quota counter: every address this request could reach has answered a
+    // quota 429 for this (deployment, model row).
     const zenOrigin = safeOrigin(currentUpstream.chatUrl);
     if (
       currentUpstream.id === "zen" &&
@@ -2076,23 +2096,6 @@ async function runChatForward(
       if (staged) {
         return { response: staged, model: current, upstream: zenStage.upstream, relay: "" };
       }
-    }
-
-    if (!isUpstreamAllowed(security, currentUpstream.id)) {
-      log.warn("upstream blocked by strict security policy", {
-        model: current.id,
-        upstream: currentUpstream.id,
-        status: 403,
-        durationMs: Date.now() - requestStartedAt,
-        failoverBlocked: true,
-      });
-      return {
-        status: 403,
-        type: "security_policy_error",
-        message: security.allowedUpstreams.length === 0
-          ? "strict security mode blocks external LLM requests until security.allowedUpstreams explicitly permits a provider"
-          : `upstream "${currentUpstream.id}" is not allowed by strict security policy`,
-      };
     }
 
     const headers = new Headers({
