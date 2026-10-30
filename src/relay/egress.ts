@@ -571,7 +571,7 @@ export async function relayFetch(
   // bar of 12 would race on the very first request, spending one request from
   // up to 6 healthy addresses on every call.
   const fleetKnownSpent =
-    quotaRejectedCount(u, model) >= Math.max(MAX_SPREAD_ALTERNATES + 1, Math.ceil(state.relays.length / 2));
+    quotaRejectedCount(u, model) >= fleetSpentThreshold(state.relays.length);
   const raceable = first.kind === "quota" && fleetKnownSpent;
   const rest = candidates.slice(1);
   if (rest.length > 0 && raceable) {
@@ -793,6 +793,35 @@ function fleetIsEssentiallySpent(state: RelayState, target: URL, model?: string)
   return deploymentEssentiallySpent(state, target.origin, model);
 }
 
+// How many distinct addresses must have answered a quota 429 before the
+// deployment counts as closed for that model row.
+//
+// A MAJORITY of the fleet, not the per-request walk size. The threshold used
+// to be MAX_SPREAD_ALTERNATES + 1 = 13, on the reasoning that "the walk visits
+// 13 relays, so 13 distinct rejections mean the whole reachable set is
+// spent". That reasoning was wrong in a way that cost the lane its whole day:
+//
+//   * one request only walks 13 of ~160 addresses, so 13 rejections say
+//     nothing about the other 147;
+//   * the fleet ROTATES the candidates, so the next request's 13 are
+//     different addresses. The count climbed slowly but it DID climb: the
+//     spent-evidence file on 2026-10-30 held 162 distinct addresses for the
+//     "de" row;
+//   * the verdict therefore needed ~13 SEPARATE requests to fire, each paying
+//     ~27s of dead round-trips. Measured 2026-10-30: beam-free took 26.5s
+//     and nemotron-3.5-super-vl-free 29.0s per request.
+//
+// The floor keeps the verdict from firing on a tiny fleet where one address
+// is half the fleet: on a fleet smaller than 26 addresses the walk can cover
+// the whole fleet in one request, so 13 rejections already are a majority.
+//
+// A false "closed" is harmless: the stage-first attempt falls through to the
+// normal path when the stage does not serve the model, so a wrong verdict
+// costs one wasted stage lookup, not a broken lane.
+function fleetSpentThreshold(relayCount: number): number {
+  return Math.max(MAX_SPREAD_ALTERNATES + 1, Math.ceil(relayCount / 2));
+}
+
 // Is this deployment closed for this model, as far as the daemon can tell?
 //
 // The daemon needs this BEFORE it sends the request, because a closed
@@ -802,36 +831,13 @@ function fleetIsEssentiallySpent(state: RelayState, target: URL, model?: string)
 // request pays ~26s of dead round-trips before the stage - the one
 // deployment that still has room - is reached.
 //
-// THE THRESHOLD IS THE REAL FLEET SIZE, NOT THE PER-REQUEST WALK SIZE.
+// A majority - not all - is the threshold, because the fleet is large and
+// addresses are heterogeneous: one relay may still have room while the rest
+// are spent. But a majority means the deployment is essentially closed, and
+// the remaining minority is worth probing only occasionally.
 //
-// The threshold used to be MAX_SPREAD_ALTERNATES + 1 = 13, on the reasoning
-// that "the walk visits 13 relays, so 13 distinct rejections mean the whole
-// reachable set is spent". That reasoning is wrong in a way that cost the
-// lane its whole day:
-//
-//   * one request only walks 13 of ~160 addresses, so 13 rejections say
-//     nothing about the other 147 - the comment right above this function
-//     says exactly that, and then the threshold contradicted it;
-//   * the fleet ROTATES the candidates, so the next request's 13 are
-//     different addresses. The count therefore climbs slowly, but it DID
-//     climb: the spent-evidence file on 2026-10-30 held 162 distinct
-//     addresses for the "de" row.
-//   * the verdict was reached only after ~13 SEPARATE requests, each paying
-//     ~27s of dead round-trips. Measured 2026-10-30: beam-free took 26.5s
-//     and nemotron-3.5-super-vl-free 29.0s per request.
-//
-// The correct question is "have a MAJORITY of the fleet's addresses answered
-// a quota 429 for this row". The fleet size is known (state.relays.length),
-// so the threshold is half of it. That is the same "majority, not all"
-// argument the old comment made, applied to the real denominator.
-//
-// The floor keeps the verdict from firing on a tiny fleet where one address
-// is half the fleet: MAX_SPREAD_ALTERNATES + 1 stays as the minimum bar.
-//
-// A false "closed" is harmless here: the stage-first attempt falls through
-// to the normal path when the stage does not serve the model, so a wrong
-// verdict costs one wasted stage lookup, not a broken lane.
-// verdict only reorders two attempts.
+// The count is over DISTINCT addresses, so repeating the same relay does not
+// manufacture evidence.
 export function deploymentEssentiallySpent(
   state: RelayState,
   origin: string,
@@ -840,18 +846,7 @@ export function deploymentEssentiallySpent(
   if (!state.relays.length) return false;
   const set = _quotaRejected.get(quotaTrackKey(new URL(origin), model));
   if (!set || set.size === 0) return false;
-  // A MAJORITY of the fleet's addresses must have answered a quota 429 for
-  // this row. The denominator is the real fleet size, so the verdict fires
-  // once the fleet is genuinely closed instead of after 13 addresses.
-  //
-  // The floor is the per-request walk size: on a fleet smaller than 26
-  // addresses the walk can cover the whole fleet in one request, and 13
-  // rejections would already be a majority.
-  const threshold = Math.max(
-    MAX_SPREAD_ALTERNATES + 1,
-    Math.ceil(state.relays.length / 2),
-  );
-  return set.size >= threshold;
+  return set.size >= fleetSpentThreshold(state.relays.length);
 }
 
 // The fleet-exhaustion verdict travels on a response header, because the
