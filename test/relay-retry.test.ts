@@ -302,6 +302,146 @@ test("a single rejected address does not close a deployment", async () => {
   }
 });
 
+// THE THRESHOLD IS THE REAL FLEET SIZE, NOT THE PER-REQUEST WALK SIZE.
+//
+// A request only walks 13 of ~160 addresses, so 13 rejections say nothing
+// about the rest. The old threshold (13) therefore needed ~13 SEPARATE
+// requests to close a deployment that was closed from the first one - and each
+// of those requests paid ~27s of dead round-trips (measured 2026-10-30:
+// beam-free 26.5s, nemotron-3.5-super-vl-free 29.0s).
+//
+// The threshold is now a MAJORITY of the fleet, so the daemon parks the model
+// (and the stage takes over) as soon as the fleet is genuinely closed.
+test("a 160-address fleet is closed after a majority of its addresses answer 429", async () => {
+  const { restore } = stubFetch(() => 429);
+  try {
+    const relays = Array.from({ length: 160 }, (_, i) => `https://r${i}.example`);
+    const st = state(relays[0]!, relays.slice(1));
+    // One request walks 13 addresses - far from a majority of 160.
+    const res = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(res.status, 429);
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
+      false,
+      "13 of 160 addresses is not a majority - the fleet is not proven closed yet",
+    );
+
+    // Now let the whole reachable set answer 429 repeatedly. The candidate
+    // list rotates, so each request reaches fresh addresses; after enough
+    // rounds the majority is reached and the deployment IS closed.
+    for (let round = 0; round < 20; round++) {
+      await relayFetch(st, TARGET, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"deepseek-v4.1-flash-free"}',
+      });
+    }
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
+      true,
+      "a majority of 160 addresses answering 429 closes the deployment",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// A fleet SMALLER than twice the walk size can be covered by one request, so
+// the floor keeps the old behaviour there: 13 rejections on a 20-address fleet
+// are already a majority.
+test("a small fleet is closed as soon as a majority of it answers 429", async () => {
+  const { restore } = stubFetch(() => 429);
+  try {
+    const relays = Array.from({ length: 20 }, (_, i) => `https://r${i}.example`);
+    const st = state(relays[0]!, relays.slice(1));
+    await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
+      true,
+      "13 of 20 addresses is a majority, so the small fleet is closed",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// A quota 429 is FREE upstream (the limiter's check() throws before track()),
+// so once the fleet is known to be spent the remaining candidates can be RACED
+// instead of walked. Measured 2026-10-30: the sequential walk cost 13 x 2.1s =
+// ~27s, the same candidates raced answered in ~1.5s.
+//
+// The race must not fire while the fleet still has room: a 200 from a raced
+// candidate spends that address's budget on a request nobody asked for.
+//
+// The scenario is a fleet that is MOSTLY spent (so a majority of its addresses
+// have answered 429) but still has FRESH addresses at the end of the candidate
+// list. That is the real shape of the problem: the old walk paid 13 dead
+// round-trips before it reached the fresh address.
+test("a mostly-spent fleet is raced, so the candidates answer in parallel", async () => {
+  let peak = 0;
+  let live = 0;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes("opencode.ai")) {
+      // the direct fallback (this machine's own bucket)
+      return new Response('{"error":{"type":"FreeUsageLimitError"}}', { status: 429 });
+    }
+    live++;
+    peak = Math.max(peak, live);
+    await new Promise((r) => setTimeout(r, 30));
+    live--;
+    const n = Number(/r(\d+)\.example/.exec(url)?.[1] ?? "0");
+    // The fresh addresses are the HIGH ones: the walk reaches them last, so
+    // only a race finds them in one round-trip.
+    return new Response(
+      n >= 150 ? '{"ok":true}' : '{"error":{"type":"FreeUsageLimitError"}}',
+      { status: n >= 150 ? 200 : 429, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+  try {
+    const relays = Array.from({ length: 160 }, (_, i) => `https://r${i}.example`);
+    const st = state(relays[0]!, relays.slice(1));
+    const body = '{"model":"deepseek-v4.1-flash-free"}';
+    // Warm the spent-evidence up to a majority of the fleet. Each round walks
+    // fresh candidates (the rejected ones carry a penalty and are skipped), so
+    // the count climbs until the majority is reached.
+    for (let round = 0; round < 20; round++) {
+      await relayFetch(st, TARGET, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+    }
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
+      true,
+      "the warm-up must reach a majority of the fleet",
+    );
+    peak = 0;
+    const res = await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+    assert.ok(
+      peak > 1,
+      `the candidates must be raced once the fleet is known to be spent (peak concurrency was ${peak})`,
+    );
+    assert.equal(res.status, 200, "the race must still find the address that has room");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 // The upstream row is keyed by the FIRST TWO CHARACTERS of the model id
 // (util_ipRateLimiter.ts:25: dailyInterval = YYYYMMDD + modelId.slice(0,2)),
 // so two ids sharing a prefix are ONE budget. A penalty on

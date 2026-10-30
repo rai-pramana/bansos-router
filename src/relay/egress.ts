@@ -112,6 +112,23 @@ const MAX_ALTERNATES = 2;
 // be enough to get past them.
 const MAX_SPREAD_ALTERNATES = 12;
 
+// How many candidates may be in flight at once once the first one failed.
+//
+// The first candidate is always tried alone: on a healthy fleet it answers,
+// and racing would spend a request from every other address's budget for
+// nothing (a 200 consumes one request of that address's row).
+//
+// After a failure the fleet may be spent, and a SPENT fleet is the expensive
+// case: measured 2026-10-30, a relay answers 429 in ~2.1s, so walking 13
+// candidates one by one cost ~27s per request (the daemon log showed 26.5s
+// and 29.0s for two ids). The same candidates raced answered in ~1.5s.
+//
+// The width is bounded so a big fleet cannot stampede the upstream: 6
+// concurrent requests is below the point where the upstream starts refusing
+// for concurrency rather than for quota (the audit measured 6 workers turning
+// healthy relays into 503s, and 2 workers keeping all but one real 404).
+const RACE_WIDTH = 6;
+
 // Is this a free-tier quota rejection (as opposed to a burst rate limit)?
 // Both arrive as 429; only the quota one carries a long Retry-After or the
 // FreeUsageLimitError body.
@@ -434,64 +451,70 @@ export async function relayFetch(
   // Compress once and reuse across attempts (a retry must not re-pay the CPU).
   const packed = await packBody(init.body);
 
-  let last: Response | null = null;
-  let quotaHit = false;
-  // The walk visits the whole candidate list: a 429 on the first addresses
-  // says nothing about the rest of the fleet (~160 addresses, each with its
-  // own daily row). Stopping early would kill a lane whose other addresses
-  // still have room - measured, one address served >= 800 requests/day
-  // without a 429 while others were spent.
-  //
-  // The candidate list itself is bounded (13 relays for a spread target), and
-  // the LATENCY of a closed deployment is handled one level up: the daemon
-  // asks the relay layer whether the deployment is already known to be spent,
-  // and if so it goes to the stage FIRST instead of paying the dead
-  // round-trips here.
-  for (let i = 0; i < candidates.length; i++) {
-    const url = candidates[i]!;
+  // One candidate's outcome. The body is read BEFORE the response is cancelled:
+  // returning a cancelled Response as `last` used to surface as "Body is
+  // unusable: Body has already been read" at the caller's res.text() — every
+  // exhausted retry turned into a 502 that hid the real upstream status.
+  type Attempt =
+    | { kind: "ok"; url: string; res: Response }
+    | { kind: "quota"; url: string; res: Response; text: string }
+    | { kind: "retry"; url: string; res: Response; text: string }
+    | { kind: "refusal"; url: string }
+    | { kind: "transport"; url: string };
+
+  const attempt = async (url: string): Promise<Attempt> => {
     let res: Response;
     try {
       res = await relayOnce(url, u, init, packed);
     } catch {
-      // Transport failure (dead deployment, DNS, reset). Try the next relay; if
-      // none is left, the caller's direct-fetch fallback still applies.
-      _penalty.set(penaltyKey(url, u), Date.now() + PENALTY_MS);
-      if (i === candidates.length - 1) return fetch(targetUrl, init);
-      continue;
+      // Transport failure (dead deployment, DNS, reset).
+      return { kind: "transport", url };
     }
     if (!RETRY_STATUS.has(res.status) && !isRelayRefusal(res.status)) {
-      if (url !== state.url) _preferred = { url, until: Date.now() + PREFER_MS, origin: u.origin };
-      else _preferred = null;
-      // This address answered: its bucket still has room, so it is not part of
-      // the spent evidence for this (deployment, model).
-      noteQuotaServed(u, model, url);
-      return res;
+      return { kind: "ok", url, res };
     }
-    // A refusal is not a quota verdict and not a broken relay: it is a
-    // deployment that does not know this target. Skip it (short penalty so
-    // it is retried rarely) and try the next relay.
     if (isRelayRefusal(res.status)) {
-      _penalty.set(penaltyKey(url, u), Date.now() + PENALTY_MS);
+      // A refusal is not a quota verdict and not a broken relay: it is a
+      // deployment that does not know this target.
       try {
         await res.body?.cancel();
       } catch {
         /* already closed */
       }
-      if (i === candidates.length - 1) {
-        // No relay in the fleet forwards this target. Fall back to direct.
-        return fetch(targetUrl, init);
-      }
-      continue;
+      return { kind: "refusal", url };
     }
-    // Read the body BEFORE cancelling it. Returning the cancelled Response as
-    // `last` used to surface as "Body is unusable: Body has already been read"
-    // at the caller's res.text() — every exhausted retry turned into a 502 that
-    // hid the real upstream status. Re-wrap the text so `last` stays readable.
-    let lastText = "";
+    let text = "";
     try {
-      lastText = await res.text();
+      text = await res.text();
     } catch {
       /* body already gone */
+    }
+    return res.status === 429
+      ? { kind: "quota", url, res, text }
+      : { kind: "retry", url, res, text };
+  };
+
+  let last: Response | null = null;
+  let quotaHit = false;
+
+  // Record one attempt's consequence: the penalty, the spent evidence, and the
+  // preferred relay. Kept in one place so the sequential attempt and the raced
+  // attempts cannot drift apart.
+  const record = (a: Attempt): void => {
+    if (a.kind === "ok") {
+      if (a.url !== state.url) _preferred = { url: a.url, until: Date.now() + PREFER_MS, origin: u.origin };
+      else _preferred = null;
+      // This address answered: its bucket still has room, so it is not part of
+      // the spent evidence for this (deployment, model).
+      noteQuotaServed(u, model, a.url);
+      return;
+    }
+    if (a.kind === "transport" || a.kind === "refusal") {
+      // A caller-side abort is not the relay's fault: penalising the address
+      // would throw away a healthy relay because the client hung up.
+      if (a.kind === "transport" && init.signal?.aborted) return;
+      _penalty.set(penaltyKey(a.url, u), Date.now() + PENALTY_MS);
+      return;
     }
     // A quota 429 (free allowance spent on that egress IP) is not a relay
     // failure: park the relay until the upstream Retry-After instead of the flat
@@ -506,19 +529,82 @@ export async function relayFetch(
     // A NON-quota 429 (a burst limit) stays deployment-scoped: it is not
     // evidence about the model's bucket, and hiding the address for every
     // model would throw away the fleet.
-    const penalty = quotaPenaltyMs(res, lastText);
-    if (res.status === 429 && penalty > PENALTY_MS) quotaHit = true;
-    const quotaScoped = res.status === 429 && penalty > PENALTY_MS && model;
-    if (quotaScoped) noteQuotaRejected(u, model, url);
+    const penalty = quotaPenaltyMs(a.res, a.text);
+    if (a.kind === "quota" && penalty > PENALTY_MS) quotaHit = true;
+    const quotaScoped = a.kind === "quota" && penalty > PENALTY_MS && model;
+    if (quotaScoped) noteQuotaRejected(u, model, a.url);
     _penalty.set(
-      quotaScoped ? penaltyKey(url, u, model) : penaltyKey(url, u),
+      quotaScoped ? penaltyKey(a.url, u, model) : penaltyKey(a.url, u),
       Date.now() + penalty,
     );
-    last = new Response(lastText, { status: res.status, headers: res.headers });
-    try {
-      await res.body?.cancel();
-    } catch {
-      /* already closed */
+    last = new Response(a.text, { status: a.res.status, headers: a.res.headers });
+  };
+
+  // The FIRST candidate goes alone: on a healthy fleet it is the one that
+  // answers, and racing would spend a request from every other address's
+  // budget for nothing.
+  const first = await attempt(candidates[0]!);
+  record(first);
+  if (first.kind === "ok") return first.res;
+
+  // A QUOTA 429 means the fleet may be spent, so the REST of the candidates can
+  // be raced instead of walked one by one.
+  //
+  // Racing is safe here and only here: a quota 429 is FREE upstream (the
+  // limiter's check() throws before track(), so a rejected request consumes no
+  // budget) and the next candidate is a DIFFERENT egress address with its own
+  // row. A 5xx or a transport error is NOT free — a 200 from the raced
+  // candidate would spend that address's budget on a request nobody asked for
+  // — so those keep the sequential walk.
+  //
+  // Racing is also only worth it when the fleet is ALREADY known to be spent
+  // for this model. Otherwise the sequential walk finds the next address with
+  // room after one round-trip (~2.1s), while racing would spend one request
+  // from up to RACE_WIDTH addresses that all had room. So the race is gated on
+  // the spent-evidence counter, which is exactly the condition under which the
+  // daemon is about to fall through to the stage anyway.
+  //
+  // The bar is the same majority-of-the-fleet rule the daemon's park uses, so
+  // the two agree: the daemon parks the model (and the stage takes over) only
+  // after a majority of the fleet has answered 429, and the race opens at the
+  // same point. A fixed bar would desynchronise them - with 160 addresses, a
+  // bar of 12 would race on the very first request, spending one request from
+  // up to 6 healthy addresses on every call.
+  const fleetKnownSpent =
+    quotaRejectedCount(u, model) >= Math.max(MAX_SPREAD_ALTERNATES + 1, Math.ceil(state.relays.length / 2));
+  const raceable = first.kind === "quota" && fleetKnownSpent;
+  const rest = candidates.slice(1);
+  if (rest.length > 0 && raceable) {
+    const attempts: Attempt[] = [];
+    let next = 0;
+    let served = false;
+    const worker = async (): Promise<void> => {
+      while (!served) {
+        const i = next++;
+        if (i >= rest.length) return;
+        const a = await attempt(rest[i]!);
+        attempts.push(a);
+        record(a);
+        if (a.kind === "ok") served = true;
+      }
+    };
+    const width = Math.min(RACE_WIDTH, rest.length);
+    await Promise.all(Array.from({ length: width }, () => worker()));
+    const winner = attempts.find((a) => a.kind === "ok");
+    if (winner && winner.kind === "ok") return winner.res;
+  } else {
+    // Not a quota rejection: walk the rest one by one. Each step keeps the
+    // old semantics, including the direct fallback when the fleet is exhausted.
+    for (let i = 0; i < rest.length; i++) {
+      const a = await attempt(rest[i]!);
+      record(a);
+      if (a.kind === "ok") return a.res;
+      if (a.kind === "transport" || a.kind === "refusal") {
+        if (i === rest.length - 1) {
+          // No relay in the fleet forwards this target. Fall back to direct.
+          return fetch(targetUrl, init);
+        }
+      }
     }
   }
   // The fleet could not serve it and the reason was a spent allowance. The local
@@ -716,17 +802,35 @@ function fleetIsEssentiallySpent(state: RelayState, target: URL, model?: string)
 // request pays ~26s of dead round-trips before the stage - the one
 // deployment that still has room - is reached.
 //
-// The threshold is the number of addresses a single request can WALK: the
-// deployment rejected every address this request could reach, so there is no
-// fresh address in reach.
+// THE THRESHOLD IS THE REAL FLEET SIZE, NOT THE PER-REQUEST WALK SIZE.
 //
-// The walk visits up to MAX_SPREAD_ALTERNATES + 1 = 13 relays for a spread
-// target, so 13 distinct rejections mean the whole reachable set is spent.
-// The fleet itself has ~160 relays, but they are reached over several
-// requests - the candidates rotate, and each rejection parks its address.
+// The threshold used to be MAX_SPREAD_ALTERNATES + 1 = 13, on the reasoning
+// that "the walk visits 13 relays, so 13 distinct rejections mean the whole
+// reachable set is spent". That reasoning is wrong in a way that cost the
+// lane its whole day:
+//
+//   * one request only walks 13 of ~160 addresses, so 13 rejections say
+//     nothing about the other 147 - the comment right above this function
+//     says exactly that, and then the threshold contradicted it;
+//   * the fleet ROTATES the candidates, so the next request's 13 are
+//     different addresses. The count therefore climbs slowly, but it DID
+//     climb: the spent-evidence file on 2026-10-30 held 162 distinct
+//     addresses for the "de" row.
+//   * the verdict was reached only after ~13 SEPARATE requests, each paying
+//     ~27s of dead round-trips. Measured 2026-10-30: beam-free took 26.5s
+//     and nemotron-3.5-super-vl-free 29.0s per request.
+//
+// The correct question is "have a MAJORITY of the fleet's addresses answered
+// a quota 429 for this row". The fleet size is known (state.relays.length),
+// so the threshold is half of it. That is the same "majority, not all"
+// argument the old comment made, applied to the real denominator.
+//
+// The floor keeps the verdict from firing on a tiny fleet where one address
+// is half the fleet: MAX_SPREAD_ALTERNATES + 1 stays as the minimum bar.
 //
 // A false "closed" is harmless here: the stage-first attempt falls through
 // to the normal path when the stage does not serve the model, so a wrong
+// verdict costs one wasted stage lookup, not a broken lane.
 // verdict only reorders two attempts.
 export function deploymentEssentiallySpent(
   state: RelayState,
@@ -736,7 +840,18 @@ export function deploymentEssentiallySpent(
   if (!state.relays.length) return false;
   const set = _quotaRejected.get(quotaTrackKey(new URL(origin), model));
   if (!set || set.size === 0) return false;
-  return set.size >= MAX_SPREAD_ALTERNATES + 1;
+  // A MAJORITY of the fleet's addresses must have answered a quota 429 for
+  // this row. The denominator is the real fleet size, so the verdict fires
+  // once the fleet is genuinely closed instead of after 13 addresses.
+  //
+  // The floor is the per-request walk size: on a fleet smaller than 26
+  // addresses the walk can cover the whole fleet in one request, and 13
+  // rejections would already be a majority.
+  const threshold = Math.max(
+    MAX_SPREAD_ALTERNATES + 1,
+    Math.ceil(state.relays.length / 2),
+  );
+  return set.size >= threshold;
 }
 
 // The fleet-exhaustion verdict travels on a response header, because the
