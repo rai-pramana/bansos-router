@@ -349,6 +349,13 @@ export function resetRelayRetryState(): void {
   }
 }
 
+// Test seam: reload the persisted spent evidence into the in-memory counter,
+// exactly as module load does. Lets a test stage pre-existing evidence the
+// way a long-running daemon accumulates it across requests.
+export function restoreQuotaEvidenceForTest(): void {
+  restoreQuotaEvidence();
+}
+
 function relayCandidates(state: RelayState, now: number, target?: URL, model?: string): string[] {
   const out: string[] = [];
   const push = (u: string) => {

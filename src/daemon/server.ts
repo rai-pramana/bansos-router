@@ -1736,6 +1736,26 @@ async function tryZenStageFor(
     await stage.ready();
     if (!stage.serves(model.id)) return null;
   }
+  // The stage has its OWN daily rows, and the relay layer counts distinct
+  // quota-429 addresses per (deployment, model row) — production's closed
+  // wall is consulted before the prod walk (see the pre-walk check), but a
+  // CLOSED STAGE was never checked. When it closes, every fall-through still
+  // walked up to 13 of its dead relays one by one before giving up: measured
+  // 2026-10-30, three consecutive big-pickle requests paid 41.7s / 45.0s /
+  // 43.7s before the park finally engaged. A majority-spent stage must fail
+  // fast; the next UTC midnight reopens it with the upstream's own rows.
+  const stageOrigin = safeOrigin(stage.upstream.chatUrl);
+  if (
+    stageOrigin !== "" &&
+    deploymentEssentiallySpent(relay, stageOrigin, model.id)
+  ) {
+    log.warn("zen stage known spent, skipping the dead walk", {
+      model: model.id,
+      upstream: stage.upstream.id,
+      durationMs: Date.now() - requestStartedAt,
+    });
+    return null;
+  }
   return tryZenStage(model, stage, sanitizedBody, req, log, requestStartedAt, callerTools, security, relay);
 }
 
