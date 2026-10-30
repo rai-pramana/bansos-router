@@ -443,7 +443,32 @@ export async function relayFetch(
   // fleet-wide on that evidence, or the lane dies while most of the fleet is
   // still fresh.
   const allCandidates = relayCandidates(state, now, u, model);
-  const candidates = allCandidates.slice(0, 1 + maxAlternates);
+  // The walk is bounded at 1 + MAX_SPREAD_ALTERNATES candidates. When the
+  // fleet is mostly known-spent for this row, take the FIRST unspent
+  // candidate instead of slicing blindly: with a cursor that restarts every
+  // daemon boot and ~60 relays already drained on the stage's rows, a blind
+  // slice could burn its whole budget on dead addresses while 95 fresh ones
+  // sat behind it (measured 2026-10-30: Hermes-shaped traffic — one big body
+  // per turn, ~4 requests per turn — drained the stage's bi+mu rows from
+  // healthy to 429-instant in half an hour, because each request walked
+  // straight into yesterday's spent addresses). A false "spent" here only
+  // costs one skipped address; the penalty expires on its own.
+  const walkBudget = 1 + maxAlternates;
+  let candidates = allCandidates;
+  if (spread && allCandidates.length > walkBudget) {
+    const nowMs = Date.now();
+    const unspent = allCandidates.filter((url) => !penalized(url, nowMs, u, model));
+    if (unspent.length > 0) {
+      // Keep the rotation order; just start at the freshest address.
+      const head = unspent[0]!;
+      const i = allCandidates.indexOf(head);
+      candidates = allCandidates.slice(i, i + walkBudget);
+    } else {
+      candidates = allCandidates.slice(0, walkBudget);
+    }
+  } else {
+    candidates = allCandidates.slice(0, walkBudget);
+  }
   // Every candidate is currently marked spent: its egress IP's allowance is
   // used up. Do NOT re-probe one of them — go straight to this machine's own
   // address, which is a different client identity with its own allowance.
