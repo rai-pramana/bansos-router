@@ -1684,6 +1684,10 @@ async function tryZenStage(
       upstream: stage.upstream.id,
       status: res.status,
       upstreamError: text.slice(0, 160),
+      // A stage that is itself spent must not be retried on every request:
+      // the next attempt would walk the stage's dead relays and then pay the
+      // production walk, which measured 31s on 2026-10-30.
+      fleetExhausted: res.headers.get(FLEET_EXHAUSTED_HEADER) === "1",
       durationMs: Date.now() - requestStartedAt,
     });
     return null;
