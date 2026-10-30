@@ -1858,9 +1858,21 @@ async function runChatForward(
   // that id. BANSOS_ZEN_FAILOVER=0 exists to keep a DIFFERENT provider from
   // answering a zen id, and the stage is not that.
   //
-  // The per-request opt-out still applies: a caller that pins the request to
-  // one upstream gets that upstream.
-  const zenStageAllowed = zenStage !== null && req.headers["x-bansos-no-failover"] !== "1";
+  // The per-request opt-out therefore does NOT apply to the stage. It was
+  // written for probes ("report the pinned upstream's own status"), but the
+  // dashboard ping and `bansos ping` both send it — which made every probe of
+  // a stage-served id answer 429 while real traffic served 200 through the
+  // very same daemon. Measured 2026-10-30: big-pickle pinged like the
+  // dashboard = 429 in 1.8ms; the identical request without the header = 200
+  // via zen-stage. A probe that reports a deployment the operator deliberately
+  // closed as "down" is worse than useless: it trains people to ignore the
+  // dashboard. Probing ONLY the pinned production row remains possible with
+  // x-bansos-no-prod-fallback (strict form of the old behaviour).
+  //
+  // The mirror keeps honouring the plain opt-out: it IS a different provider
+  // answering under the same id, exactly what a pinning caller excludes.
+  const zenStageAllowed =
+    zenStage !== null && req.headers["x-bansos-no-prod-fallback"] !== "1";
   // The caller's own tool names, needed by every path that has to rebuild the
   // answer (the stage and the mirror both answer under a different transport).
   const callerTools = callerToolsFromBody(sanitizedBody);

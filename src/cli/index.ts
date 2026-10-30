@@ -206,7 +206,9 @@ Flags:
   --json    emit { "results": [...], "summary": {...} } instead of a table
 
 Notes:
-  Probes set x-bansos-no-failover so the reported status is the model's own.
+  Probes set x-bansos-no-failover (no cross-provider substitute; the zen
+  stage — same provider, other deployment — still answers). Set
+  x-bansos-no-prod-fallback to pin strictly the requested upstream.
 Exit codes: 0 at least one model answered, 1 all failed/unreachable.
 
 Example:

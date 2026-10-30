@@ -302,6 +302,35 @@ test("a caller that pins the request to one upstream does not reach the stage", 
   });
   const daemon = await startZenDaemon("big-pickle", stage.url, ["big-pickle"]);
   try {
+    // The STRICT pin is its own header. x-bansos-no-failover alone no longer
+    // silences the stage (it is what the dashboard ping sends, and a probe
+    // that reports the stage's capacity as "down" contradicts real traffic).
+    const res = await fetch(`http://127.0.0.1:${daemon.bport}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-bansos-no-prod-fallback": "1" },
+      body: JSON.stringify({
+        model: "big-pickle",
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 64,
+        stream: false,
+      }),
+    });
+    assert.equal(res.status, 429, "the strict per-request opt-out must be honoured");
+    assert.equal(stage.requests.length, 0, "the stage must not be asked");
+  } finally {
+    await daemon.bansos.close();
+    await daemon.server.close();
+    await stage.close();
+    setZenStage(null);
+  }
+});
+
+test("a plain no-failover probe still reaches the stage (same provider)", async () => {
+  const stage = await startStage(["big-pickle"], {
+    "big-pickle": { status: 200, body: sse("PONG") },
+  });
+  const daemon = await startZenDaemon("big-pickle", stage.url, ["big-pickle"]);
+  try {
     const res = await fetch(`http://127.0.0.1:${daemon.bport}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-bansos-no-failover": "1" },
@@ -312,8 +341,11 @@ test("a caller that pins the request to one upstream does not reach the stage", 
         stream: false,
       }),
     });
-    assert.equal(res.status, 429, "the per-request opt-out must be honoured");
-    assert.equal(stage.requests.length, 0, "the stage must not be asked");
+    // The dashboard ping sends exactly this: production is closed, the stage
+    // is opencode itself on another deployment, so the probe reports the
+    // lane's REAL state (200), not production's dead row.
+    assert.equal(res.status, 200, "a no-failover probe sees the stage's honest answer");
+    assert.ok(stage.requests.length > 0, "the stage was asked");
   } finally {
     await daemon.bansos.close();
     await daemon.server.close();
