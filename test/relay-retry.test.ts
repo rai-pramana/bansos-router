@@ -8,6 +8,7 @@ import {
   relayRetryState,
   resetRelayRetryState,
   deploymentEssentiallySpent,
+  expireQuotaEvidenceForTest,
   FLEET_EXHAUSTED_HEADER,
   type RelayState,
 } from "../src/relay/egress";
@@ -502,6 +503,43 @@ test("a quota 429 on a few addresses does NOT declare the fleet exhausted", asyn
       res.headers.get("x-bansos-fleet-exhausted"),
       "1",
       "a handful of spent addresses must not park the model fleet-wide",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// The spent evidence is collected PER UTC DAY: the upstream's daily row
+// refills at 00:00 UTC. The on-disk copy carried that deadline, but the
+// IN-MEMORY map did not, so a daemon that ran across midnight kept
+// yesterday's spent addresses forever.
+//
+// The consequence was a lane that could not recover on its own: the majority
+// verdict stayed true, the model stayed parked, the stage stayed "known
+// spent" and skipped - while the upstream's rows were fresh again.
+test("the spent verdict expires with the UTC day, so the lane can recover", async () => {
+  const { restore } = stubFetch(() => 429);
+  try {
+    const relays = Array.from({ length: 20 }, (_, i) => `https://r${i}.example`);
+    const st = state(relays[0]!, relays.slice(1));
+    await relayFetch(st, TARGET, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"deepseek-v4.1-flash-free"}',
+    });
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
+      true,
+      "13 of 20 addresses is a majority, so the fleet starts out closed",
+    );
+
+    // The UTC day passes: the upstream's allowance is back.
+    expireQuotaEvidenceForTest();
+
+    assert.equal(
+      deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
+      false,
+      "yesterday's spent addresses must not close the fleet today",
     );
   } finally {
     restore();

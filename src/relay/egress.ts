@@ -342,6 +342,7 @@ export function resetRelayRetryState(): void {
   // operator wants the fleet re-probed from scratch, so the accumulated
   // "this deployment is closed" evidence must go with it - on disk too.
   _quotaRejected.clear();
+  _quotaUntil.clear();
   try {
     fs.rmSync(QUOTA_EVIDENCE_FILE, { force: true });
   } catch {
@@ -741,15 +742,59 @@ function quotaEvidenceUntil(now = Date.now()): number {
   return nextMidnight;
 }
 
-function persistQuotaEvidence(): void {
-  const until = quotaEvidenceUntil();
+// The spent evidence is collected PER UTC DAY: the upstream's daily row
+// refills at 00:00 UTC, so an address that answered 429 yesterday may have
+// room again today.
+//
+// The on-disk copy carries that deadline ("until"), but the IN-MEMORY map
+// carried none: a daemon that ran across midnight kept yesterday's spent
+// addresses forever. The consequence was a lane that could not recover on
+// its own - the majority verdict stayed true, the daemon kept the model
+// parked, and the stage kept being skipped as "known spent", while the
+// upstream's rows were actually fresh again.
+//
+// So the deadline is kept IN MEMORY too, and every read prunes what has
+// expired. Pruning on read (not on a timer) means there is no background
+// work to keep alive and no window in which a stale verdict is served.
+const _quotaUntil = new Map<string, number>();
+
+// Drop the rows whose UTC day has passed. A row that expires must be
+// forgotten, not carried into the next day: the upstream's allowance is
+// back, so the addresses are candidates again.
+function pruneQuotaEvidence(now = Date.now()): void {
+  let changed = false;
+  for (const [key, until] of _quotaUntil) {
+    if (until > now) continue;
+    _quotaUntil.delete(key);
+    _quotaRejected.delete(key);
+    changed = true;
+  }
+  if (changed) persistQuotaEvidence(now);
+}
+
+// Test seam: expire the in-memory evidence as if the UTC day had passed,
+// without waiting for midnight. The on-disk copy keeps its own deadline, so
+// this only moves the in-memory verdict.
+export function expireQuotaEvidenceForTest(now = Date.now()): void {
+  for (const key of [..._quotaUntil.keys()]) {
+    _quotaUntil.set(key, now - 1);
+  }
+  pruneQuotaEvidence(now);
+}
+
+function collectQuotaRows(now: number): Record<string, { spent: string[]; until: number }> {
   const rows: Record<string, { spent: string[]; until: number }> = {};
+  const until = quotaEvidenceUntil(now);
   for (const [key, set] of _quotaRejected) {
     if (set.size === 0) continue;
     rows[key] = { spent: [...set], until };
   }
+  return rows;
+}
+
+function persistQuotaEvidence(now = Date.now()): void {
   try {
-    writeJsonAtomic(QUOTA_EVIDENCE_FILE, { rows }, 0);
+    writeJsonAtomic(QUOTA_EVIDENCE_FILE, { rows: collectQuotaRows(now) }, 0);
   } catch {
     // A failed write only costs the next restart its shortcut.
   }
@@ -762,7 +807,10 @@ function restoreQuotaEvidence(): void {
   for (const [key, entry] of Object.entries(file.rows)) {
     if (!entry || typeof entry.until !== "number" || entry.until <= now) continue;
     const set = new Set<string>((entry.spent ?? []).filter((u) => typeof u === "string"));
-    if (set.size) _quotaRejected.set(key, set);
+    if (set.size) {
+      _quotaRejected.set(key, set);
+      _quotaUntil.set(key, entry.until);
+    }
   }
 }
 
@@ -777,28 +825,39 @@ function quotaTrackKey(target: URL, model?: string): string {
 }
 
 function noteQuotaRejected(target: URL, model: string | undefined, url: string): void {
+  const now = Date.now();
+  pruneQuotaEvidence(now);
   const key = quotaTrackKey(target, model);
   let set = _quotaRejected.get(key);
   if (!set) {
-    set = new Set();
+    set = new Set<string>();
     _quotaRejected.set(key, set);
+    // The row's deadline is the end of the UTC day the evidence was collected
+    // in: that is when the upstream's own allowance comes back.
+    _quotaUntil.set(key, quotaEvidenceUntil(now));
     // Bound the key space: the oldest key is dropped when the cap is hit.
     while (_quotaRejected.size > MAX_QUOTA_TRACK_KEYS) {
       const oldest = _quotaRejected.keys().next();
       if (oldest.done) break;
       _quotaRejected.delete(oldest.value);
+      _quotaUntil.delete(oldest.value);
     }
   }
   set.add(url);
-  persistQuotaEvidence();
+  persistQuotaEvidence(now);
 }
 
 function noteQuotaServed(target: URL, model: string | undefined, url: string): void {
+  const now = Date.now();
+  pruneQuotaEvidence(now);
   const key = quotaTrackKey(target, model);
   const set = _quotaRejected.get(key);
   if (!set) return;
-  if (set.delete(url) && set.size === 0) _quotaRejected.delete(key);
-  persistQuotaEvidence();
+  if (set.delete(url) && set.size === 0) {
+    _quotaRejected.delete(key);
+    _quotaUntil.delete(key);
+  }
+  persistQuotaEvidence(now);
 }
 
 // How many DISTINCT addresses are known to be spent for this
@@ -808,6 +867,7 @@ function noteQuotaServed(target: URL, model: string | undefined, url: string): v
 // known to be spent, the fewer probes a request should pay for before it
 // gives up and lets the daemon fall through to another deployment.
 function quotaRejectedCount(target: URL, model?: string): number {
+  pruneQuotaEvidence();
   return _quotaRejected.get(quotaTrackKey(target, model))?.size ?? 0;
 }
 
@@ -876,6 +936,7 @@ export function deploymentEssentiallySpent(
   model?: string,
 ): boolean {
   if (!state.relays.length) return false;
+  pruneQuotaEvidence();
   const set = _quotaRejected.get(quotaTrackKey(new URL(origin), model));
   if (!set || set.size === 0) return false;
   return set.size >= fleetSpentThreshold(state.relays.length);
