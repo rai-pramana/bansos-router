@@ -355,6 +355,29 @@ export function resetRelayRetryState(): void {
   // UTC), so nothing needs to delete it.
 }
 
+// Test seam: reset the spread rotation cursor.
+//
+// The cursor makes consecutive requests start on a DIFFERENT address, so a
+// test that wants to prove "this address is not chosen again" has to pin the
+// start. Without this, the proof depends on the rotation's phase.
+export function resetSpreadCursorForTest(): void {
+  _spreadCursor.clear();
+}
+
+// Test seam: make every penalty look expired.
+//
+// The penalty map's lifetime (10min-6h) is SHORTER than the spent evidence's
+// (until 00:00 UTC), so a test needs to be able to expire the penalties while
+// keeping the evidence - that is the state the walk used to mishandle.
+//
+// The deadline is moved to the PAST relative to now, because penalized()
+// compares `until <= now` against the current clock.
+export function expirePenaltyForTest(now = Date.now()): void {
+  for (const [key, until] of _penalty) {
+    if (until > now) _penalty.set(key, now - 1);
+  }
+}
+
 // Test seam: reload the persisted spent evidence into the in-memory counter,
 // exactly as module load does. Lets a test stage pre-existing evidence the
 // way a long-running daemon accumulates it across requests.
@@ -463,7 +486,24 @@ export async function relayFetch(
   let candidates = allCandidates;
   if (spread && allCandidates.length > walkBudget) {
     const nowMs = Date.now();
-    const unspent = allCandidates.filter((url) => !penalized(url, nowMs, u, model));
+    // An address is spent if EITHER map says so.
+    //
+    // penalized() is the penalty map: a short-lived (10min-6h) entry that the
+    // upstream's Retry-After sets. _quotaRejected is the distinct-address
+    // evidence: it says this address answered 429 for this row TODAY, and it
+    // lives until the upstream's row refills at 00:00 UTC.
+    //
+    // Consulting only the penalty map was the bug. The penalty expires long
+    // before the row does, so a spent address came back as a candidate and
+    // the walk hit it again: measured 2026-10-31, the stage answered 429 on
+    // "muse-spark-1.3-contributor-free" for three consecutive requests
+    // (40.9s / 38.8s / 39.5s) while 121 FRESH addresses still answered 200
+    // on the same row - the walk was probing known-dead addresses and then
+    // paying the production walk for the fallback.
+    const spentSet = quotaSpentAddresses(u, model);
+    const unspent = allCandidates.filter(
+      (url) => !penalized(url, nowMs, u, model) && !spentSet.has(url),
+    );
     if (unspent.length > 0) {
       // Keep the rotation order; just start at the freshest address.
       const head = unspent[0]!;
@@ -875,6 +915,18 @@ function quotaRejectedCount(target: URL, model?: string): number {
   pruneQuotaEvidence();
   return _quotaRejected.get(quotaTrackKey(target, model))?.size ?? 0;
 }
+
+// The addresses known to have answered a quota 429 for this (deployment, model
+// row) - the ones whose upstream row is spent until the next UTC midnight.
+//
+// The caller must treat this as a SET, not a count: the count feeds the
+// majority verdict, the set feeds the candidate choice.
+function quotaSpentAddresses(target: URL, model?: string): ReadonlySet<string> {
+  pruneQuotaEvidence();
+  return _quotaRejected.get(quotaTrackKey(target, model)) ?? EMPTY_SPENT;
+}
+
+const EMPTY_SPENT: ReadonlySet<string> = new Set<string>();
 
 // Has a MAJORITY of the fleet's addresses answered a quota 429 for this
 // (deployment, model)?

@@ -9,6 +9,8 @@ import {
   resetRelayRetryState,
   deploymentEssentiallySpent,
   expireQuotaEvidenceForTest,
+  expirePenaltyForTest,
+  resetSpreadCursorForTest,
   FLEET_EXHAUSTED_HEADER,
   type RelayState,
 } from "../src/relay/egress";
@@ -546,6 +548,61 @@ test("the spent verdict expires with the UTC day, so the lane can recover", asyn
       deploymentEssentiallySpent(st, new URL(TARGET).origin, "deepseek-v4.1-flash-free"),
       false,
       "yesterday's spent addresses must not close the fleet today",
+    );
+  } finally {
+    restore();
+  }
+});
+
+// The spent evidence and the penalty map have DIFFERENT lifetimes, and the
+// candidate choice must respect BOTH.
+//
+// The penalty is short-lived (10min-6h, from the upstream's Retry-After).
+// The spent evidence lives until the upstream's row refills at 00:00 UTC.
+// So an address can be known-dead for the whole day while its penalty has
+// already expired - and then it looks like a fine candidate again.
+//
+// Measured 2026-10-31: the stage answered 429 on
+// "muse-spark-1.3-contributor-free" for three consecutive requests
+// (40.9s / 38.8s / 39.5s) while 121 FRESH addresses still answered 200 on
+// the same row. The walk was probing known-dead addresses and then paying
+// the production walk for the fallback.
+test("a spent address stays out of the walk even after its penalty expires", async () => {
+  // The spread cursor rotates the start address between requests, so it is
+  // pinned here: the proof must not depend on the rotation's phase.
+  resetSpreadCursorForTest();
+
+  // r0 is the address the walk starts on. It answers 429, so it is spent for
+  // this row and carries a penalty. Every other address answers 200.
+  const { calls, restore } = stubFetch((url) => (url.includes("r0") ? 429 : 200));
+  try {
+    const relays = Array.from({ length: 20 }, (_, i) => `https://r${i}.example`);
+    const st = state(relays[0]!, relays.slice(1));
+    const init = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"muse-spark-1.3-contributor-free"}',
+    };
+    const first = await relayFetch(st, TARGET, init);
+    assert.equal(first.status, 200, "the walk must find a fresh address");
+    assert.ok(
+      calls.some((c) => c.url === "https://r0.example"),
+      "the first request must have probed r0",
+    );
+
+    // The penalty on r0 expires (10 minutes), but the upstream's row does not
+    // refill until 00:00 UTC. Rewind the clock so the penalty lapses while
+    // the spent evidence stays.
+    expirePenaltyForTest(Date.now() - 60 * 60_000);
+    resetSpreadCursorForTest();
+
+    calls.length = 0;
+    const second = await relayFetch(st, TARGET, init);
+    assert.equal(second.status, 200, "a fresh address must still answer");
+    assert.ok(
+      !calls.some((c) => c.url === "https://r0.example"),
+      "an address that already answered 429 for this row must not be re-probed " +
+        "just because its penalty lapsed",
     );
   } finally {
     restore();
