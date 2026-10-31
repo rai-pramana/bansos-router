@@ -787,6 +787,15 @@ function quotaEvidenceUntil(now = Date.now()): number {
   return nextMidnight;
 }
 
+// Seconds until the upstream's daily row refills (00:00 UTC). The daemon uses
+// it to answer a closed deployment with a 429 that carries the deadline,
+// instead of letting an older 400 ("Model is unavailable") reach the client:
+// a 400 tells the caller nothing about when to come back, so it retries a
+// request that can never be served.
+export function quotaRefillInSeconds(now = Date.now()): number {
+  return Math.max(0, Math.ceil((quotaEvidenceUntil(now) - now) / 1000));
+}
+
 // The spent evidence is collected PER UTC DAY: the upstream's daily row
 // refills at 00:00 UTC, so an address that answered 429 yesterday may have
 // room again today.

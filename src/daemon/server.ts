@@ -42,6 +42,7 @@ import {
   relayFetch,
   relayRetryState,
   deploymentEssentiallySpent,
+  quotaRefillInSeconds,
   FLEET_EXHAUSTED_HEADER,
   type RelayState,
 } from "../relay/egress";
@@ -1583,6 +1584,56 @@ async function tryZenMirrorOnce(
 //
 // Returns the answer, or null when the stage cannot serve this request (the
 // caller then falls through to its normal error path).
+// The stage's own verdict on a failed request. A stage that answers 429 has
+// said "this deployment's bucket for this id is empty" - a NEWER and more
+// specific statement than production's older "this id is gone" (400). The
+// caller must be told about the 429 (it carries the refill deadline), not
+// about the retirement it supersedes.
+type StageVerdict = {
+  status: number;
+  message: string;
+  retryAfter?: number;
+};
+
+// A box the stage fills with its verdict, so the caller can prefer it over an
+// older production error.
+type StageVerdictBox = { verdict: StageVerdict | null };
+
+// The stage is the NEWER deployment, so its verdict about a model id supersedes
+// production's older one. Production's retirement verdict (400 "Model is
+// unavailable") is the least actionable one: a client reads a 400 as "your
+// request is malformed" and keeps resending a request that can never be
+// served. The stage's 429 says "wait for the refill" and carries the deadline.
+//
+// But a verdict is only allowed to REPLACE an older one, never to downgrade
+// it: a 429 (wait for the refill) stays a 429 even when the stage says 400,
+// because a 400 tells the client nothing about when to come back.
+//
+// The retryAfter is carried over from the previous error only when the stage
+// gave none: both deployments refill at the same UTC midnight, so the older
+// deadline is still the better answer than no deadline at all.
+function stageVerdictError(
+  box: StageVerdictBox,
+  previous: ForwardError | null,
+): ForwardError | null {
+  const verdict = box.verdict;
+  if (!verdict) return previous;
+  // A rate limit is the actionable verdict; a retirement 400 is not.
+  const actionable = (e: ForwardError | null) => e?.status === 429;
+  if (previous && actionable(previous) && !actionable(verdict)) return previous;
+  const retryAfter =
+    verdict.retryAfter !== undefined
+      ? verdict.retryAfter
+      : previous?.retryAfter !== undefined
+        ? previous.retryAfter
+        : undefined;
+  return {
+    status: verdict.status,
+    message: verdict.message,
+    ...(retryAfter !== undefined ? { retryAfter } : {}),
+  };
+}
+
 async function tryZenStage(
   model: ModelDef,
   stage: ZenStageHandle,
@@ -1593,6 +1644,7 @@ async function tryZenStage(
   callerTools: CallerTools,
   security: SecurityConfig,
   relay: RelayState,
+  verdictOut?: StageVerdictBox,
 ): Promise<Response | null> {
   // The stage's catalog decides which ids it can serve. An id it does not
   // carry answers "Model is unavailable" (400), which is a refusal, not a
@@ -1685,6 +1737,7 @@ async function tryZenStage(
 
   if (res.status >= 400) {
     const text = await res.text().catch(() => "");
+    const stageRetryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
     log.warn("zen stage rejected", {
       model: model.id,
       upstream: stage.upstream.id,
@@ -1696,6 +1749,19 @@ async function tryZenStage(
       fleetExhausted: res.headers.get(FLEET_EXHAUSTED_HEADER) === "1",
       durationMs: Date.now() - requestStartedAt,
     });
+    // Report the stage's own verdict. A 429 here is the freshest statement
+    // about this id: it says the stage's bucket is empty until the refill
+    // deadline, which the caller must be told - not the older production
+    // "Model is unavailable" (400) that the stage already superseded.
+    if (verdictOut) {
+      verdictOut.verdict = {
+        status: res.status,
+        message: text.slice(0, 256) || `zen stage returned HTTP ${res.status}`,
+        ...(stageRetryAfterMs !== undefined
+          ? { retryAfter: Math.ceil(stageRetryAfterMs / 1000) }
+          : {}),
+      };
+    }
     return null;
   }
 
@@ -1737,6 +1803,7 @@ async function tryZenStageFor(
   callerTools: CallerTools,
   security: SecurityConfig,
   relay: RelayState,
+  verdictOut?: StageVerdictBox,
 ): Promise<Response | null> {
   if (!stage.serves(model.id)) {
     await stage.ready();
@@ -1760,9 +1827,20 @@ async function tryZenStageFor(
       upstream: stage.upstream.id,
       durationMs: Date.now() - requestStartedAt,
     });
+    // The stage is closed for the whole fleet, so it will answer 429 until
+    // its row refills. Say so, with the deadline: otherwise the caller falls
+    // back to production's older 400 ("Model is unavailable") and reads a
+    // well-formed request as malformed.
+    if (verdictOut) {
+      verdictOut.verdict = {
+        status: 429,
+        message: "Free usage limit reached. Free models work in OpenCode",
+        retryAfter: quotaRefillInSeconds(),
+      };
+    }
     return null;
   }
-  return tryZenStage(model, stage, sanitizedBody, req, log, requestStartedAt, callerTools, security, relay);
+  return tryZenStage(model, stage, sanitizedBody, req, log, requestStartedAt, callerTools, security, relay, verdictOut);
 }
 
 // The mirror for a parked zen model. Unlike the 429 path, the mirror list may
@@ -1882,6 +1960,15 @@ async function runChatForward(
   // The caller's own tool names, needed by every path that has to rebuild the
   // answer (the stage and the mirror both answer under a different transport).
   const callerTools = callerToolsFromBody(sanitizedBody);
+  // The newest stage verdict seen for this request. It is kept separately from
+  // transientError because the production walk below produces its own error,
+  // and that one is OLDER than what the stage already said about the same id.
+  let stageVerdict: StageVerdict | null = null;
+  // The stage's verdict when the id was already retired and the stage was
+  // asked first. It outlives the block below, because that block may hand the
+  // request to the mirror, and the mirror's own failure must not fall back to
+  // production's stale "Model is unavailable" (400).
+  let retiredStageVerdict: StageVerdict | null = null;
   // An upstream that RETIRED this model id will never answer it again, and a
   // stage or mirror serves the SAME id from another transport. So a known
   // retirement goes straight to the stage, then the mirror: asking the
@@ -1889,6 +1976,7 @@ async function runChatForward(
   if (catalog.isRetired(model.id) && upstream.id === "zen") {
     // The stage is opencode's own console, so it answers under its own gate.
     if (zenStage && zenStageAllowed) {
+      const stageBox: StageVerdictBox = { verdict: null };
       const staged = await tryZenStageFor(
         model,
         zenStage,
@@ -1899,10 +1987,18 @@ async function runChatForward(
         callerTools,
         security,
         relay,
+        stageBox,
       );
       if (staged) {
         return { response: staged, model, upstream: zenStage.upstream, relay: "" };
       }
+      // The stage is spent for this id too. Keep its verdict: a 429 says
+      // "wait for the refill" and carries the deadline, while the retirement
+      // that sent us here only says "production will never serve this id".
+      // Without this the caller gets production's older 400 and reads a
+      // well-formed request as malformed.
+      retiredStageVerdict = stageBox.verdict;
+      stageVerdict = stageBox.verdict;
     }
     // The mirror is a DIFFERENT provider, so it keeps the cross-provider gate.
     if (zenMirror && zenFailoverAllowed) {
@@ -1917,6 +2013,14 @@ async function runChatForward(
       if (mirrored) {
         return { response: mirrored, model, upstream: zenMirror.upstream, relay: "" };
       }
+    }
+    // The stage refused with a verdict and the mirror had nothing. Answering
+    // the stage's verdict here ends the request: falling through to the
+    // production walk would re-ask an upstream that already retired this id,
+    // which measured 38-21s of dead round-trips on 2026-10-31 and then
+    // returned the very same 400 the stage had already superseded.
+    if (retiredStageVerdict) {
+      return stageVerdictError({ verdict: retiredStageVerdict }, null)!;
     }
   }
   // Which egress served this request. The watchdog can only attribute failures
@@ -2031,6 +2135,7 @@ async function runChatForward(
       // because it keeps the lane pure - the answer still comes from
       // opencode, not from a different provider under the same id.
       if (currentUpstream.id === "zen" && zenStage && zenStageAllowed) {
+        const stageBox: StageVerdictBox = { verdict: null };
         const staged = await tryZenStageFor(
           current,
           zenStage,
@@ -2040,11 +2145,17 @@ async function runChatForward(
           requestStartedAt,
           callerTools,
           security,
-        relay,
+          relay,
+          stageBox,
         );
         if (staged) {
           return { response: staged, model: current, upstream: zenStage.upstream, relay: "" };
         }
+        // The stage is spent for this id as well. Its verdict is the freshest
+        // one, so it replaces the park's own 429 when it carries a refill
+        // deadline of its own.
+        stageVerdict = stageBox.verdict;
+        transientError = stageVerdictError(stageBox, transientError);
       }
       // The zen mirror is the next place: it answers the SAME model id from
       // an upstream whose own bucket still has room, so it is not "paying for
@@ -2135,6 +2246,7 @@ async function runChatForward(
       zenOrigin !== "" &&
       deploymentEssentiallySpent(relay, zenOrigin, current.id)
     ) {
+      const stageBox: StageVerdictBox = { verdict: null };
       const staged = await tryZenStageFor(
         current,
         zenStage,
@@ -2145,10 +2257,16 @@ async function runChatForward(
         callerTools,
         security,
         relay,
+        stageBox,
       );
       if (staged) {
         return { response: staged, model: current, upstream: zenStage.upstream, relay: "" };
       }
+      // The pre-walk stage attempt found the stage spent. Remember its verdict:
+      // the production walk below is about to produce its own error, and the
+      // stage's is the newer and more specific one.
+      stageVerdict = stageBox.verdict;
+      transientError = stageVerdictError(stageBox, transientError);
     }
 
     const headers = new Headers({
@@ -2329,13 +2447,16 @@ async function runChatForward(
           catalog.markRateLimited(current.id, retryAfterMs, { status: upstreamRes.status, message: errorMsg });
         }
       }
-      transientError = {
-        status: upstreamRes.status,
-        message: errorMsg,
-        ...(upstreamRetryAfterMs !== undefined
-          ? { retryAfter: Math.ceil(upstreamRetryAfterMs / 1000) }
-          : {}),
-      };
+      transientError = stageVerdictError(
+        { verdict: stageVerdict },
+        {
+          status: upstreamRes.status,
+          message: errorMsg,
+          ...(upstreamRetryAfterMs !== undefined
+            ? { retryAfter: Math.ceil(upstreamRetryAfterMs / 1000) }
+            : {}),
+        },
+      );
 
       // The zen pool is a daily per-IP request budget. When it is spent, the
       // upstream is CLOSED for every egress identity — there is no route to
@@ -2360,6 +2481,7 @@ async function runChatForward(
         zenStageAllowed &&
         (upstreamRes.status === 429 || zenRetired)
       ) {
+        const stageBox: StageVerdictBox = { verdict: null };
         const staged = await tryZenStageFor(
           current,
           zenStage,
@@ -2369,11 +2491,19 @@ async function runChatForward(
           requestStartedAt,
           callerTools,
           security,
-        relay,
+          relay,
+          stageBox,
         );
         if (staged) {
           return { response: staged, model: current, upstream: zenStage.upstream, relay: "" };
         }
+        // The stage refused too. Its verdict is the freshest one about this
+        // id: a 429 there means "wait for the refill", while production's 400
+        // ("Model is unavailable") only means "this id is gone" - which the
+        // stage already contradicted. Reporting the 400 makes the caller treat
+        // a well-formed request as malformed and retry it forever.
+        stageVerdict = stageBox.verdict;
+        transientError = stageVerdictError(stageBox, transientError);
       }
       if (
         currentUpstream.id === "zen" &&
