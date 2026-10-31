@@ -49,6 +49,12 @@ function stubFetch(reply: (url: string, n: number) => number): { calls: Call[]; 
 // and it would otherwise outrank the fixture relays.
 const NO_RANK = path.join(os.tmpdir(), "bansos-test-no-rank.json");
 beforeEach(() => {
+  // The full in-memory reset - penalty map, spread cursor, preferred relay,
+  // spent evidence - so each test starts from a clean fleet. The on-disk
+  // evidence is NOT touched: resetRelayRetryState() used to delete it, and
+  // against the REAL BANSOS_DIR that file is the live daemon's state. (It
+  // was deleted that way on 2026-10-31, when this file was run without the
+  // isolate.ts preload.)
   resetRelayRetryState();
   process.env.BANSOS_RELAY_RANK = NO_RANK;
 });

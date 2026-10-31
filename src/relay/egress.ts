@@ -338,16 +338,21 @@ export function resetRelayRetryState(): void {
   _preferred = null;
   _penalty.clear();
   _spreadCursor.clear();
-  // The spent-evidence counter is per (deployment, model): a reset means the
-  // operator wants the fleet re-probed from scratch, so the accumulated
-  // "this deployment is closed" evidence must go with it - on disk too.
   _quotaRejected.clear();
   _quotaUntil.clear();
-  try {
-    fs.rmSync(QUOTA_EVIDENCE_FILE, { force: true });
-  } catch {
-    // A missing file is the expected state.
-  }
+  // The on-disk evidence is NOT deleted. It is the live daemon's state: the
+  // knowledge of which addresses are spent for this UTC day, which is what
+  // keeps a closed lane failing in 1ms instead of walking 13 dead relays.
+  //
+  // Deleting it used to be the intent ("reset the fleet from scratch"), but
+  // the function is called by the TEST SUITE, and the tests run against
+  // BANSOS_DIR - which is the real ~/.bansos unless the isolate.ts preload
+  // is loaded. On 2026-10-31 a test file was run without that preload and
+  // deleted ~/.bansos/quota-evidence.json: the daemon restarted into an
+  // empty map and lost the whole shortcut.
+  //
+  // The file now expires on its own (the upstream's row refills at 00:00
+  // UTC), so nothing needs to delete it.
 }
 
 // Test seam: reload the persisted spent evidence into the in-memory counter,
