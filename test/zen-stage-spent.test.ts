@@ -127,10 +127,23 @@ test("a known-spent stage is skipped instead of walked when production is parked
   // AND on every reset, so this is what a real afternoon of accumulated
   // quota-429s looks like from the daemon's side. The stage's catalog fetch
   // (one /models hit) happens earlier and is not counted as a chat contact.
+  //
+  // spentAt is required: a mark with no observation time is deliberately NOT
+  // trusted, because the egress identity behind a relay URL rotates and an
+  // untimestamped mark cannot be proven fresh.
   resetRelayRetryState();
+  const observedAt = Date.now();
   fs.writeFileSync(
     path.join(BANSOS_DIR, "quota-evidence.json"),
-    JSON.stringify({ rows: { [`${stageOrigin}|bi`]: { spent: relayUrls, until: Date.now() + 3_600_000 } } }),
+    JSON.stringify({
+      rows: {
+        [`${stageOrigin}|bi`]: {
+          spent: relayUrls,
+          until: Date.now() + 3_600_000,
+          spentAt: Object.fromEntries(relayUrls.map((u) => [u, observedAt])),
+        },
+      },
+    }),
   );
   restoreQuotaEvidenceForTest();
 

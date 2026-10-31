@@ -161,3 +161,32 @@ test("a relay that answers 200 has its spent mark forgotten immediately", async 
     stub.restore();
   }
 });
+test("a legacy spent file with no observation time is not trusted", async () => {
+  // Files written by the build that trusted marks for the whole UTC day have no
+  // per-address timestamp. Their age is unknown, and that is exactly the shape
+  // that closed the lane for a live fleet: on 2026-11-01 90/164 marks from such a
+  // file exceeded the threshold while all 90 relays answered 200.
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { BANSOS_DIR } = await import("../src/daemon/state");
+  const file = path.join(BANSOS_DIR, "quota-evidence.json");
+  const relays = Array.from({ length: 20 }, (_, i) => `https://r${i}.example`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      rows: {
+        "https://dev.opencode.ai|mu": { spent: relays, until: Date.now() + 12 * 60 * 60_000 },
+      },
+    }),
+  );
+
+  const { restoreQuotaEvidenceForTest } = await import("../src/relay/egress");
+  resetRelayRetryState();
+  restoreQuotaEvidenceForTest();
+  assert.equal(
+    deploymentEssentiallySpent(state(relays[0]!, relays.slice(1)), "https://dev.opencode.ai", MODEL),
+    false,
+    "untimestamped marks from an older build must not close a live deployment",
+  );
+  fs.rmSync(file, { force: true });
+});

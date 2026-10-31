@@ -929,18 +929,23 @@ function restoreQuotaEvidence(): void {
     // An address whose observation is older than the TTL is not restored: the
     // egress identity behind a relay URL rotates, so the mark is about a past
     // moment, not about the relay.
+    //
+    // A legacy entry with NO timestamp is dropped too. It was written by a build
+    // that trusted marks for the whole UTC day, so its age is unknown and it is
+    // exactly the shape that closed the lane for a live fleet (2026-11-01).
+    // Forgetting them costs a few relay probes once; trusting them costs a day.
     const at = entry.spentAt ?? {};
     const set = new Set<string>(
       (entry.spent ?? []).filter((u) => {
         if (typeof u !== "string") return false;
         const seen = at[u];
-        return seen === undefined || now - seen <= SPENT_EVIDENCE_TTL_MS;
+        return typeof seen === "number" && now - seen <= SPENT_EVIDENCE_TTL_MS;
       }),
     );
     if (set.size) {
       _quotaRejected.set(key, set);
       _quotaUntil.set(key, entry.until);
-      for (const url of set) _spentAt.set(url, at[url] ?? now);
+      for (const url of set) _spentAt.set(url, at[url]!);
     }
   }
 }
