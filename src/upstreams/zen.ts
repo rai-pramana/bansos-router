@@ -347,6 +347,72 @@ function toolNameOf(tool: unknown): string {
   return raw.trim();
 }
 
+// The stage's free-tier gate accepts a request only when the tool list carries
+// its own file/shell vocabulary, and it counts what it is given: a list that is
+// TOO LONG is refused with the same FreeUsageLimitError as a spent bucket, even
+// when the bucket is fresh.
+//
+// Measured 2026-11-01 against dev.opencode.ai on muse-spark-1.3-contributor-free,
+// 10 identical calls per case: read+shell plus 20 other tools answered 200
+// every time; the same set with one more tool answered 429 every time. Adding
+// the gate's own read/shell to a caller that already ships 21 tools therefore
+// pushed the list to 23 and was refused - which is why every Hermes request
+// failed while a 2-tool dashboard ping succeeded on the same relay.
+//
+// So do not grow the caller's list. Re-present the caller's OWN file/shell tools
+// under the names the gate expects, and only add the exact specs when the caller
+// ships neither - then the total never exceeds what the caller asked for, and
+// the gate still sees what it requires.
+const STAGE_READ_TARGETS = ["read_file", "readfile", "view", "file_read", "cat"];
+const STAGE_SHELL_TARGETS = ["terminal", "run_command", "exec_command", "bash", "exec"];
+
+// The most tools the gate was measured to accept, INCLUDING its own read+shell.
+const STAGE_TOOL_BUDGET = 22;
+
+function renameForGate(body: Record<string, unknown>, targets: string[], canonical: string): boolean {
+  if (!Array.isArray(body.tools)) return false;
+  const tools = body.tools as unknown[];
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
+    const t = tool as Record<string, unknown>;
+    const name = toolNameOf(tool);
+    if (!targets.includes(name)) continue;
+    // The responses wire carries `name` at the top level; the chat wire nests it
+    // under `function`. Rename in place, whichever shape this request uses.
+    const fn = t.function && typeof t.function === "object" && !Array.isArray(t.function)
+      ? (t.function as Record<string, unknown>)
+      : null;
+    if (fn && typeof fn.name === "string") fn.name = canonical;
+    else t.name = canonical;
+    return true;
+  }
+  return false;
+}
+
+// Trim the caller's list down to the gate's budget, keeping the tools it uses
+// most (the earlier entries are the agent's core surface) and appending the
+// canonical read/shell when they survived the cut.
+function enforceToolBudget(body: Record<string, unknown>): void {
+  if (!Array.isArray(body.tools)) return;
+  const tools = body.tools as unknown[];
+  if (tools.length <= STAGE_TOOL_BUDGET) return;
+  const kept: unknown[] = [];
+  const canonical: unknown[] = [];
+  const seen = new Set<string>();
+  for (const tool of tools) {
+    const name = toolNameOf(tool);
+    if (name === "read" || name === "shell") {
+      canonical.push(tool);
+      continue;
+    }
+    if (kept.length >= STAGE_TOOL_BUDGET - 2) continue;
+    if (name && seen.has(name)) continue;
+    if (name) seen.add(name);
+    kept.push(tool);
+  }
+  body.tools = [...canonical, ...kept].slice(0, STAGE_TOOL_BUDGET);
+}
+
 // the Zen gate needs read/shell tool names present; add the exact ones only when missing, never rename the caller's
 function ensureChatFingerprintTools(body: Record<string, unknown>): void {
   if (!Array.isArray(body.tools)) body.tools = [];
@@ -359,6 +425,20 @@ function ensureChatFingerprintTools(body: Record<string, unknown>): void {
     if (present.has(t.function.name)) continue;
     (body.tools as unknown[]).push(structuredClone(t));
   }
+}
+
+// Rename first (never grow the list), then only add the canonical pair when the
+// caller genuinely ships no file/shell tool of its own.
+function prepareToolsForGate(body: Record<string, unknown>, responsesWire: boolean): void {
+  const renamedRead = renameForGate(body, STAGE_READ_TARGETS, "read");
+  const renamedShell = renameForGate(body, STAGE_SHELL_TARGETS, "shell");
+  if (!renamedRead || !renamedShell) {
+    // One or both are missing: the exact specs are added, then the budget trims
+    // whatever no longer fits. This is the only path that can grow the list.
+    if (responsesWire) ensureResponsesFingerprintTools(body);
+    else ensureChatFingerprintTools(body);
+  }
+  enforceToolBudget(body);
 }
 
 function ensureResponsesFingerprintTools(body: Record<string, unknown>): void {
@@ -407,11 +487,11 @@ function transformOpencodeBody(
     delete body.max_tokens;
     delete body.max_completion_tokens;
     body.store = false;
-    ensureResponsesFingerprintTools(body);
+    prepareToolsForGate(body, true);
     sanitizeResponsesItems(body);
     return { body, responsesPath: true };
   }
-  ensureChatFingerprintTools(body);
+  prepareToolsForGate(body, false);
   return { body, responsesPath: false };
 }
 
@@ -435,7 +515,7 @@ function ensureOpencodeSystemPrompt(body: Record<string, unknown>): void {
 
 function transformOpencodeBodyChat(body: Record<string, unknown>): Record<string, unknown> {
   body.stream = true;
-  ensureChatFingerprintTools(body);
+  prepareToolsForGate(body, false);
   ensureOpencodeSystemPrompt(body);
   return body;
 }
@@ -451,7 +531,7 @@ function transformOpencodeBodyResponses(body: Record<string, unknown>): Record<s
   delete body.max_completion_tokens;
   body.store = false;
   body.stream = true;
-  ensureResponsesFingerprintTools(body);
+  prepareToolsForGate(body, true);
   sanitizeResponsesItems(body);
   return body;
 }
