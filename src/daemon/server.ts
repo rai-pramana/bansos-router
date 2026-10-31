@@ -990,6 +990,11 @@ type ForwardError = {
   type?: "upstream_error" | "security_policy_error";
   secretTypes?: SecretType[];
   relay?: string;
+  // The upstream that actually produced this verdict. Without it the caller
+  // reports the model's REGISTERED source, so an answer that came from the
+  // stage (or the mirror) is logged as "zen" - which is exactly the mislabel
+  // that made a working stage look like a failing production lane.
+  upstream?: string;
   // Seconds the client should wait before retrying. Carried from the upstream's
   // Retry-After so a daily free-tier exhaustion is not retried in a tight loop.
   retryAfter?: number;
@@ -1578,6 +1583,9 @@ type StageVerdict = {
   status: number;
   message: string;
   retryAfter?: number;
+  // Which deployment produced this verdict. Carried so the activity log names
+  // the stage instead of falling back to the model's registered source.
+  upstream?: string;
 };
 
 // What a stage attempt produced: the answer, or the reason it could not.
@@ -1633,6 +1641,9 @@ function stageVerdictError(
   return {
     status: verdict.status,
     message: verdict.message,
+    // The verdict came from the STAGE, so say so. Falling back to `previous`
+    // here is what labelled a stage refusal as the production lane's.
+    upstream: verdict.upstream ?? previous?.upstream,
     ...(retryAfter !== undefined ? { retryAfter } : {}),
   };
 }
@@ -1763,6 +1774,7 @@ async function tryZenStage(
       verdict: {
         status: res.status,
         message: text.slice(0, 256) || `zen stage returned HTTP ${res.status}`,
+        upstream: stage.upstream.id,
         ...(stageRetryAfterMs !== undefined
           ? { retryAfter: Math.ceil(stageRetryAfterMs / 1000) }
           : {}),
@@ -1840,6 +1852,7 @@ async function tryZenStageFor(
       verdict: {
         status: 429,
         message: "Free usage limit reached. Free models work in OpenCode",
+        upstream: stage.upstream.id,
         retryAfter: quotaRefillInSeconds(),
       },
     };
@@ -2444,6 +2457,7 @@ async function runChatForward(
         {
           status: upstreamRes.status,
           message: errorMsg,
+          upstream: currentUpstream.id,
           ...(upstreamRetryAfterMs !== undefined
             ? { retryAfter: Math.ceil(upstreamRetryAfterMs / 1000) }
             : {}),
@@ -2652,7 +2666,7 @@ async function handleChat(
       kind: "chat",
       model: parsed.value.model,
       requestedModel: parsed.value.model,
-      upstream: catalog.resolve(parsed.value.model)?.source ?? "unknown",
+      upstream: result.upstream ?? catalog.resolve(parsed.value.model)?.source ?? "unknown",
       relay: result.relay,
       inputTokens: 0,
       outputTokens: 0,
@@ -2873,7 +2887,7 @@ async function handleResponses(
       kind: "responses",
       model: parsed.value.model,
       requestedModel: parsed.value.model,
-      upstream: catalog.resolve(parsed.value.model)?.source ?? "unknown",
+      upstream: result.upstream ?? catalog.resolve(parsed.value.model)?.source ?? "unknown",
       relay: result.relay,
       inputTokens: 0,
       outputTokens: 0,
@@ -3070,7 +3084,7 @@ async function handleAnthropic(
       kind: "anthropic",
       model: parsed.value.model,
       requestedModel: parsed.value.model,
-      upstream: model?.source ?? "unknown",
+      upstream: result.upstream ?? model?.source ?? "unknown",
       relay: result.relay,
       inputTokens: 0,
       outputTokens: 0,

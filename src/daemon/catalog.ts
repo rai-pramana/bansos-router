@@ -5,7 +5,7 @@ import {
   type SecurityConfig,
 } from "../security/policy";
 import type { ModelDef, Upstream, UpstreamSource } from "../upstreams/types";
-import { CATALOG_FILE, readJson, writeJsonAtomic } from "./state";
+import { CATALOG_FILE, RETIRED_FILE, readJson, writeJsonAtomic } from "./state";
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 const MAX_COOLDOWN_MS = 15 * 60_000;
@@ -78,6 +78,11 @@ export class RuntimeCatalog {
       this.bySource.set(u.id, u);
       if (u.kind === "local-openai") this.bySource.set("local", u);
     }
+    // The upstream's retirement verdicts are restored HERE, not by the caller:
+    // a catalog that forgets them makes the first request for such an id pay the
+    // production round-trip again, and nothing about that depends on which code
+    // path constructed the catalog.
+    this.loadRetired();
   }
 
   // upstream that serves a model source (zen/kilo/llm7/local)
@@ -146,12 +151,43 @@ export class RuntimeCatalog {
 
   // Remember that the upstream retired this id, so the next request skips
   // that upstream instead of paying for the same rejection again.
+  //
+  // The fact is PERSISTED. It is a property of the upstream's registry, not of
+  // this process, and the daemon restarts constantly (an install, a config
+  // change, a crash). In memory only, every restart made the first request for
+  // the id pay the production round-trip again - measured 2026-11-01: a cold
+  // boot paid 1.9s for production's 400 "Model is unavailable" before the stage
+  // could answer, on every restart.
   markRetired(id: string): void {
+    if (this.retired.has(id)) return;
     this.retired.add(id);
+    this.persistRetired();
   }
 
   isRetired(id: string): boolean {
     return this.retired.has(id);
+  }
+
+  // Restore the retirement facts from disk at boot. An entry older than the
+  // snapshot window is dropped: upstream registries do re-add ids (that is how
+  // muse-spark came back), and a permanent local veto would hide it forever.
+  loadRetired(now = Date.now()): void {
+    const saved = readJson<{ savedAt?: number; ids?: string[] }>(RETIRED_FILE);
+    if (!saved?.ids?.length) return;
+    if (typeof saved.savedAt === "number" && now - saved.savedAt > SNAPSHOT_MAX_AGE_MS) {
+      this.log.warn("retired-model evidence older than 7 days - ignoring it");
+      return;
+    }
+    for (const id of saved.ids) if (typeof id === "string" && id) this.retired.add(id);
+    this.log.info(`retired-model evidence restored: ${this.retired.size} id(s)`);
+  }
+
+  private persistRetired(): void {
+    try {
+      writeJsonAtomic(RETIRED_FILE, { savedAt: Date.now(), ids: [...this.retired] });
+    } catch (err) {
+      this.log.warn(`retired-model evidence write failed: ${String((err as Error)?.message ?? err)}`);
+    }
   }
 
   // the last live pass is a better offline seed than the build-time pins: a cold

@@ -771,9 +771,32 @@ const MAX_QUOTA_TRACK_KEYS = 256;
 // upstream's own penalty.
 const QUOTA_EVIDENCE_FILE = path.join(BANSOS_DIR, "quota-evidence.json");
 
+// How long one address's "spent" mark stays trusted.
+//
+// The mark is keyed by RELAY URL, but the bucket it stands for is keyed by the
+// relay's EGRESS ADDRESS - and that address does not belong to the relay: it
+// rotates per request behind the deployment's edge. So a URL-level mark is only
+// an observation about a moment, not a property of the relay.
+//
+// Holding it for the whole UTC day was measured to be actively wrong on
+// 2026-11-01: 90 of 164 relays carried a same-day "spent" mark for
+// dev.opencode.ai|mu - above the 82-address threshold - so
+// deploymentEssentiallySpent() short-circuited BOTH deployments and every
+// request answered 429 in 7ms. Probing those exact 90 relays with the canonical
+// contract answered 200 on all 90.
+//
+// A short window keeps the shortcut useful (a genuinely spent moment is not
+// re-paid on the very next request) without turning a stale observation into a
+// dead lane. It is overridable so an operator can widen it if their fleet ever
+// gets stable egress.
+const SPENT_EVIDENCE_TTL_MS = Math.max(
+  60_000,
+  Number.parseInt(process.env.BANSOS_SPENT_TTL_MS ?? "", 10) || 15 * 60_000,
+);
+
 interface QuotaEvidenceFile {
   // "<origin>|<prefix>" -> { spent: string[]; until: epochMs }
-  rows: Record<string, { spent: string[]; until: number }>;
+  rows: Record<string, { spent: string[]; until: number; spentAt?: Record<string, number> }>;
 }
 
 function quotaEvidenceUntil(now = Date.now()): number {
@@ -812,6 +835,15 @@ export function quotaRefillInSeconds(now = Date.now()): number {
 // work to keep alive and no window in which a stale verdict is served.
 const _quotaUntil = new Map<string, number>();
 
+// When each marked address was LAST observed spent (`relayUrl` -> epochMs).
+//
+// The row's deadline above is the upstream's refill moment, which is the right
+// lifetime for "this row is closed". It is the WRONG lifetime for "this relay is
+// spent": the relay's egress address rotates, so the mark goes stale long before
+// the row refills. This map carries the observation time so a mark can expire on
+// its own TTL while the row's deadline stays intact.
+const _spentAt = new Map<string, number>();
+
 // Drop the rows whose UTC day has passed. A row that expires must be
 // forgotten, not carried into the next day: the upstream's allowance is
 // back, so the addresses are candidates again.
@@ -821,6 +853,15 @@ function pruneQuotaEvidence(now = Date.now()): void {
     if (until > now) continue;
     _quotaUntil.delete(key);
     _quotaRejected.delete(key);
+    changed = true;
+  }
+  // A per-address mark older than the TTL is dropped even while its row is
+  // still inside the UTC day: the egress identity behind a relay URL rotates,
+  // so yesterday's (or this morning's) observation says nothing about now.
+  for (const [url, at] of _spentAt) {
+    if (now - at <= SPENT_EVIDENCE_TTL_MS) continue;
+    _spentAt.delete(url);
+    for (const set of _quotaRejected.values()) set.delete(url);
     changed = true;
   }
   if (changed) persistQuotaEvidence(now);
@@ -836,12 +877,37 @@ export function expireQuotaEvidenceForTest(now = Date.now()): void {
   pruneQuotaEvidence(now);
 }
 
-function collectQuotaRows(now: number): Record<string, { spent: string[]; until: number }> {
-  const rows: Record<string, { spent: string[]; until: number }> = {};
+// Test seam: age the per-address marks without touching the ROW deadline.
+//
+// This is the state the over-sticky evidence produced: the row is still inside
+// its UTC day, but the observations behind the marks are old enough that the
+// egress identity has rotated away from them. Pruning must drop the marks and
+// keep the row, so a request probes the fleet again instead of short-circuiting.
+export function ageSpentEvidenceForTest(ageMs: number, now = Date.now()): void {
+  for (const url of [..._spentAt.keys()]) _spentAt.set(url, now - ageMs);
+  pruneQuotaEvidence(now);
+}
+
+// Test seam: the TTL the prune uses.
+export function spentEvidenceTtlMs(): number {
+  return SPENT_EVIDENCE_TTL_MS;
+}
+
+function collectQuotaRows(
+  now: number,
+): Record<string, { spent: string[]; until: number; spentAt?: Record<string, number> }> {
+  const rows: Record<string, { spent: string[]; until: number; spentAt?: Record<string, number> }> = {};
   const until = quotaEvidenceUntil(now);
   for (const [key, set] of _quotaRejected) {
     if (set.size === 0) continue;
-    rows[key] = { spent: [...set], until };
+    // Carry the observation time per address, so a restart honours the TTL
+    // instead of re-trusting a mark that was already stale in memory.
+    const spentAt: Record<string, number> = {};
+    for (const url of set) {
+      const at = _spentAt.get(url);
+      if (at !== undefined) spentAt[url] = at;
+    }
+    rows[key] = { spent: [...set], until, ...(Object.keys(spentAt).length ? { spentAt } : {}) };
   }
   return rows;
 }
@@ -860,10 +926,21 @@ function restoreQuotaEvidence(): void {
   const now = Date.now();
   for (const [key, entry] of Object.entries(file.rows)) {
     if (!entry || typeof entry.until !== "number" || entry.until <= now) continue;
-    const set = new Set<string>((entry.spent ?? []).filter((u) => typeof u === "string"));
+    // An address whose observation is older than the TTL is not restored: the
+    // egress identity behind a relay URL rotates, so the mark is about a past
+    // moment, not about the relay.
+    const at = entry.spentAt ?? {};
+    const set = new Set<string>(
+      (entry.spent ?? []).filter((u) => {
+        if (typeof u !== "string") return false;
+        const seen = at[u];
+        return seen === undefined || now - seen <= SPENT_EVIDENCE_TTL_MS;
+      }),
+    );
     if (set.size) {
       _quotaRejected.set(key, set);
       _quotaUntil.set(key, entry.until);
+      for (const url of set) _spentAt.set(url, at[url] ?? now);
     }
   }
 }
@@ -898,6 +975,7 @@ function noteQuotaRejected(target: URL, model: string | undefined, url: string):
     }
   }
   set.add(url);
+  _spentAt.set(url, now);
   persistQuotaEvidence(now);
 }
 
@@ -907,6 +985,10 @@ function noteQuotaServed(target: URL, model: string | undefined, url: string): v
   const key = quotaTrackKey(target, model);
   const set = _quotaRejected.get(key);
   if (!set) return;
+  // This address just answered, so it is NOT spent for this row: forget both the
+  // mark and its observation time, or the TTL would keep a live relay out of the
+  // walk for nothing.
+  _spentAt.delete(url);
   if (set.delete(url) && set.size === 0) {
     _quotaRejected.delete(key);
     _quotaUntil.delete(key);

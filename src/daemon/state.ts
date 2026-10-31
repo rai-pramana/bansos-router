@@ -20,6 +20,11 @@ export const RELAY_STATE_FILE = path.join(BANSOS_DIR, "relay-state.json");
 export const LOG_DIR = path.join(BANSOS_DIR, "logs");
 export const LOG_FILE = path.join(LOG_DIR, "bansosd.log");
 export const CATALOG_FILE = path.join(BANSOS_DIR, "catalog.json");
+// Model ids the upstream answered with a retirement verdict (410 / 400 "Model is
+// unavailable"). A fact about the upstream's registry, not about one process, so
+// it outlives a restart: without it every cold boot re-paid the production
+// round-trip before the stage could answer the id.
+export const RETIRED_FILE = path.join(BANSOS_DIR, "retired-models.json");
 
 export interface BansosConfig {
   port: number;
