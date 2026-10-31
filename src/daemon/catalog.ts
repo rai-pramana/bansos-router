@@ -276,6 +276,29 @@ export class RuntimeCatalog {
     }
   }
 
+  /**
+   * Restore the zen park PER MODEL ROW.
+   *
+   * The upstream meters (egress IP, the model's first two characters)
+   * separately, so a row that is still open must not be closed by another
+   * row's exhaustion. The resolver answers for one model id.
+   */
+  restoreZenParkPerModel(
+    resolve: (modelId: string) => { windowMs: number; reason?: string } | undefined,
+    now = Date.now(),
+  ): void {
+    for (const model of this.models) {
+      if (model.source !== "zen") continue;
+      const entry = resolve(model.id);
+      if (!entry || entry.windowMs <= 0) continue;
+      const until = this.coolUntil.get(model.id);
+      if (until !== undefined && until >= now + entry.windowMs) continue;
+      this.coolUntil.set(model.id, now + entry.windowMs);
+      this.quotaParked.add(model.id);
+      if (entry.reason) this.parkReason.set(model.id, { status: 429, message: entry.reason });
+    }
+  }
+
   // Milliseconds left on a model's park, 0 when it is not parked. The daemon
   // uses this to keep the zen probe gate closed for exactly as long as the
   // model stays parked, even if the gate marker was cleared by hand.

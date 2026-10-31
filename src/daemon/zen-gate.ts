@@ -37,6 +37,18 @@ interface GateMarker {
   set_at?: number;
   set_at_h?: string;
   source?: string;
+  // Per-prefix windows. The upstream's budget is keyed by (egress IP, the
+  // model's FIRST TWO CHARACTERS), so "bi" and "ne" are different rows with
+  // different refill states. A single global window therefore closes rows
+  // that still have room - and that is not a conservative mistake, it is a
+  // functional one: the closed row's 429s can never be re-probed, so the
+  // per-prefix spent evidence for it is never collected, so the daemon walks
+  // the dead addresses again on every request.
+  //
+  // The legacy top-level `until`/`reason` stay as the DEFAULT window (what a
+  // human or the gate script sets, and what applies to a prefix with no entry
+  // of its own). A prefix listed here overrides it.
+  prefixes?: Record<string, { until?: number; reason?: string }>;
 }
 
 function readMarker(): GateMarker {
@@ -101,10 +113,26 @@ export function noteZenQuotaExhausted(retryAfterMs?: number, reason?: string): v
  * Reopen the probe lane once a zen request finally succeeds.
  *
  * A deliberate freeze is left alone.
+ *
+ * When the marker carries PER-PREFIX windows, only the recovered row's window
+ * is removed: a successful "bi" says the "bi" row has room, not that the
+ * "ne" row does. Clearing the whole marker on any success would reopen rows
+ * the upstream has already reported as spent - and each of those rows then
+ * pays a full dead-address walk before the daemon learns it is still closed.
+ *
+ * The legacy global-only marker is removed entirely, as before.
  */
-export function noteZenQuotaRecovered(): void {
+export function noteZenQuotaRecovered(modelId?: string): void {
   const marker = readMarker();
   if (marker.freeze) return;
+  const prefix = zenRowPrefix(modelId);
+  if (prefix && marker.prefixes && Object.keys(marker.prefixes).length > 0) {
+    if (!marker.prefixes[prefix]) return; // that row was never closed
+    const prefixes = { ...marker.prefixes };
+    delete prefixes[prefix];
+    writeMarker({ ...marker, prefixes });
+    return;
+  }
   if (!marker.until && !marker.reason) return;
   try {
     fs.unlinkSync(MARKER);
@@ -118,6 +146,100 @@ export function nextUtcMidnight(nowMs = Date.now()): number {
   const d = new Date(nowMs);
   const midnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0);
   return midnight - nowMs;
+}
+
+// The upstream's budget row for a model id: the FIRST TWO CHARACTERS of the id.
+// "big-pickle" and "beam-free" are different rows; "big-pickle" and
+// "big-pickle-2" are the SAME row.
+export function zenRowPrefix(modelId: string | undefined): string {
+  if (!modelId) return "";
+  return modelId.slice(0, 2);
+}
+
+// The window that applies to ONE model row.
+//
+// A prefix-specific window wins over the global one: the global window is
+// what a human or the gate script set for "the whole lane", and the
+// per-prefix entries are what the daemon learned from the upstream's own
+// per-row answers. A row that the upstream says still has room must not be
+// closed by another row's exhaustion.
+export function zenQuotaClosedForModel(modelId: string | undefined, nowMs = Date.now()): number {
+  const marker = readMarker();
+  if (marker.freeze) return 0;
+  const prefix = zenRowPrefix(modelId);
+  const scoped = prefix ? marker.prefixes?.[prefix] : undefined;
+  const until = typeof scoped?.until === "number" ? scoped.until : marker.until;
+  if (typeof until !== "number") return 0;
+  const remaining = until * 1000 - nowMs;
+  return remaining > 0 ? remaining : 0;
+}
+
+// The reason that applies to ONE model row, for the same reason.
+export function zenQuotaReasonForModel(modelId: string | undefined): string | undefined {
+  const marker = readMarker();
+  if (marker.freeze) return undefined;
+  const prefix = zenRowPrefix(modelId);
+  const scoped = prefix ? marker.prefixes?.[prefix] : undefined;
+  const reason = scoped?.reason ?? marker.reason;
+  return typeof reason === "string" && reason ? reason : undefined;
+}
+
+/**
+ * Close ONE model row of the zen probe lane for exactly the upstream's refill
+ * window.
+ *
+ * The window is recorded per PREFIX, not globally. The upstream meters each
+ * row separately, so closing "bi" must not close "mu" - and a global close
+ * has a functional cost, not just a conservative one: while the lane is
+ * closed the daemon never re-probes production, so the per-prefix spent
+ * evidence for that row is never collected, so the daemon cannot learn that
+ * the row is closed and keeps walking the dead addresses on every request
+ * (measured 2026-10-31: a 24s production walk for a row the upstream had
+ * already reported as spent).
+ */
+export function noteZenQuotaExhaustedForModel(
+  modelId: string | undefined,
+  retryAfterMs?: number,
+  reason?: string,
+): void {
+  const marker = readMarker();
+  if (marker.freeze) return; // a deliberate freeze wins over automation
+  const prefix = zenRowPrefix(modelId);
+  if (!prefix) {
+    noteZenQuotaExhausted(retryAfterMs, reason);
+    return;
+  }
+  const now = Date.now();
+  const fallback = nextUtcMidnight(now);
+  const untilMs = Math.max(now + (retryAfterMs ?? fallback), now + 60_000);
+  const until = Math.ceil(untilMs / 1000);
+  const existing = marker.prefixes?.[prefix];
+  // Never shorten an existing window: the upstream window is the truth, and a
+  // later retry may carry a slightly different rounding.
+  if (typeof existing?.until === "number" && existing.until > until && existing.until * 1000 > now) {
+    return;
+  }
+  const text =
+    reason ??
+    `zen free-tier bucket exhausted (upstream Retry-After); probes resume at ${new Date(untilMs).toISOString()}`;
+  const prefixes = { ...(marker.prefixes ?? {}) };
+  prefixes[prefix] = { until, reason: text };
+  // The daemon's OWN legacy global window is superseded by this per-prefix
+  // one. It was written by the same automation (source "bansosd") before the
+  // windows became per-row, and leaving it in place would keep closing every
+  // zen model - the exact bug this change fixes.
+  //
+  // A HUMAN's whole-lane close (zen_quota_gate.py set) has no `source`, so it
+  // survives: the per-prefix entries are an addition, not a replacement.
+  const supersededDaemonGlobal = marker.source === "bansosd";
+  writeMarker({
+    ...marker,
+    ...(supersededDaemonGlobal ? { until: undefined, reason: undefined } : {}),
+    prefixes,
+    set_at: Math.floor(now / 1000),
+    set_at_h: new Date(now).toISOString().replace("T", " ").slice(0, 19),
+    source: "bansosd",
+  });
 }
 
 /**

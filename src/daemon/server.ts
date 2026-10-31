@@ -17,7 +17,13 @@ import {
 } from "../security/policy";
 import { redactRequestBody, scanRequestBody, type SecretType } from "../security/secret-guard";
 import { ActivityStore, type ActivityKind } from "./activity";
-import { noteZenQuotaExhausted, noteZenQuotaRecovered, zenQuotaClosedForMs } from "./zen-gate";
+import {
+  noteZenQuotaExhausted,
+  noteZenQuotaExhaustedForModel,
+  noteZenQuotaRecovered,
+  zenQuotaClosedForModel,
+  zenQuotaClosedForMs,
+} from "./zen-gate";
 import type { ModelDef, Upstream } from "../upstreams/types";
 import { pickSmartDefaultModel } from "../upstreams/types";
 import { parseChatTurn, sanitizeChatBody } from "../protocols/openai-chat";
@@ -1973,12 +1979,23 @@ async function runChatForward(
     // re-stamping itself forever, otherwise clearing the gate could never open
     // the lane. A burst park is the daemon's own timing and keeps its window.
     if (currentUpstream.id === "zen" && catalog.isQuotaParked(current.id)) {
-      const closedMs = zenQuotaClosedForMs();
+      // The window is PER MODEL ROW: the upstream meters (egress IP, the
+      // model's first two characters) separately, so "bi" and "ne" are
+      // different budgets with different refill states. Reading the global
+      // window here closed every zen model when ANY one of them was spent.
+      //
+      // That was not merely conservative: while the lane was closed the daemon
+      // never re-probed production, so the per-prefix spent evidence for that
+      // row was never collected, so the daemon could not learn the row was
+      // closed and walked the dead addresses on every request (measured
+      // 2026-10-31: a 24s walk for a row the upstream had already reported as
+      // spent).
+      const closedMs = zenQuotaClosedForModel(current.id);
       if (closedMs > 0) {
         // Keep the lane closed for the rest of the park. Re-stamping from the
         // REMAINING time (never from now + full window) means repeated requests
         // cannot push the deadline forward.
-        noteZenQuotaExhausted(closedMs);
+        noteZenQuotaExhaustedForModel(current.id, closedMs);
       } else {
         // No open window on disk: the park is stale, let the request through so
         // a recovered bucket is discovered instead of being hidden forever.
@@ -2303,7 +2320,7 @@ async function runChatForward(
           // watchers stop spending requests from an empty bucket. Without this
           // the lane stays quiet only until someone runs the gate by hand.
           if (currentUpstream.id === "zen") {
-            noteZenQuotaExhausted(retryAfterMs);
+            noteZenQuotaExhaustedForModel(current.id, retryAfterMs);
           }
         } else if (upstreamRes.status === 429) {
           // Either a burst limit, or one address's bucket is spent while the
@@ -2445,7 +2462,10 @@ async function runChatForward(
 
     // A zen request that made it through means the daily bucket has room
     // again: reopen the probe lane so the watchers resume on their own.
-    if (currentUpstream.id === "zen") noteZenQuotaRecovered();
+    //
+    // Scoped to this model's row: the upstream meters each row separately, so
+    // a success on "bi" says nothing about "ne".
+    if (currentUpstream.id === "zen") noteZenQuotaRecovered(current.id);
 
     return {
       response: finalResponse,

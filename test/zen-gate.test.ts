@@ -9,9 +9,16 @@ import test from "node:test";
 const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "zen-gate-test-"));
 process.env.BANSOS_DIR = path.join(TMP_HOME, ".bansos");
 
-const { noteZenQuotaExhausted, noteZenQuotaRecovered, nextUtcMidnight, zenQuotaClosedForMs } = await import(
-  "../src/daemon/zen-gate"
-);
+const {
+  noteZenQuotaExhausted,
+  noteZenQuotaExhaustedForModel,
+  noteZenQuotaRecovered,
+  nextUtcMidnight,
+  zenQuotaClosedForMs,
+  zenQuotaClosedForModel,
+  zenQuotaReasonForModel,
+  zenRowPrefix,
+} = await import("../src/daemon/zen-gate");
 
 const MARKER = path.join(process.env.BANSOS_DIR!, "logs", ".zen-quota.json");
 
@@ -110,4 +117,74 @@ test("a human freeze leaves the closed-window question to the human", () => {
   assert.equal(zenQuotaClosedForMs(), 0);
   noteZenQuotaRecovered();
   fs.unlinkSync(MARKER);
+});
+
+// The upstream meters (egress IP, the model's FIRST TWO CHARACTERS) as
+// separate daily rows, so "bi" and "ne" are different budgets with different
+// refill states.
+//
+// A single global window closed every zen model when ANY one of them was
+// spent. That was not merely conservative - it was functionally broken:
+//
+//   while the lane was closed the daemon never re-probed production, so the
+//   per-prefix spent evidence for that row was never collected, so the daemon
+//   could not learn the row was closed, so it walked the dead addresses again
+//   on every request (measured 2026-10-31: a 24s walk for a row the upstream
+//   had already reported as spent).
+test("a spent row closes only ITS OWN row, not the whole lane", () => {
+  fs.rmSync(MARKER, { force: true });
+  noteZenQuotaExhaustedForModel("nemotron-3.5-lightning-free", 6 * 60 * 60_000, "ne row spent");
+
+  // The exhausted row is closed.
+  assert.ok(
+    zenQuotaClosedForModel("nemotron-3.5-lightning-free") > 5.9 * 60 * 60_000,
+    "the exhausted row must be closed for the upstream's window",
+  );
+
+  // A DIFFERENT row is untouched: it still has its own budget.
+  assert.equal(
+    zenQuotaClosedForModel("big-pickle"),
+    0,
+    "another row must not be closed by a different row's exhaustion",
+  );
+  assert.equal(
+    zenQuotaClosedForModel("muse-spark-1.3-contributor-free"),
+    0,
+    "another row must not be closed by a different row's exhaustion",
+  );
+
+  // The reason travels with the row that carries it.
+  assert.equal(zenQuotaReasonForModel("nemotron-3.5-lightning-free"), "ne row spent");
+  assert.equal(zenQuotaReasonForModel("big-pickle"), undefined);
+});
+
+test("the row prefix is the model's first two characters", () => {
+  assert.equal(zenRowPrefix("big-pickle"), "bi");
+  assert.equal(zenRowPrefix("beam-free"), "be");
+  assert.equal(zenRowPrefix("nemotron-3.5-lightning-free"), "ne");
+  // Two ids sharing a prefix are ONE upstream row.
+  assert.equal(zenRowPrefix("big-pickle"), zenRowPrefix("big-pickle-v2"));
+});
+
+test("a success on one row reopens only that row", () => {
+  fs.rmSync(MARKER, { force: true });
+  noteZenQuotaExhaustedForModel("big-pickle", 6 * 60 * 60_000, "bi spent");
+  noteZenQuotaExhaustedForModel("nemotron-3.5-lightning-free", 6 * 60 * 60_000, "ne spent");
+
+  noteZenQuotaRecovered("big-pickle");
+
+  assert.equal(zenQuotaClosedForModel("big-pickle"), 0, "the recovered row is open again");
+  assert.ok(
+    zenQuotaClosedForModel("nemotron-3.5-lightning-free") > 0,
+    "a success on one row must not reopen a row the upstream still reports as spent",
+  );
+});
+
+test("the legacy global window still closes the whole lane", () => {
+  // A human's "close the whole lane" (zen_quota_gate.py set) must keep
+  // working: the per-prefix entries are an ADDITION, not a replacement.
+  fs.rmSync(MARKER, { force: true });
+  noteZenQuotaExhausted(6 * 60 * 60_000, "manual whole-lane close");
+  assert.ok(zenQuotaClosedForModel("big-pickle") > 0, "the global window applies to every row");
+  assert.ok(zenQuotaClosedForModel("nemotron-3.5-lightning-free") > 0);
 });
