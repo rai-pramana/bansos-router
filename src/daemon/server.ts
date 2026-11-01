@@ -47,6 +47,7 @@ import {
   type RelayState,
 } from "../relay/egress";
 import { ADAPTERS, buildSetupContext, findAdapter } from "../adapters";
+import { setToolTrimReporter } from "../upstreams/zen";
 import { harnessStatuses } from "../cli/doctor";
 import { ADMIN_PATHS, handleAdmin, type AdminOptions } from "./admin";
 import { createSseFrameSplitter, readSseStream } from "../protocols/stream";
@@ -3240,6 +3241,20 @@ export function createServer(opts: ServerOptions): http.Server {
   const { catalog, rateLimiter, port, log, startedAt } = opts;
   const security = opts.security ?? DEFAULT_SECURITY_CONFIG;
   activity = opts.activity ?? new ActivityStore();
+  // The zen stage gate accepts at most STAGE_TOOL_BUDGET tools, so a caller with
+  // a wider surface (this CLI profile resolves 37) silently loses the tail. The
+  // request still succeeds, which is exactly why it must be visible: an agentic
+  // caller that believes it has `execute_code` or `delegate_task` will plan
+  // around tools the model never received. Report every trim.
+  setToolTrimReporter(({ model, total, kept, dropped }) => {
+    log.warn("zen stage tool budget trimmed the caller's list", {
+      model,
+      tools: total,
+      kept,
+      dropped: dropped.length,
+      droppedNames: dropped.slice(0, 12).join(","),
+    });
+  });
   const adminOptions: AdminOptions = {
     bind: "127.0.0.1",
     refreshIntervalMs: 0,

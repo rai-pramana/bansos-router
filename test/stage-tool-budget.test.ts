@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { zenUpstream } from "../src/upstreams/zen";
+import { zenUpstream, setToolTrimReporter } from "../src/upstreams/zen";
 
 // The stage's free-tier gate counts tools, and refuses over-long lists with the
 // SAME FreeUsageLimitError as a spent bucket.
@@ -90,4 +90,41 @@ test("the chat wire transform follows the same rule", () => {
   assert.ok(list.length <= 22, `chat wire must respect the budget too, got ${list.length}`);
   assert.ok(list.includes("read"));
   assert.ok(list.includes("shell"));
+});
+test("a trim is reported with the names it dropped, not swallowed", () => {
+  // The trim keeps the request working, which is why it used to be invisible: a
+  // caller that ships 37 tools (this CLI profile's full surface) gets a 200 and
+  // its model simply never sees `execute_code`, `memory`, `delegate_task`, ...
+  // An agentic caller then plans around capabilities it no longer has. Every
+  // trim must therefore name what it removed.
+  const seen: Array<{ model: string; total: number; kept: number; dropped: string[] }> = [];
+  setToolTrimReporter((info) => seen.push(info));
+  try {
+    const many = Array.from({ length: 20 }, (_, i) => `tail_${i}`);
+    const b = body(["read_file", "terminal", "web_search", ...many]);
+    const out = (up.transformRequestBody as any)(b, { id: "muse-spark-1.3-contributor-free" });
+    assert.equal(out.tools.length, 22, "the list still has to fit the gate");
+    assert.equal(seen.length, 1, "exactly one trim must be reported");
+    assert.equal(seen[0]!.total, 23);
+    assert.equal(seen[0]!.kept, 22);
+    assert.equal(seen[0]!.dropped.length, 1, "the one dropped name must be reported");
+    assert.ok(
+      seen[0]!.dropped[0]!.startsWith("tail_"),
+      `the reported name must be the dropped tool, got ${seen[0]!.dropped[0]}`,
+    );
+  } finally {
+    setToolTrimReporter(null);
+  }
+});
+
+test("a list inside the budget reports nothing", () => {
+  const seen: unknown[] = [];
+  setToolTrimReporter((info) => seen.push(info));
+  try {
+    const b = body(["read_file", "terminal", "web_search"]);
+    (up.transformRequestBody as any)(b, { id: "muse-spark-1.3-contributor-free" });
+    assert.equal(seen.length, 0, "no trim means no report - silence must mean silence");
+  } finally {
+    setToolTrimReporter(null);
+  }
 });

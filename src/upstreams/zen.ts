@@ -389,13 +389,21 @@ function renameForGate(body: Record<string, unknown>, targets: string[], canonic
   return false;
 }
 
-// Trim the caller's list down to the gate's budget, keeping the tools it uses
-// most (the earlier entries are the agent's core surface) and appending the
-// canonical read/shell when they survived the cut.
-function enforceToolBudget(body: Record<string, unknown>): void {
-  if (!Array.isArray(body.tools)) return;
+// Trim the caller's list down to the gate's budget, returning the names that
+// were dropped so the caller's lost capabilities can be reported.
+//
+// The trim is the only path where a request silently loses tools: it keeps the
+// earliest entries (the agent's core surface) and the canonical read/shell, and
+// discards the tail. Measured 2026-11-01: this CLI profile resolves 37 tools
+// while the gate accepts 22, so a widened toolset (MCP enabled, more toolsets)
+// starts dropping `execute_code`, `skill_*`, `memory`, `delegate_task`,
+// `cronjob_manage`, `computer_use` — the request still succeeds and the model
+// simply never sees those tools. Silent degradation is worse than the 429 it
+// replaced, so every trim is reported.
+function enforceToolBudget(body: Record<string, unknown>): string[] {
+  if (!Array.isArray(body.tools)) return [];
   const tools = body.tools as unknown[];
-  if (tools.length <= STAGE_TOOL_BUDGET) return;
+  if (tools.length <= STAGE_TOOL_BUDGET) return [];
   const kept: unknown[] = [];
   const canonical: unknown[] = [];
   const seen = new Set<string>();
@@ -410,7 +418,25 @@ function enforceToolBudget(body: Record<string, unknown>): void {
     if (name) seen.add(name);
     kept.push(tool);
   }
-  body.tools = [...canonical, ...kept].slice(0, STAGE_TOOL_BUDGET);
+  const next = [...canonical, ...kept].slice(0, STAGE_TOOL_BUDGET);
+  const keptNames = new Set(next.map((t) => toolNameOf(t)));
+  const dropped = tools
+    .map((t) => toolNameOf(t))
+    .filter((n) => n !== "" && !keptNames.has(n));
+  body.tools = next;
+  return dropped;
+}
+
+// Where a trim gets reported. The transform functions are pure by design, so the
+// daemon installs the sink once at boot instead of zen.ts reaching for a logger.
+let toolTrimReporter:
+  | ((info: { model: string; total: number; kept: number; dropped: string[] }) => void)
+  | null = null;
+
+export function setToolTrimReporter(
+  reporter: ((info: { model: string; total: number; kept: number; dropped: string[] }) => void) | null,
+): void {
+  toolTrimReporter = reporter;
 }
 
 // the Zen gate needs read/shell tool names present; add the exact ones only when missing, never rename the caller's
@@ -438,7 +464,16 @@ function prepareToolsForGate(body: Record<string, unknown>, responsesWire: boole
     if (responsesWire) ensureResponsesFingerprintTools(body);
     else ensureChatFingerprintTools(body);
   }
-  enforceToolBudget(body);
+  const before = Array.isArray(body.tools) ? (body.tools as unknown[]).length : 0;
+  const dropped = enforceToolBudget(body);
+  if (dropped.length > 0 && toolTrimReporter) {
+    toolTrimReporter({
+      model: typeof body.model === "string" ? body.model : "",
+      total: before,
+      kept: Array.isArray(body.tools) ? (body.tools as unknown[]).length : 0,
+      dropped,
+    });
+  }
 }
 
 function ensureResponsesFingerprintTools(body: Record<string, unknown>): void {
