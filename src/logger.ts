@@ -45,6 +45,13 @@ const SAFE_FIELD_NAMES = new Set([
   "failoverFrom",
   "stream",
   "upstreamError",
+  // Tool-budget trim reporting: the gate drops the tail of an over-long tool
+  // list, and which tools a request lost is operational telemetry, not a
+  // secret. Without these the trim line prints with no details at all.
+  "tools",
+  "kept",
+  "dropped",
+  "droppedNames",
 ]);
 
 const SECRET_TYPES = new Set<SecretType>([
