@@ -1,6 +1,9 @@
 
 
-export type UpstreamSource = "zen" | "kilo" | "llm7" | "ovh" | "local";
+// "zen-stage" is the SAME product on a separate deployment (dev.opencode.ai),
+// with its own free-tier database. It is a label, not a provider: a zen id is
+// still answered by opencode's own console, never by a third party.
+export type UpstreamSource = "zen" | "zen-stage" | "kilo" | "llm7" | "ovh" | "local";
 export type UpstreamKind = "remote-keyless" | "local-openai";
 
 // per-model translation flags
@@ -21,6 +24,10 @@ export interface ModelCost {
 export interface ModelDef {
   // exact upstream model id (never an alias)
   id: string;
+  // The id the UPSTREAM expects, when `id` carries a deployment label.
+  // A labeled entry ("zen-stage/muse-spark-...") lets a caller choose which
+  // deployment spends the request, while the wire still carries the bare id.
+  upstreamId?: string;
   name: string;
   source: UpstreamSource;
   reasoning: boolean;

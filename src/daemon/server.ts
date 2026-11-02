@@ -1671,11 +1671,14 @@ async function tryZenStage(
     "content-type": "application/json",
     ...stage.upstream.requestHeaders(model, req.headers as Record<string, string | string[] | undefined>),
   });
+  // `model.id` is what the CALLER asked for; a labeled entry (zen-stage/<id>)
+  // must put the bare id on the wire or the stage answers "Model is unavailable".
+  const wireId = model.upstreamId ?? model.id;
   const transformedBody = stage.upstream.transformRequestBody
-    ? stage.upstream.transformRequestBody({ ...sanitizedBody, model: model.id }, model)
-    : { ...sanitizedBody, model: model.id };
+    ? stage.upstream.transformRequestBody({ ...sanitizedBody, model: wireId }, model)
+    : { ...sanitizedBody, model: wireId };
   let outboundBody = JSON.stringify(
-    responsesWire ? chatToResponsesBody(transformedBody, model.id) : transformedBody,
+    responsesWire ? chatToResponsesBody(transformedBody, wireId) : transformedBody,
   );
 
   // The stage is an external upstream, so the same secret guard applies:
@@ -2282,12 +2285,15 @@ async function runChatForward(
     // responses-wire model: body/reply translated at the edges so the pipeline only sees chat
     const responsesWire = current.wireApi === "responses" && !!currentUpstream.responsesUrl;
     const outboundUrl = responsesWire ? currentUpstream.responsesUrl! : currentUpstream.chatUrl;
+    // A labeled catalog entry carries the bare upstream id separately; sending
+    // the label itself would be an unknown model upstream.
+    const wireId = current.upstreamId ?? current.id;
     const transformedBody = currentUpstream.transformRequestBody
-      ? currentUpstream.transformRequestBody({ ...sanitizedBody, model: current.id }, current)
-      : { ...sanitizedBody, model: current.id };
+      ? currentUpstream.transformRequestBody({ ...sanitizedBody, model: wireId }, current)
+      : { ...sanitizedBody, model: wireId };
     let outboundBody = JSON.stringify(
       responsesWire
-        ? chatToResponsesBody(transformedBody, current.id)
+        ? chatToResponsesBody(transformedBody, wireId)
         : transformedBody,
     );
 

@@ -144,6 +144,40 @@ export class RuntimeCatalog {
     }
   }
 
+  // Publish ONE upstream's models under a deployment label.
+  //
+  // Why this exists: the stage answers the SAME ids as production, so a single
+  // id cannot name both buckets. Without a label the caller has no way to say
+  // "spend the stage's quota, not production's", and every request to a
+  // stage-available model burns the tiny production budget first.
+  //
+  // Two things happen per id:
+  //   * catalog id  = "<label>/<bare id>"  — what the caller asks for;
+  //   * upstreamId  = "<bare id>"          — what goes on the wire.
+  // The upstream is registered as well, so routing resolves it by source.
+  setLabeledModels(
+    label: string,
+    upstream: Upstream,
+    ids: Iterable<string>,
+    describe?: (id: string) => ModelDef | undefined,
+  ): string[] {
+    this.bySource.set(upstream.id, upstream);
+    const published: string[] = [];
+    for (const id of ids) {
+      const entry = describe?.(id) ?? this.byId.get(id) ?? this.pins.get(id);
+      if (!entry) continue;
+      const labeled = `${label}/${id}`;
+      this.byId.set(labeled, {
+        ...entry,
+        id: labeled,
+        upstreamId: id,
+        source: upstream.id as ModelDef["source"],
+      });
+      published.push(labeled);
+    }
+    return published;
+  }
+
   // The ids the stage can serve, and that are published here.
   get stagedIds(): string[] {
     return [...this.staged].filter((id) => this.byId.has(id));

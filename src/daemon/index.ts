@@ -193,6 +193,27 @@ function startServer(
   const stageUrl = (process.env.BANSOS_ZEN_STAGE_URL ?? "https://dev.opencode.ai").trim();
   const stage = stageEnabled && stageUrl ? createZenStage({ baseUrl: stageUrl }) : null;
   setZenStage(stage);
+  // Publish the stage as its own upstream LABEL: "zen-stage/<id>" spends the
+  // stage's bucket instead of production's. Same ids, different database — so
+  // without the label a caller cannot choose which quota it drains, and every
+  // request to a stage-available model burns production's few daily requests
+  // before falling back. Idempotent, and cheap enough to repeat: the stage
+  // catalog lookup answers 200 even when the pool is empty and is not metered.
+  let stageLabelPublished = false;
+  const publishStageLabel = () => {
+    if (!stage) return;
+    const labeled = catalog.setLabeledModels(
+      "zen-stage",
+      stage.upstream,
+      stage.ids(),
+      (id) => stage.describe(id),
+    );
+    if (labeled.length > 0 && !stageLabelPublished) {
+      stageLabelPublished = true;
+      log.info("catalog: zen-stage label published", { models: labeled });
+    }
+  };
+
   if (stage) {
     // Resolve once at startup so the first request that hits the closed
     // production pool does not pay for the discovery round trip.
@@ -210,7 +231,12 @@ function startServer(
       if (kept.length > 0) {
         log.info("catalog: stage-backed model ids published", { models: kept });
       }
+      publishStageLabel();
     });
+    // The first catalog fetch can fail (cold stage, no network yet). Retry on a
+    // timer so a transient miss does not leave the label missing until restart.
+    const labelTimer = setInterval(publishStageLabel, 10 * 60_000);
+    labelTimer.unref?.();
   }
 
   // seed the pinned registry: usable offline, refined by health checks
