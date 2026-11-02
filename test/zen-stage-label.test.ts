@@ -94,3 +94,19 @@ test("republishing the label is idempotent", () => {
   const labeled = catalog.models.filter((m) => m.id === `zen-stage/${BASE}`);
   assert.equal(labeled.length, 1, "the id must not be duplicated in the list");
 });
+
+test("a caller that keeps its provider prefix still lands on the label", () => {
+  // Hermes dials the daemon through the "bansos" provider, so some of its calls
+  // arrive as "bansos/zen-stage/<id>". Resolution must strip that prefix and
+  // still prefer the LABEL over the bare id — the bare one would spend
+  // production instead of the stage, which is the exact bug the label fixes.
+  const { catalog, stage } = build();
+  catalog.setLabeledModels("zen-stage", stage, [BASE], () => model(BASE));
+
+  const labeled = catalog.resolve(`bansos/zen-stage/${BASE}`);
+  assert.equal(labeled?.source, "zen-stage");
+  assert.equal(labeled?.upstreamId, BASE);
+
+  const bare = catalog.resolve(`bansos/${BASE}`);
+  assert.equal(bare?.source, "zen", "a prefixed bare id stays production");
+});

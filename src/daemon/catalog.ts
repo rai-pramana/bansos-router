@@ -385,7 +385,19 @@ export class RuntimeCatalog {
     for (const [k, m] of this.byId) {
       if (k.endsWith(`/${id}`)) return m;
     }
-    return undefined;
+    // ...and the other direction: a caller that keeps the provider it dialled
+    // ("bansos/zen-stage/big-pickle") still means the catalog id without it.
+    // Longest match wins, so the label is never shadowed by its own bare id —
+    // picking the bare one would spend production instead of the stage.
+    let best: ModelDef | undefined;
+    let bestLen = 0;
+    for (const [k, m] of this.byId) {
+      if (k.length > bestLen && id.endsWith(`/${k}`)) {
+        best = m;
+        bestLen = k.length;
+      }
+    }
+    return best;
   }
 
   // unreachable upstream keeps last-known models; concurrent callers share the in-flight pass
