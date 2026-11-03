@@ -1,5 +1,15 @@
 import { ZEN_MODELS, zenUpstream } from "./zen";
 import type { ModelDef, Upstream } from "./types";
+import path from "node:path";
+import { BANSOS_DIR, readJson, writeJsonAtomic } from "../daemon/state";
+
+// The stage's id list survives a restart on disk. Without it a cold boot that
+// reaches systemd before DNS is up publishes NOTHING under the `zen-stage`
+// label and every slot pointing at it answers "unknown model" until the first
+// successful refresh, which nothing triggers on its own. Measured 2026-11-04:
+// daemon up at 00:20:27 with an empty list, labels appeared at 00:50 only after
+// an unrelated request forced a refetch.
+const IDS_FILE = path.join(BANSOS_DIR, "zen-stage-ids.json");
 
 // The zen STAGE deployment.
 //
@@ -78,6 +88,12 @@ export function createZenStage(cfg: ZenStageConfig): ZenStageHandle {
   let fetchedAt = 0;
   let inflight: Promise<void> | null = null;
 
+  // Seed from the last known list so the label is publishable on the very first
+  // tick after a restart. Stale ids are harmless: the stage answers 400 for an
+  // id it no longer carries, and the next refresh replaces this set.
+  const cached = readJson<{ ids?: string[] }>(IDS_FILE);
+  for (const id of cached?.ids ?? []) if (KNOWN.has(id)) served.add(id);
+
   async function refresh(): Promise<void> {
     try {
       // The catalog lookup is quota-free (it answers 200 even when the pool
@@ -92,6 +108,11 @@ export function createZenStage(cfg: ZenStageConfig): ZenStageHandle {
       if (ids.size === 0) return;
       served = ids;
       fetchedAt = Date.now();
+      try {
+        writeJsonAtomic(IDS_FILE, { savedAt: fetchedAt, ids: [...ids] }, 0);
+      } catch {
+        // a cache write failure must not fail the refresh itself
+      }
     } catch {
       // keep the last known list: an unreachable stage must not unpublish
       // the ids it served a minute ago

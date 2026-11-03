@@ -201,7 +201,7 @@ function startServer(
   // catalog lookup answers 200 even when the pool is empty and is not metered.
   let stageLabelPublished = false;
   const publishStageLabel = () => {
-    if (!stage) return;
+    if (!stage) return 0;
     const labeled = catalog.setLabeledModels(
       "zen-stage",
       stage.upstream,
@@ -212,6 +212,35 @@ function startServer(
       stageLabelPublished = true;
       log.info("catalog: zen-stage label published", { models: labeled });
     }
+    return labeled.length;
+  };
+  // Republishing an EMPTY id list is a no-op, so a timer that only called
+  // publishStageLabel() could never recover from a boot-time fetch failure:
+  // ready() resolves once at startup, keeps `served` empty when the network is
+  // not up yet, and only a later REQUEST would refill it. Measured on a cold
+  // boot (2026-11-04 00:20): the labels appeared at 00:50, after an unrelated
+  // request forced ready() — three timer ticks published nothing. Refresh
+  // first, then publish, and retry fast while the list is still empty.
+  let stageRetryMs = 5_000;
+  const settleStageLabel = async () => {
+    if (!stage) return;
+    // Publish FIRST: the id list is seeded from disk, so the label exists on the
+    // first tick after a restart even when the network is not up yet.
+    let published = publishStageLabel();
+    if (published === 0) {
+      await stage.ready();
+      published = publishStageLabel();
+    }
+    if (published > 0) {
+      stageRetryMs = 10 * 60_000;
+      return;
+    }
+    log.warn("catalog: zen-stage label pending - stage catalog still unknown", {
+      retryInMs: stageRetryMs,
+    });
+    const wait = stageRetryMs;
+    stageRetryMs = Math.min(stageRetryMs * 3, 10 * 60_000);
+    setTimeout(() => void settleStageLabel(), wait).unref?.();
   };
 
   if (stage) {
@@ -233,9 +262,14 @@ function startServer(
       }
       publishStageLabel();
     });
-    // The first catalog fetch can fail (cold stage, no network yet). Retry on a
-    // timer so a transient miss does not leave the label missing until restart.
-    const labelTimer = setInterval(publishStageLabel, 10 * 60_000);
+    // The stage catalog is a network call: on a cold boot it fails (measured:
+    // systemd starts the daemon at 00:20:27, before DNS/egress is ready) and
+    // ready() then keeps `served` empty until something asks again. settle()
+    // refreshes before publishing and backs off 5s -> 15s -> 45s -> 10min, so
+    // the label lands as soon as the stage answers instead of waiting for the
+    // first unrelated request.
+    void settleStageLabel();
+    const labelTimer = setInterval(() => void settleStageLabel(), 10 * 60_000);
     labelTimer.unref?.();
   }
 
