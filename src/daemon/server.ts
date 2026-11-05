@@ -26,6 +26,7 @@ import {
 } from "./zen-gate";
 import type { ModelDef, Upstream } from "../upstreams/types";
 import { pickSmartDefaultModel } from "../upstreams/types";
+import { VERSION, peekUpdate, type UpdateInfo } from "../update";
 import { parseChatTurn, sanitizeChatBody } from "../protocols/openai-chat";
 import { parseResponsesTurn, renderResponse, extractReasoningText, ResponsesStreamEncoder } from "../protocols/responses";
 import { chatToResponsesBody, toChatResponse } from "../protocols/responses-upstream";
@@ -90,6 +91,7 @@ export function setZenStage(handle: ZenStageHandle | null): void {
 
 export interface StatusPayload {
   status: "ok";
+  version: string;
   uptimeSeconds: number;
   port: number;
   modelCount: number;
@@ -108,6 +110,7 @@ export interface StatusPayload {
     allowedUpstreams: string[];
     allowCrossProviderFailover: boolean;
   };
+  update?: UpdateInfo;
 }
 
 function providerCounts(
@@ -234,7 +237,10 @@ function isAllowedInboundPath(pathname: string): boolean {
   if (STATIC_ROOT_FILES.has(pathname) || API_EXACT_PATHS.has(pathname)) {
     return true;
   }
-  return pathname.startsWith("/assets/") && /^[\w.-]+$/.test(pathname.slice(8));
+  if (pathname.startsWith("/assets/") && /^[\w.-]+$/.test(pathname.slice(8))) {
+    return true;
+  }
+  return pathname.startsWith("/fonts/") && /^[\w.-]+$/.test(pathname.slice(7));
 }
 
 // fallback models to try after the primary is rejected; total attempts = 1 + this
@@ -412,7 +418,7 @@ function serveStaticUi(res: http.ServerResponse, reqPath: string): void {
     return;
   }
 
-  if (relativePath.startsWith("assets/")) {
+  if (relativePath.startsWith("assets/") || relativePath.startsWith("fonts/")) {
     sendJson(res, 404, { error: { message: "asset not found" } });
     return;
   }
@@ -579,13 +585,29 @@ async function readBody(
 interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
+  cachedTokens?: number;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
 }
 
 export function extractUsage(json: unknown): TokenUsage | null {
-  const usage = (json as { usage?: { prompt_tokens?: number; completion_tokens?: number } })
-    ?.usage;
-  if (!usage || usage.prompt_tokens == null || usage.completion_tokens == null) return null;
-  return { inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens };
+  const usage = asRecord(asRecord(json)?.usage);
+  if (!usage) return null;
+  const prompt = usage.prompt_tokens;
+  const completion = usage.completion_tokens;
+  if (typeof prompt !== "number" || typeof completion !== "number") return null;
+  // openai chat reports prompt_tokens_details, the responses wire reports input_tokens_details
+  const cached =
+    asRecord(usage.prompt_tokens_details)?.cached_tokens ??
+    asRecord(usage.input_tokens_details)?.cached_tokens ??
+    usage.cache_read_input_tokens;
+  return {
+    inputTokens: prompt,
+    outputTokens: completion,
+    ...(typeof cached === "number" ? { cachedTokens: cached } : {}),
+  };
 }
 
 // fold reasoning into content when a model streams reasoning_content but no content (C5)
@@ -849,6 +871,7 @@ export function logUsageTransform(
       ...(relay ? { relay } : {}),
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
+      cachedTokens: usage.cachedTokens ?? 0,
       durationMs: Date.now() - startedAt,
       status: "ok",
       ...(requestedModel && requestedModel !== model ? { failoverFrom: requestedModel } : {}),
@@ -2732,6 +2755,7 @@ async function handleChat(
           relay: result.relay,
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
+          cachedTokens: usage.cachedTokens ?? 0,
           durationMs: Date.now() - requestStartedAt,
           status: "ok",
           ...(current.id !== model.id ? { failoverFrom: model.id } : {}),
@@ -2944,6 +2968,7 @@ async function handleResponses(
         relay: result.relay,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
+        cachedTokens: usage.cachedTokens ?? 0,
         durationMs: Date.now() - requestStartedAt,
         status: "ok",
         ...(current.id !== resolved.id ? { failoverFrom: resolved.id } : {}),
@@ -3017,6 +3042,7 @@ async function handleResponses(
       relay: result.relay,
       inputTokens: streamUsage.inputTokens,
       outputTokens: streamUsage.outputTokens,
+      cachedTokens: streamUsage.cachedTokens ?? 0,
       durationMs: Date.now() - requestStartedAt,
       status: "ok",
       ...(current.id !== resolved.id ? { failoverFrom: resolved.id } : {}),
@@ -3138,6 +3164,7 @@ async function handleAnthropic(
         relay: result.relay,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
+        cachedTokens: usage.cachedTokens ?? 0,
         durationMs: Date.now() - requestStartedAt,
         status: "ok",
         ...(current.id !== model.id ? { failoverFrom: model.id } : {}),
@@ -3211,6 +3238,7 @@ async function handleAnthropic(
       relay: result.relay,
       inputTokens: streamUsage.inputTokens,
       outputTokens: streamUsage.outputTokens,
+      cachedTokens: streamUsage.cachedTokens ?? 0,
       durationMs: Date.now() - requestStartedAt,
       status: "ok",
       ...(current.id !== model.id ? { failoverFrom: model.id } : {}),
@@ -3265,6 +3293,7 @@ export function createServer(opts: ServerOptions): http.Server {
     bind: "127.0.0.1",
     refreshIntervalMs: 0,
     ...opts.admin,
+    activity,
     security,
     catalog,
     port,
@@ -3367,8 +3396,10 @@ export function createServer(opts: ServerOptions): http.Server {
 
     if (url === "/bansos/status") {
       const relay = visibleRelayState();
+      const update = peekUpdate();
       const payload: StatusPayload = {
         status: "ok",
+        version: VERSION,
         uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
         port,
         modelCount: catalog.servableModels.length,
@@ -3387,6 +3418,7 @@ export function createServer(opts: ServerOptions): http.Server {
           allowedUpstreams: security.allowedUpstreams,
           allowCrossProviderFailover: security.allowCrossProviderFailover,
         },
+        ...(update ? { update } : {}),
       };
       sendJson(res, 200, payload);
       return;
@@ -3611,6 +3643,7 @@ export function createServer(opts: ServerOptions): http.Server {
       (url === "" ||
         url === "/index.html" ||
         cleanUrl.startsWith("/assets/") ||
+        cleanUrl.startsWith("/fonts/") ||
         url === "/favicon.ico" ||
         url === "/favicon.svg" ||
         url === "/favicon.png" ||

@@ -36,14 +36,14 @@ if (!("Bun" in globalThis) && !process.env.BANSOS_NO_BUN && !process.env._BANSOS
     process.exit(res.status ?? 0);
   }
 }
-import { runAutostart } from "./autostart";
+import { restartManaged, runAutostart } from "./autostart";
 import { runDoctor } from "./doctor";
 import { runPing } from "./ping";
 import { runRelay } from "./relay";
 import { runSetup } from "./setup";
 import { runDaemon, DEFAULT_PORT, MAX_PORT } from "../daemon";
-import { BANSOS_DIR, STATE_FILE, effectiveBind, effectivePort, readJson, runningDaemonUrl } from "../daemon/state";
-import { VERSION, checkUpdate } from "../update";
+import { BANSOS_DIR, STATE_FILE, effectiveBind, effectivePort, readJson, runningDaemonUrl, startArgs, type StartFlags } from "../daemon/state";
+import { VERSION, checkUpdate, isNewerVersion, staleDaemonNotice, updateNotice } from "../update";
 
 function help(): void {
   console.log(`bansos - free, keyless coding models for every agent harness
@@ -54,6 +54,7 @@ Usage:
 Commands:
   start       start the daemon (--bg = detached)
   stop        stop the daemon started here (--all for every daemon)
+  restart     restart the daemon, through systemd or launchd when they run it
   setup       write harness config files
   status      daemon status (aliases: none)
   models      list live catalog
@@ -64,6 +65,8 @@ Commands:
   relay       manage relay egress
   autostart   start the daemon when you log in (on/off/status)
   doctor      diagnose setup
+  backup      export config, usage history, and relay state to json
+  restore     restore config and usage history from a backup file
 
 Global flags:
   --json      structured output on status / models / ping (agent-friendly)
@@ -133,7 +136,7 @@ Notes:
 
 Exit codes: 0 success, 1 unsupported system or the service manager failed.
 `,
-  stop: `bansos stop - stop the daemon recorded in state.json (SIGTERM, then SIGKILL after 400ms)
+  stop: `bansos stop - stop the daemon recorded in state.json (SIGTERM, then SIGKILL after 5s)
 
 Usage:
   bansos stop [--all]
@@ -146,7 +149,19 @@ Notes:
   started by someone else (or in another project) is left alone. If state.json
   names no live daemon, the command reports what else is running and exits 0.
 
-Exit codes: 0 always (0 even when nothing was running).
+Exit codes: 0 when every daemon exited (also when nothing was running), 1 when one survived.
+`,
+  restart: `bansos restart - stop and start the daemon, e.g. after npm i -g bansos-router
+
+Usage:
+  bansos restart
+
+How:
+  A daemon run by "bansos autostart" is restarted by its service manager
+  (systemctl --user restart on Linux, launchctl kickstart on macOS), so it
+  stays supervised. Any other daemon is stopped and started again with
+  "bansos start --bg". The dashboard's Restart only reloads the config in the
+  same process, so a new version needs this command.
 `,
   setup: `bansos setup - write harness config files pointing at the router
 
@@ -212,7 +227,7 @@ Notes:
 Exit codes: 0 at least one model answered, 1 all failed/unreachable.
 
 Example:
-  bansos ping mimo-v2.5-free
+  bansos ping big-pickle
 `,
   refresh: `bansos refresh - ask the daemon to re-run upstream health checks now
 
@@ -263,6 +278,21 @@ Requires a running daemon (bansos start). Aggregates cover the last 60 days,
 kept in ~/.bansos/activity.json across restarts. Use the "Activity" tab in the web UI for a live, per-request feed.
 Exit codes: 0 daemon reachable, 1 daemon unreachable.
 `,
+  backup: `bansos backup - export config, usage history, and relay state
+
+Usage:
+  bansos backup [file.json]
+
+Defaults to bansos-backup-YYYY-MM-DD.json in current directory, or - for stdout.
+Exit codes: 0 success, 1 failure.
+`,
+  restore: `bansos restore - restore config and usage history from a backup file
+
+Usage:
+  bansos restore <file.json>
+
+Exit codes: 0 success, 1 failure.
+`,
 };
 
 function isDaemonFlag(a: string | undefined): boolean {
@@ -303,6 +333,8 @@ async function main(): Promise<number> {
       return runStart(args.slice(1));
     case "stop":
       return runStop(args.slice(1));
+    case "restart":
+      return runRestart(args.slice(1));
     case "logs":
       return runLogs(args.slice(1));
     case "status":
@@ -320,6 +352,10 @@ async function main(): Promise<number> {
       return runAutostart(args.slice(1), json);
     case "doctor":
       return runDoctor(args.slice(1));
+    case "backup":
+      return runBackup(args.slice(1));
+    case "restore":
+      return runRestore(args.slice(1));
     case "--version":
     case "-v":
       console.log(VERSION);
@@ -368,6 +404,9 @@ async function runStart(args: string[]): Promise<number> {
   const running = await runningDaemonUrl(port);
   if (running) {
     console.log(`bansosd already running at ${running}`);
+    const stale = await staleDaemonNotice(running);
+    if (stale) console.log(`${stale}\n`);
+    else await printUpdateNotice();
     return 0;
   }
 
@@ -379,9 +418,7 @@ async function runStart(args: string[]): Promise<number> {
       ...process.execArgv,
       process.argv[1]!,
       "daemon",
-      ...(port !== undefined ? ["--port", String(port)] : []),
-      ...(bind !== undefined ? ["--bind", bind] : []),
-      ...(unsafeAllowNonLoopback ? ["--unsafe-allow-non-loopback"] : []),
+      ...startArgs({ port, bind, unsafeAllowNonLoopback }),
       "--bg-child",
     ],
     {
@@ -421,7 +458,13 @@ async function runStart(args: string[]): Promise<number> {
   console.log(`  ├── API Base : ${baseUrl}/v1`);
   console.log(`  └── Log file : ${logFile}`);
   console.log(`\nwatch logs live with: bansos logs\n`);
+  await printUpdateNotice();
   return 0;
+}
+
+async function printUpdateNotice(): Promise<void> {
+  const notice = updateNotice(await checkUpdate());
+  if (notice) console.log(`${notice}\n`);
 }
 
 // tail the daemon log in real time for a --bg daemon (polls file size every 500ms)
@@ -536,8 +579,9 @@ function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    // EPERM: the process exists but belongs to someone else, so it is not stopped
+    return (err as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
@@ -608,6 +652,56 @@ function isDaemonCmdline(args: string[]): boolean {
   return args.includes("daemon") || args.join(" ").includes("dist/daemon/index.js");
 }
 
+async function waitForExit(pids: number[], timeoutMs: number): Promise<number[]> {
+  const deadline = Date.now() + timeoutMs;
+  let alive = pids.filter(isAlive);
+  while (alive.length > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    alive = alive.filter(isAlive);
+  }
+  return alive;
+}
+
+async function runRestart(args: string[]): Promise<number> {
+  if (args.length > 0) {
+    console.error(`bansos restart: takes no flags (got "${args[0]}")`);
+    return 1;
+  }
+  const state = readJson<{ pid?: number; startedAt?: number; flags?: StartFlags }>(STATE_FILE);
+  let manager: string | null;
+  try {
+    manager = restartManaged();
+  } catch (err) {
+    console.error(`bansos restart: ${(err as Error).message}`);
+    return 1;
+  }
+  if (!manager) {
+    if (!state?.pid || !isAlive(state.pid)) {
+      const others = findDaemonPids(null);
+      if (others.length > 0) {
+        console.error(`bansos restart: ${others.length} daemon(s) not recorded in state.json are running, so there is nothing to restart here`);
+        console.error(`  stop them with "bansos stop --all", then run "bansos start --bg"`);
+        return 1;
+      }
+    }
+    const stopped = await runStop();
+    return stopped === 0 ? runStart(["--bg", ...startArgs(state?.flags)]) : stopped;
+  }
+  for (let i = 0; i < 100; i++) {
+    // a new startedAt proves the answer comes from the new process, not the old one still draining
+    const startedAt = readJson<{ startedAt?: number }>(STATE_FILE)?.startedAt;
+    const url = startedAt !== undefined && startedAt !== state?.startedAt ? await runningDaemonUrl() : null;
+    if (url) {
+      console.log(`bansosd restarted by ${manager} at ${url}`);
+      await printUpdateNotice();
+      return 0;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  console.error(`bansos restart: ${manager} restarted the service but the daemon did not answer; check: bansos logs`);
+  return 1;
+}
+
 async function runStop(args: string[] = []): Promise<number> {
   const all = args.includes("--all");
   const state = readJson<{ pid?: number }>(STATE_FILE);
@@ -639,25 +733,28 @@ async function runStop(args: string[] = []): Promise<number> {
       // already gone
     }
   }
-  await new Promise((r) => setTimeout(r, 400));
-  let stopped = 0;
-  for (const pid of pids) {
-    if (isAlive(pid)) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // gone between checks
-      }
+  // wait for a real exit: a start that runs before the old daemon lets go of the port bumps to the next one
+  let survivors = await waitForExit(pids, 5000);
+  for (const pid of survivors) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // gone between checks
     }
-    stopped++;
   }
+  survivors = await waitForExit(survivors, 2000);
   fs.rmSync(STATE_FILE, { force: true });
-  console.log(`stopped ${stopped} daemon(s)`);
+  console.log(`stopped ${pids.length - survivors.length} daemon(s)`);
+  if (survivors.length > 0) {
+    console.error(`bansos stop: pid ${survivors.join(", ")} did not exit`);
+    return 1;
+  }
   return 0;
 }
 
 interface DaemonStatus {
   status: string;
+  version?: string;
   port: number;
   modelCount: number;
   models: string[];
@@ -701,10 +798,8 @@ async function runStatus(json: boolean): Promise<number> {
     console.error(
       `bansos: no daemon reachable (probed ports ${DEFAULT_PORT}-${MAX_PORT}), start one with "bansos start"`,
     );
-    const update = await checkUpdate();
-    if (update.hasUpdate) {
-      console.log(`\nUpdate available: ${update.current} -> ${update.latest} (run: npm i -g bansos-router)`);
-    }
+    const notice = updateNotice(await checkUpdate());
+    if (notice) console.log(`\n${notice}`);
     return 1;
   }
   const update = await checkUpdate();
@@ -718,6 +813,10 @@ async function runStatus(json: boolean): Promise<number> {
   }
   for (const [i, d] of daemons.entries()) {
     console.log(`daemon:   ok (port ${d.port})`);
+    if (d.version) {
+      const stale = isNewerVersion(d.version, VERSION) ? ` (${VERSION} is installed, run: bansos restart)` : "";
+      console.log(`version:  ${d.version}${stale}`);
+    }
     console.log(`models:   ${d.modelCount}`);
     if (d.relay?.enabled && d.relay.url) {
       console.log(`relay:    on (${d.relay.url})`);
@@ -728,7 +827,7 @@ async function runStatus(json: boolean): Promise<number> {
     if (i < daemons.length - 1) console.log("");
   }
   if (update.hasUpdate) {
-    console.log(`\nUpdate available: ${update.current} -> ${update.latest} (run: npm i -g bansos-router)`);
+    console.log(`\n${updateNotice(update)}`);
   }
   return 0;
 }
@@ -739,9 +838,10 @@ interface UsageCliShape {
   errorRequests: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  totalCachedTokens: number;
   failoverCount: number;
   avgDurationMs: number;
-  perModel: Record<string, { requests: number; ok: number; inputTokens: number; outputTokens: number }>;
+  perModel: Record<string, { requests: number; ok: number; inputTokens: number; outputTokens: number; cachedTokens: number }>;
   perUpstream: Record<string, { requests: number; ok: number }>;
 }
 
@@ -761,9 +861,10 @@ async function runUsage(json: boolean): Promise<number> {
       errorRequests: number;
       totalInputTokens: number;
       totalOutputTokens: number;
+      totalCachedTokens: number;
       failoverCount: number;
       avgDurationMs: number;
-      perModel: Record<string, { requests: number; ok: number; inputTokens: number; outputTokens: number }>;
+      perModel: Record<string, { requests: number; ok: number; inputTokens: number; outputTokens: number; cachedTokens: number }>;
       perUpstream: Record<string, { requests: number; ok: number }>;
     };
   } catch {
@@ -783,6 +884,7 @@ async function runUsage(json: boolean): Promise<number> {
   console.log(`\n● usage summary (last 60 days)\n`);
   console.log(`  requests    : ${body.totalRequests} (${body.okRequests} ok, ${body.errorRequests} err)`);
   console.log(`  tokens in   : ${fmt(body.totalInputTokens)}`);
+  console.log(`  cached      : ${fmt(body.totalCachedTokens ?? 0)}`);
   console.log(`  tokens out  : ${fmt(body.totalOutputTokens)}`);
   console.log(`  avg latency : ${dur(body.avgDurationMs)}`);
   console.log(`  failovers   : ${body.failoverCount}`);
@@ -791,7 +893,7 @@ async function runUsage(json: boolean): Promise<number> {
   if (models.length > 0) {
     console.log(`\n  by model:`);
     for (const [m, s] of models) {
-      console.log(`    ${m}  ${s.requests} reqs · ${fmt(s.inputTokens)}/${fmt(s.outputTokens)} tok`);
+      console.log(`    ${m}  ${s.requests} reqs · ${fmt(s.inputTokens)}/${fmt(s.outputTokens)} tok · ${fmt(s.cachedTokens ?? 0)} cached`);
     }
   }
 
@@ -831,6 +933,85 @@ async function runStatusOrModels(cmd: "status" | "models" | "refresh", json: boo
   } catch {
     if (json) console.log(JSON.stringify({ ok: false, error: `daemon not reachable at ${base}` }));
     else console.error(`bansos: daemon not reachable at ${base}. Start it with "bansos start"`);
+    return 1;
+  }
+}
+
+async function runBackup(argv: string[]): Promise<number> {
+  const base = `http://${effectiveBind()}:${effectivePort()}`;
+  let outPath = argv.find((a) => !a.startsWith("-"));
+  let res: Response;
+  try {
+    res = await fetch(`${base}/bansos/backup`);
+    if (!res.ok) {
+      console.error(`bansos backup: daemon returned HTTP ${res.status}`);
+      return 1;
+    }
+  } catch {
+    console.error(`bansos backup: daemon not reachable at ${base}. Start it with "bansos start"`);
+    return 1;
+  }
+  const body = await res.json();
+  const formatted = JSON.stringify(body, null, 2);
+  if (!outPath) {
+    outPath = `bansos-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  }
+  if (outPath === "-") {
+    process.stdout.write(formatted + "\n");
+    return 0;
+  }
+  try {
+    fs.writeFileSync(outPath, formatted);
+    console.log(`Backup written to ${outPath}`);
+    return 0;
+  } catch (err) {
+    console.error(`bansos backup: failed to write ${outPath}: ${(err as Error).message}`);
+    return 1;
+  }
+}
+
+async function runRestore(argv: string[]): Promise<number> {
+  const filePath = argv.find((a) => !a.startsWith("-"));
+  if (!filePath) {
+    console.error("Usage: bansos restore <backup-file.json>");
+    return 1;
+  }
+  if (!fs.existsSync(filePath)) {
+    console.error(`bansos restore: file not found: ${filePath}`);
+    return 1;
+  }
+  let parsed: unknown;
+  try {
+    const text = fs.readFileSync(filePath, "utf8");
+    parsed = JSON.parse(text);
+  } catch (err) {
+    console.error(`bansos restore: failed to parse JSON in ${filePath}: ${(err as Error).message}`);
+    return 1;
+  }
+  const base = `http://${effectiveBind()}:${effectivePort()}`;
+  try {
+    const res = await fetch(`${base}/bansos/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: parsed }),
+    });
+    if (!res.ok) {
+      const errBody = (await res.json().catch(() => ({}))) as { error?: { message?: string } };
+      console.error(`bansos restore: daemon returned HTTP ${res.status}: ${errBody?.error?.message ?? "unknown error"}`);
+      return 1;
+    }
+    const result = (await res.json()) as { restored: { config: boolean; activityCount: number; relay: boolean }; restartRequired: string[] };
+    const parts: string[] = [];
+    if (result.restored.config) parts.push("config");
+    if (result.restored.activityCount > 0) parts.push(`${result.restored.activityCount} activity events`);
+    if (result.restored.relay) parts.push("relay");
+    console.log(`Restored: ${parts.join(", ") || "no components found"}`);
+    if (result.restartRequired.length > 0) {
+      console.log(`Restart required to apply changes to: ${result.restartRequired.join(", ")} (run: bansos restart)`);
+    }
+    return 0;
+  } catch {
+    console.error(`bansos restore: daemon not reachable at ${base}. Start it with "bansos start"`);
     return 1;
   }
 }

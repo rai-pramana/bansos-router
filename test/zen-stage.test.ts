@@ -149,16 +149,16 @@ async function startZenDaemon(
 }
 
 test("the stage's catalog decides which ids it can serve", async () => {
-  const stage = await startStage(["big-pickle", "muse-spark-1.3-contributor-free"], {});
+  const stage = await startStage(["big-pickle", "glm-5.3-flash-free"], {});
   try {
     const handle = createZenStage({ baseUrl: stage.url, ttlMs: 0 });
     await handle.ready();
     assert.equal(handle.serves("big-pickle"), true);
-    assert.equal(handle.serves("muse-spark-1.3-contributor-free"), true);
+    assert.equal(handle.serves("glm-5.3-flash-free"), true);
     // an id the stage does not carry is NOT servable there
     assert.equal(handle.serves("beam-free"), false);
     // only ids the daemon has a registry entry for are published
-    assert.deepEqual(handle.ids().sort(), ["big-pickle", "muse-spark-1.3-contributor-free"]);
+    assert.deepEqual(handle.ids().sort(), ["big-pickle", "glm-5.3-flash-free"]);
   } finally {
     await stage.close();
   }
@@ -231,31 +231,31 @@ test("a stage-backed id the production catalog does not list stays published", a
     relayAllowed: false,
     chatUrl: "https://example.invalid/chat/completions",
     async fetchCatalog() {
-      // production lists big-pickle but NOT muse-spark-1.3-contributor-free
+      // production lists big-pickle but NOT glm-5.3-flash-free
       return [md("big-pickle", "zen")];
     },
     requestHeaders: () => ({}),
   };
   const catalog = new RuntimeCatalog([upstream], logger(), normalizeSecurityConfig(undefined));
-  catalog.seed([md("big-pickle", "zen"), md("muse-spark-1.3-contributor-free", "zen")]);
+  catalog.seed([md("big-pickle", "zen"), md("glm-5.3-flash-free", "zen")]);
 
-  const stage = await startStage(["big-pickle", "muse-spark-1.3-contributor-free"], {});
+  const stage = await startStage(["big-pickle", "glm-5.3-flash-free"], {});
   try {
     const handle = createZenStage({ baseUrl: stage.url, ttlMs: 0 });
     await handle.ready();
     catalog.setStagedModels(handle.ids(), (id) => handle.describe(id));
 
-    assert.equal(catalog.resolve("muse-spark-1.3-contributor-free")?.id, "muse-spark-1.3-contributor-free");
+    assert.equal(catalog.resolve("glm-5.3-flash-free")?.id, "glm-5.3-flash-free");
 
     // a refresh that drops the id from the production list must not unpublish
     // it: the stage still serves it
     await catalog.refresh();
     assert.equal(
-      catalog.resolve("muse-spark-1.3-contributor-free")?.id,
-      "muse-spark-1.3-contributor-free",
+      catalog.resolve("glm-5.3-flash-free")?.id,
+      "glm-5.3-flash-free",
       "a refresh must not drop a stage-backed id",
     );
-    assert.deepEqual(catalog.stagedIds.sort(), ["big-pickle", "muse-spark-1.3-contributor-free"]);
+    assert.deepEqual(catalog.stagedIds.sort(), ["big-pickle", "glm-5.3-flash-free"]);
   } finally {
     await stage.close();
   }

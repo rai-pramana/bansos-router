@@ -46,7 +46,7 @@ Supported harnesses for `bansos setup`: `claude-code`, `aider`, `opencode`, `cod
 
 Using both is harmless but redundant: the IDs differ (`bansos` vs `bansosr`), so you get two providers listing the same models. Prefer one.
 
-Open `http://127.0.0.1:17070` in your browser for the Web UI dashboard: model catalog with live latency ping, harness setup (preview or apply in one click), relay manager, playground, activity and usage, daemon logs, and settings (security mode, catalog refresh, port and bind, restart, health check).
+Open `http://127.0.0.1:17070` in your browser for the Web UI dashboard: model catalog with live latency ping, harness setup (preview or apply in one click), relay manager, playground, activity and usage, daemon logs, and settings (security mode, catalog refresh, port and bind, autostart, backup and data management, restart, health check).
 
 ### Start at login
 
@@ -54,7 +54,7 @@ Open `http://127.0.0.1:17070` in your browser for the Web UI dashboard: model ca
 bansos autostart on       # also: off, status
 ```
 
-The daemon then starts whenever you log in, through the system's own service manager: a systemd user service on Linux, a LaunchAgent on macOS, a script in the Startup folder on Windows. On Linux and macOS it is also restarted if it crashes, while `bansos stop` still stops it for good. A daemon you are already running is left alone and the service takes over at the next login. The same switch is in the dashboard's Settings tab. On Linux, `loginctl enable-linger $USER` starts it at boot, before you log in.
+The daemon then starts whenever you log in, through the system's own service manager: a systemd user service on Linux, a LaunchAgent on macOS, a script in the Startup folder on Windows. On Linux and macOS it is also restarted if it crashes, while `bansos stop` stops it for good (a daemon that has to be force-killed after 5 seconds counts as a crash and comes back). A daemon you are already running is left alone and the service takes over at the next login. The same switch is in the dashboard's Settings tab. On Linux, `loginctl enable-linger $USER` starts it at boot, before you log in.
 
 ### Always-on local protections
 
@@ -90,21 +90,33 @@ docker compose up -d
 
 | Command | Purpose |
 |---|---|
-| `bansos start [--bg] [--port N] [--bind H] [--unsafe-allow-non-loopback]` | Run the daemon (foreground, or detached with `--bg`) |
+| `bansos start [--bg] [--port N] [--bind H] [--unsafe-allow-non-loopback]` | Run the daemon (foreground, or detached with `--bg`). If a daemon already answers on that port it says so and exits 0 instead of starting a second one |
 | `bansos logs [--activity]` | Tail the daemon log in real time (every mode: daemon always logs to `~/.bansos/logs/bansosd.log`); `--activity` prints the structured request feed shown in the web UI "Activity" tab |
-| `bansos stop [--all]` | Stop the daemon recorded in `state.json`; `--all` stops every bansos daemon on the machine |
+| `bansos stop [--all]` | Stop the daemon recorded in `state.json`; `--all` stops every bansos daemon on the machine. Sends SIGTERM, then SIGKILL after 5 seconds, and exits 1 if a daemon survives |
+| `bansos restart` | Restart the daemon, for example after `npm i -g bansos-router`; a daemon run by `bansos autostart` is restarted by systemd or launchd so it stays supervised |
 | `bansos status [--json]` | Daemon status (port, model count, alive models); reports every running daemon on the auto-bump range (17070-17090) |
 | `bansos models [--json]` | List live catalog from `/v1/models` |
 | `bansos ping [model] [--json]` | Probe live latency and rate-limit status of all models (or a specific model) |
 | `bansos refresh` | Ask the daemon to re-run health checks now |
 | `bansos usage [--json]` | Request counts and token totals per model and upstream (last 60 days) |
 | `bansos setup <harness...> [--model <id> \| --models <id,...> --upstream <id,...>] [--dry-run] [--undo]` | Write, update, or undo harness configs |
-| `bansos relay <on\|off\|status\|url\|use\|list\|remove>` | Manage relay egress |
+| `bansos relay <on\|off\|status\|url\|use\|list\|remove>` | Manage relay egress (`relay deploy` is listed in the help but not implemented yet) |
 | `bansos autostart <on\|off\|status> [--json]` | Start the daemon when you log in (systemd / launchd / Startup folder) |
-| `bansos doctor` | Diagnose daemon reachability and harness config validity |
+| `bansos doctor` | Diagnose daemon reachability, relay, security config, autostart, harness config validity and available updates |
+| `bansos backup [file.json]` | Export daemon configuration, usage history, and relay state to JSON (defaults to `bansos-backup-YYYY-MM-DD.json` or `-` for stdout) |
+| `bansos restore <file.json>` | Restore configuration and usage history from a backup JSON file |
 | `bansos --version` | Print version |
 | `bansos <command> --help` / `bansos help <command>` | Per-command usage, defaults, exit codes, examples |
 | `bansosd` | Alias for the daemon (e.g. `bansosd --bg`) |
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `BANSOS_DIR` | Directory for state, config and logs instead of `~/.bansos`. The pi extension still reads `~/.bansos/state.json` |
+| `BANSOS_LOG=json` | Log JSON lines instead of text |
+| `BANSOS_RATE_LIMIT` | Requests per minute per client IP (default 300; `0` or an invalid value keeps the default) |
+| `NO_UPDATE_NOTIFIER=1` | Turn off the daily npm update check and every update notice |
 
 ## Strict security mode
 
@@ -127,7 +139,7 @@ Strict mode is opt-in and fail-closed. Add a `security` block to `~/.bansos/conf
 
 With `mode: "strict"`:
 
-- Non-loopback binds rejected unless `--unsafe-allow-non-loopback` passed.
+- Non-loopback binds rejected unless `--unsafe-allow-non-loopback` is passed (or `"unsafeAllowNonLoopbackBind": true` is set in the `security` block).
 - Relay egress, probing, and mutation disabled across CLI, API, Web UI.
 - Only exact upstreams in `allowedUpstreams` receive requests (empty list blocks all). Models from the other upstreams are left out of `/v1/models`, `bansos setup` and the smart default; the dashboard still lists them, marked blocked.
 - Cross-provider failover disabled.
@@ -150,16 +162,16 @@ With `mode: "strict"`:
 ## Available models
 
 By default, `bansos setup` automatically configures intelligent defaults per harness:
-- **Claude Code**: Maps tiers automatically (`haiku` -> fast non-reasoning, `sonnet` -> daily reasoning, `opus` -> highest-capacity reasoning).
-- **Multi-model harnesses** (`opencode`, `goose`, `openclaw`, `continue`): Registers all available models with the smart default (currently `muse-spark-1.3-contributor-free`) as primary.
+- **Claude Code**: Maps tiers automatically (`haiku` -> the largest non-reasoning model, `sonnet` -> the smart default when it reasons, otherwise the second-largest reasoning model, `opus` -> the largest reasoning model).
+- **Multi-model harnesses** (`opencode`, `goose`, `openclaw`, `continue`): Registers every available model so each one is selectable in the harness; no primary model is set.
 - **Discovery harnesses** (`9router`, `omp`): Register a provider that lists models from `/v1/models` itself.
-- **Single-model harnesses** (`aider`, `codex`, `hermes`, `antigravity`, `jcode`, `cline`, `roo`): Same smart default. Pass `--model <id>` to pin a specific model.
+- **Single-model harnesses** (`aider`, `codex`, `hermes`, `antigravity`, `jcode`, `cline`, `roo`): Use the smart default, which is the preferred model in `src/upstreams/types.ts` when it is alive, otherwise the reasoning model with the largest context window. Pass `--model <id>` to pin a specific model.
 
 To write only some models, pass `--models <id,...>` and/or `--upstream <id,...>` (every model of that upstream), for example `bansos setup opencode --upstream zen --models kilo-auto/free`. Claude Code then picks its Haiku, Sonnet and Opus tiers from that set. The dashboard's Agent Setup tab has the same picker, with a checkbox per model and per upstream.
 
 The model list changes as upstreams rotate their free tiers, so it lives on its own page: [ihsan-ramadhan.github.io/bansos-router](https://ihsan-ramadhan.github.io/bansos-router/). A GitHub Action runs the daemon's own catalog check every six hours and publishes the result there, with reasoning, vision, context and max output for each model, and as [`models.json`](https://ihsan-ramadhan.github.io/bansos-router/models.json). It checks from a GitHub datacenter, so run `bansos models` or `bansos ping` to see what your machine can reach.
 
-Muse Spark answers only on the Responses API (`/v1/responses`) and returns HTTP 500 on chat completions. bansos-router translates the upstream leg both ways, so Muse works from any harness: chat completions, Responses, and Anthropic clients all see their usual wire format, tool calls included.
+Responses wire models (such as `crouton-alpha-free` on OpenCode Zen) accept inputs on the Responses API (`/v1/responses`) and support multimodal PDF input. bansos-router translates the upstream leg both ways, so responses-wire models work seamlessly from any harness: chat completions, Responses, and Anthropic clients all see their usual wire format, tool calls included.
 
 Notes:
 

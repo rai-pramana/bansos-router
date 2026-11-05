@@ -18,6 +18,7 @@ export interface ActivityEvent {
   relay?: string;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens?: number;
   durationMs: number;
   status: ActivityStatus;
   statusCode?: number;
@@ -29,6 +30,7 @@ export interface ModelActivity {
   ok: number;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens: number;
 }
 
 export interface UsageStats {
@@ -37,6 +39,7 @@ export interface UsageStats {
   errorRequests: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  totalCachedTokens: number;
   failoverCount: number;
   avgDurationMs: number;
   perModel: Record<string, ModelActivity>;
@@ -53,6 +56,7 @@ export interface ActivityInput {
   relay?: string;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens?: number;
   durationMs: number;
   status: ActivityStatus;
   statusCode?: number;
@@ -87,6 +91,7 @@ interface Bucket {
   errors: number;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens: number;
   durationMs: number;
   failovers: number;
   perModel: Record<string, ModelActivity>;
@@ -100,6 +105,7 @@ function emptyBucket(): Bucket {
     errors: 0,
     inputTokens: 0,
     outputTokens: 0,
+    cachedTokens: 0,
     durationMs: 0,
     failovers: 0,
     perModel: {},
@@ -201,16 +207,18 @@ export class ActivityStore {
     else b.errors++;
     b.inputTokens += e.inputTokens ?? 0;
     b.outputTokens += e.outputTokens ?? 0;
+    b.cachedTokens += e.cachedTokens ?? 0;
     b.durationMs += e.durationMs ?? 0;
     if (e.failoverFrom) b.failovers++;
 
     const m =
       b.perModel[e.model] ??
-      (b.perModel[e.model] = { requests: 0, ok: 0, inputTokens: 0, outputTokens: 0 });
+      (b.perModel[e.model] = { requests: 0, ok: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 });
     m.requests++;
     if (e.status === "ok") m.ok++;
     m.inputTokens += e.inputTokens ?? 0;
     m.outputTokens += e.outputTokens ?? 0;
+    m.cachedTokens += e.cachedTokens ?? 0;
 
     const u = b.perUpstream[e.upstream] ?? (b.perUpstream[e.upstream] = { requests: 0, ok: 0 });
     u.requests++;
@@ -292,6 +300,12 @@ export class ActivityStore {
     }
   }
 
+  private rebuildBuckets(): void {
+    this.buckets.clear();
+    for (const e of this.events) this.addToBucket(e);
+    this.pruneBuckets();
+  }
+
   record(input: ActivityInput): void {
     const now = Date.now();
     // id/timestamp after the spread: ActivityInput has no id, but a caller (or a
@@ -367,6 +381,7 @@ export class ActivityStore {
     let errors = 0;
     let inputTokens = 0;
     let outputTokens = 0;
+    let cachedTokens = 0;
     let durationMs = 0;
     let failovers = 0;
     const perModel: Record<string, ModelActivity> = {};
@@ -379,15 +394,17 @@ export class ActivityStore {
       errors += b.errors;
       inputTokens += b.inputTokens;
       outputTokens += b.outputTokens;
+      cachedTokens += b.cachedTokens ?? 0;
       durationMs += b.durationMs;
       failovers += b.failovers;
       for (const [id, m] of Object.entries(b.perModel)) {
         const acc =
-          perModel[id] ?? (perModel[id] = { requests: 0, ok: 0, inputTokens: 0, outputTokens: 0 });
+          perModel[id] ?? (perModel[id] = { requests: 0, ok: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 });
         acc.requests += m.requests;
         acc.ok += m.ok;
         acc.inputTokens += m.inputTokens;
         acc.outputTokens += m.outputTokens;
+        acc.cachedTokens += m.cachedTokens ?? 0;
       }
       for (const [id, u] of Object.entries(b.perUpstream)) {
         const acc = perUpstream[id] ?? (perUpstream[id] = { requests: 0, ok: 0 });
@@ -402,10 +419,60 @@ export class ActivityStore {
       errorRequests: errors,
       totalInputTokens: inputTokens,
       totalOutputTokens: outputTokens,
+      totalCachedTokens: cachedTokens,
       failoverCount: failovers,
       avgDurationMs: requests ? Math.round(durationMs / requests) : 0,
       perModel,
       perUpstream,
     };
+  }
+
+  getAllEvents(): ActivityEvent[] {
+    return [...this.events];
+  }
+
+  clear(): void {
+    this.closeFd();
+    this.events = [];
+    this.buckets.clear();
+    this.nextId = 1;
+    this.flushToDisk();
+  }
+
+  importEvents(incoming: ActivityEvent[], replace = false): number {
+    if (!Array.isArray(incoming)) return 0;
+    const now = Date.now();
+    const valid = incoming.filter(
+      (e) =>
+        e &&
+        typeof e === "object" &&
+        typeof e.timestamp === "number" &&
+        now - e.timestamp <= MAX_RETENTION_MS &&
+        typeof e.model === "string" &&
+        typeof e.upstream === "string" &&
+        (e.status === "ok" || e.status === "error"),
+    );
+    if (replace) {
+      this.events = valid;
+    } else {
+      const seen = new Set(this.events.map((e) => `${e.timestamp}_${e.model}_${e.upstream}`));
+      for (const e of valid) {
+        const key = `${e.timestamp}_${e.model}_${e.upstream}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          this.events.push(e);
+        }
+      }
+    }
+    this.events.sort((a, b) => a.timestamp - b.timestamp);
+    if (this.events.length > this.cap) {
+      this.events = this.events.slice(-this.cap);
+    }
+    if (this.events.length > 0) {
+      this.nextId = Math.max(...this.events.map((e) => e.id || 0)) + 1;
+    }
+    this.rebuildBuckets();
+    this.flushToDisk();
+    return valid.length;
   }
 }

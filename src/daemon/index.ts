@@ -9,6 +9,8 @@ import {
   loadConfig,
   loadConfigWarnings,
   runningDaemonUrl,
+  startArgs,
+  type StartFlags,
   writeJsonAtomic,
   STATE_FILE,
   LOG_DIR,
@@ -20,7 +22,7 @@ import { assertBindAllowed } from "../security/policy";
 import { buildUpstreams, SEEDED_MODELS } from "../upstreams";
 import { createZenMirror } from "../upstreams/zen-mirror";
 import { createZenStage } from "../upstreams/zen-stage";
-import { VERSION } from "../update";
+import { VERSION, checkUpdate, staleDaemonNotice, updateNotice } from "../update";
 import { RuntimeCatalog } from "./catalog";
 import { RateLimiter } from "./rate-limit";
 import { ActivityStore } from "./activity";
@@ -336,8 +338,15 @@ async function main(argv: string[]): Promise<void> {
   const running = args.bgChild ? null : await runningDaemonUrl(args.port);
   if (running) {
     console.log(`bansosd already running at ${running}`);
+    const notice = (await staleDaemonNotice(running)) ?? updateNotice(await checkUpdate());
+    if (notice) console.log(notice);
     return;
   }
+  const explicit: StartFlags = {
+    ...(args.port !== undefined ? { port: args.port } : {}),
+    ...(args.bind !== undefined ? { bind: args.bind } : {}),
+    ...(args.unsafeAllowNonLoopback ? { unsafeAllowNonLoopback: true } : {}),
+  };
 
   // always log to file (for `bansos logs`) and tee to stdout; built before the bind check
   fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -382,9 +391,7 @@ async function main(argv: string[]): Promise<void> {
         ...process.execArgv,
         process.argv[1]!,
         "daemon",
-        ...(args.port !== undefined ? ["--port", String(args.port)] : []),
-        ...(args.bind !== undefined ? ["--bind", args.bind] : []),
-        ...(args.unsafeAllowNonLoopback ? ["--unsafe-allow-non-loopback"] : []),
+        ...startArgs(explicit),
         // marker so the child knows it is the file-backed instance
         "--bg-child",
       ],
@@ -424,6 +431,7 @@ async function main(argv: string[]): Promise<void> {
       port: actualPort,
       bind: wantBind,
       startedAt: Date.now(),
+      flags: explicit,
     });
 
     // banner goes through the tee, not stdout, so a bg child's banner still reaches `bansos logs`
@@ -489,6 +497,13 @@ async function main(argv: string[]): Promise<void> {
 
   for (const warning of loadConfigWarnings()) log.warn(warning);
   await boot(config);
+  // once per process, not on every config restart from the dashboard; never awaited so it cannot hold up the server
+  if (process.env.BANSOS_LOG !== "json") {
+    void checkUpdate().then((info) => {
+      const notice = updateNotice(info);
+      if (notice) out.write(`${notice}\n\n`);
+    });
+  }
 
   const shutdown = () => {
     log.info("shutting down");
