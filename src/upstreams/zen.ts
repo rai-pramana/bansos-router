@@ -612,6 +612,22 @@ export function zenModelFromIndex(id: string, m: ModelsDevModel): ModelDef {
 }
 
 export const ZEN_MODELS: ModelDef[] = [
+  // LOCAL PATCH (local-patches branch): the stage still serves this id and the
+  // `zen-stage/` label is built from this registry, so dropping it here makes
+  // the model disappear from the daemon entirely — measured 2026-11-05, after
+  // upstream rewrote ZEN_MODELS for 0.6.x while dev.opencode.ai kept answering
+  // this id with billing_source=free. Do not "clean up" on the next merge.
+  modelDef({
+    id: "muse-spark-1.3-contributor-free",
+    name: "Muse Spark 1.3 Free",
+    source: "zen",
+    reasoning: true,
+    contextWindow: 1_048_576,
+    maxTokens: 131_072,
+    input: ["text", "image", "pdf"],
+    compat: { supportsReasoningEffort: false, supportsDeveloperRole: false },
+    wireApi: "responses",
+  }),
   modelDef({
     id: "glm-5.3-flash-free",
     name: "GLM-5.3-Flash Free",
