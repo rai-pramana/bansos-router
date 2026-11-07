@@ -851,6 +851,7 @@ export function logUsageTransform(
   activity?: ActivityStore,
   kind: ActivityKind = "chat",
   relay = "",
+  client?: string,
 ): Transform {
   const splitter = createSseFrameSplitter();
   const state: ChatFoldState = { sawContent: false, sawToolCalls: false, reasoning: "", envelope: {} };
@@ -869,6 +870,7 @@ export function logUsageTransform(
       requestedModel: requestedModel ?? model,
       upstream,
       ...(relay ? { relay } : {}),
+      ...(client ? { client } : {}),
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
       cachedTokens: usage.cachedTokens ?? 0,

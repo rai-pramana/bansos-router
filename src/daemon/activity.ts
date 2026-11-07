@@ -23,6 +23,7 @@ export interface ActivityEvent {
   status: ActivityStatus;
   statusCode?: number;
   failoverFrom?: string;
+  client?: string;
 }
 
 export interface ModelActivity {
@@ -46,8 +47,16 @@ export interface UsageStats {
   perUpstream: Record<string, { requests: number; ok: number }>;
 }
 
-export type TimeWindow = "today" | "7d" | "30d" | "60d" | "all";
+export interface InFlightRequest {
+  id: number;
+  timestamp: number;
+  client: string;
+  model: string;
+  requestedModel: string;
+  upstream: string;
+}
 
+export type TimeWindow = "today" | "7d" | "30d" | "60d" | "all";
 export interface ActivityInput {
   kind: ActivityKind;
   model: string;
@@ -61,6 +70,7 @@ export interface ActivityInput {
   status: ActivityStatus;
   statusCode?: number;
   failoverFrom?: string;
+  client?: string;
 }
 
 // Append-only JSONL, one event per line. The old single-JSON-array file forced a
@@ -125,7 +135,9 @@ function hourKey(ts: number): number {
 
 export class ActivityStore {
   private events: ActivityEvent[] = [];
+  private inFlight = new Map<number, InFlightRequest>();
   private nextId = 1;
+  private nextInFlightId = 1;
   private readonly cap: number;
   private buckets = new Map<number, Bucket>();
   private fd: number | null = null;
@@ -429,6 +441,24 @@ export class ActivityStore {
 
   getAllEvents(): ActivityEvent[] {
     return [...this.events];
+  }
+
+  startRequest(input: Omit<InFlightRequest, "id">): number {
+    const id = this.nextInFlightId++;
+    this.inFlight.set(id, { id, ...input });
+    return id;
+  }
+
+  endRequest(id: number): void {
+    this.inFlight.delete(id);
+  }
+
+  getInFlight(): InFlightRequest[] {
+    const now = Date.now();
+    for (const [id, req] of this.inFlight.entries()) {
+      if (now - req.timestamp > 120_000) this.inFlight.delete(id);
+    }
+    return Array.from(this.inFlight.values());
   }
 
   clear(): void {
