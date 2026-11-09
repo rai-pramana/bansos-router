@@ -137,6 +137,63 @@ test("responsesToChatJson folds output items into an openai chat completion", ()
   assert.deepEqual(chat.usage, { prompt_tokens: 12, completion_tokens: 60, total_tokens: 72 });
 });
 
+test("responsesToChatJson carries the reasoning item as reasoning_content", () => {
+  const chat = responsesToChatJson(
+    {
+      status: "completed",
+      output: [
+        {
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "first think " }, { type: "summary_text", text: "then conclude" }],
+        },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "OK" }] },
+      ],
+    },
+    "muse",
+  ) as any;
+
+  assert.equal(chat.choices[0].message.content, "OK");
+  assert.equal(chat.choices[0].message.reasoning_content, "first think then conclude");
+});
+
+test("responsesToChatJson reads provider variants of the reasoning item", () => {
+  const fromContent = responsesToChatJson(
+    {
+      status: "completed",
+      output: [
+        { type: "reasoning", content: [{ type: "reasoning_text", text: "alt shape" }] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "OK" }] },
+      ],
+    },
+    "muse",
+  ) as any;
+  assert.equal(fromContent.choices[0].message.reasoning_content, "alt shape");
+
+  const bare = responsesToChatJson(
+    {
+      status: "completed",
+      output: [
+        { type: "reasoning", text: "bare shape" },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "OK" }] },
+      ],
+    },
+    "muse",
+  ) as any;
+  assert.equal(bare.choices[0].message.reasoning_content, "bare shape");
+});
+
+test("responsesToChatJson omits reasoning_content when there is no thinking", () => {
+  const chat = responsesToChatJson(
+    {
+      status: "completed",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "OK" }] }],
+    },
+    "muse",
+  ) as any;
+
+  assert.equal("reasoning_content" in chat.choices[0].message, false);
+});
+
 test("responsesToChatJson maps function_call items to tool_calls", () => {
   const chat = responsesToChatJson(
     {
@@ -224,6 +281,46 @@ test("responsesToChatStream reassembles frames split across chunks", async () =>
   const chunks = chunksOf(raw);
   assert.equal(chunks[0].choices[0].delta.content, "hello");
   assert.ok(raw.endsWith("data: [DONE]\n\n"));
+});
+
+test("responsesToChatStream forwards reasoning deltas as reasoning_content", async () => {
+  const raw = await collect(
+    sse([
+      { type: "response.output_item.added", output_index: 0, item: { type: "reasoning", status: "in_progress" } },
+      { type: "response.reasoning_summary_text.delta", output_index: 0, delta: "thinking " },
+      { type: "response.reasoning_summary_text.delta", output_index: 0, delta: "hard" },
+      { type: "response.output_item.added", output_index: 1, item: { type: "message", role: "assistant" } },
+      { type: "response.output_text.delta", output_index: 1, delta: "done" },
+      { type: "response.completed", response: { status: "completed" } },
+    ]),
+  );
+
+  const chunks = chunksOf(raw);
+  const thought = chunks
+    .map((c) => c.choices[0].delta.reasoning_content ?? "")
+    .join("");
+  assert.equal(thought, "thinking hard");
+  const answers = chunks.filter((c) => typeof c.choices[0].delta.content === "string");
+  assert.equal(answers.map((c) => c.choices[0].delta.content).join(""), "done");
+  // thinking and answer stay on separate channels, never interleaved into content
+  assert.ok(chunks.every((c) => c.choices[0].delta.content === undefined || c.choices[0].delta.reasoning_content === undefined));
+});
+
+test("responsesToChatStream forwards whole reasoning on done when no deltas came", async () => {
+  const raw = await collect(
+    sse([
+      { type: "response.reasoning_summary_text.done", output_index: 0, text: "whole thought" },
+      { type: "response.output_item.added", output_index: 1, item: { type: "message", role: "assistant" } },
+      { type: "response.output_text.delta", output_index: 1, delta: "done" },
+      { type: "response.completed", response: { status: "completed" } },
+    ]),
+  );
+
+  const chunks = chunksOf(raw);
+  const thought = chunks
+    .map((c) => c.choices[0].delta.reasoning_content ?? "")
+    .join("");
+  assert.equal(thought, "whole thought");
 });
 
 test("responsesToChatStream closes the stream when the upstream cuts off early", async () => {

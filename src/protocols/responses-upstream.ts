@@ -14,6 +14,27 @@ function textOf(content: unknown): string {
     .join("");
 }
 
+// A responses `reasoning` item carries its thinking in `summary` (OpenAI
+// shape: [{ type: "summary_text", text }]) or, for some providers, in
+// `content` or a bare `text`. The chat wire has no reasoning item, so this
+// folds every variant into the `reasoning_content` string the rest of the
+// daemon (and Hermes) already understands.
+function reasoningItemText(item: any): string {
+  if (!item || typeof item !== "object") return "";
+  for (const key of ["summary", "content"] as const) {
+    const parts = (item as Record<string, unknown>)[key];
+    if (Array.isArray(parts)) {
+      const text = parts
+        .map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+        .join("");
+      if (text) return text;
+    }
+  }
+  return typeof (item as Record<string, unknown>).text === "string"
+    ? ((item as Record<string, unknown>).text as string)
+    : "";
+}
+
 // responses types output and input separately, so `role` picks the part type
 function inputParts(content: unknown, role: string): unknown[] {
   const textType = role === "assistant" ? "output_text" : "input_text";
@@ -157,11 +178,14 @@ interface ChatToolCall {
 export function responsesToChatJson(resp: any, modelId: string): unknown {
   const output = Array.isArray(resp?.output) ? resp.output : [];
   let text = "";
+  let reasoning = "";
   const toolCalls: ChatToolCall[] = [];
 
   for (const item of output) {
     if (item?.type === "message") {
       text += textOf(item.content);
+    } else if (item?.type === "reasoning") {
+      reasoning += reasoningItemText(item);
     } else if (item?.type === "function_call") {
       toolCalls.push({
         id: item.call_id ?? item.id ?? randomId("call"),
@@ -183,6 +207,7 @@ export function responsesToChatJson(resp: any, modelId: string): unknown {
   const usage = resp?.usage ?? {};
   const cached = usage.input_tokens_details?.cached_tokens ?? usage.prompt_tokens_details?.cached_tokens;
   const message: Record<string, unknown> = { role: "assistant", content: text };
+  if (reasoning) message.reasoning_content = reasoning;
   if (toolCalls.length > 0) message.tool_calls = toolCalls;
 
   return {
@@ -234,6 +259,33 @@ export function responsesToChatStream(modelId: string): Transform {
         if (typeof event.delta === "string" && event.delta.length > 0) {
           push(chunk(withRole({ content: event.delta })));
         }
+        break;
+      }
+      // Thinking arrives on its own channel; the chat wire carries it as
+      // `reasoning_content` on the delta, which downstream (Hermes, the
+      // fold logic in server.ts) already consumes. `item_id` is not stable
+      // across providers, so deltas are appended in arrival order — the
+      // same order the upstream emits them.
+      case "response.reasoning_summary_text.delta":
+      case "response.reasoning_text.delta": {
+        if (typeof event.delta === "string" && event.delta.length > 0) {
+          push(chunk(withRole({ reasoning_content: event.delta })));
+        }
+        break;
+      }
+      case "response.reasoning_summary_part.added": {
+        const text = typeof event.part?.text === "string" ? event.part.text : "";
+        if (text) push(chunk(withRole({ reasoning_content: text })));
+        break;
+      }
+      // Some providers skip the delta channel and hand over the whole
+      // thinking at once on done. Emit it: downstream appends in arrival
+      // order, and deltas (when present) arrive before this, so nothing
+      // duplicates — the done text only fills the gap when deltas never came.
+      case "response.reasoning_summary_text.done":
+      case "response.reasoning_text.done": {
+        const text = typeof event.text === "string" ? event.text : "";
+        if (text) push(chunk(withRole({ reasoning_content: text })));
         break;
       }
       case "response.output_item.added": {
