@@ -6,41 +6,6 @@ function randomId(prefix: string): string {
   return `${prefix}_${Math.random().toString(36).slice(2, 12)}`;
 }
 
-// Wire tap (see toChatResponse): appends one line per upstream event/item
-// TYPE, never bodies. Used once to learn what thinking shapes an upstream
-// actually emits; stays off in normal operation.
-function tapLine(modelId: string, what: string): void {
-  try {
-    require("node:fs").appendFileSync(
-      "/tmp/bansos-responses-tap.log",
-      `${new Date().toISOString()} ${modelId} ${what}\n`,
-    );
-  } catch {
-    // tap must never break the request
-  }
-}
-
-function tapResponsesJson(modelId: string, resp: any): void {
-  const output = Array.isArray(resp?.output) ? resp.output : [];
-  tapLine(modelId, `json output=[${output.map((i: any) => i?.type ?? "?").join(",")}]`);
-  for (const item of output) {
-    if (item?.type === "reasoning") {
-      const keys = Object.keys(item).filter((k) => k !== "type");
-      tapLine(modelId, `json reasoning keys=[${keys.join(",")}]`);
-    }
-  }
-}
-
-function tapResponsesEvent(modelId: string, event: any): void {
-  const extra =
-    event?.type === "response.output_item.added" && event?.item?.type
-      ? ` item=${event.item.type}`
-      : event?.type === "response.output_item.done" && event?.item?.type
-        ? ` item=${event.item.type}`
-        : "";
-  tapLine(modelId, `sse ${event?.type ?? "?"}${extra}`);
-}
-
 function textOf(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -106,18 +71,11 @@ export async function toChatResponse(
 ): Promise<Response> {
   if (!upstreamRes.body) return upstreamRes;
 
-  // One-shot wire tap: BANSOS_TAP_RESPONSES=1 dumps the raw upstream event
-  // types (not bodies) to /tmp/bansos-responses-tap.log for diagnosing
-  // dropped thinking. Default off; zero overhead when unset.
-  const tap = process.env.BANSOS_TAP_RESPONSES === "1";
-
   if (!streaming) {
     // read once: a consumed body cannot be handed back via a fallback
     const text = await upstreamRes.text();
     try {
-      const parsed = JSON.parse(text);
-      if (tap) tapResponsesJson(modelId, parsed);
-      return new Response(JSON.stringify(responsesToChatJson(parsed, modelId)), {
+      return new Response(JSON.stringify(responsesToChatJson(JSON.parse(text), modelId)), {
         status: upstreamRes.status,
         headers: { "content-type": "application/json" },
       });
@@ -133,7 +91,7 @@ export async function toChatResponse(
   }
 
   const src = Readable.fromWeb(upstreamRes.body as import("node:stream/web").ReadableStream);
-  const out = responsesToChatStream(modelId, tap ? (e) => tapResponsesEvent(modelId, e) : undefined);
+  const out = responsesToChatStream(modelId);
   // pipeline() wires errors and destroy both ways; pipe() would crash on an upstream reset
   pipeline(src, out, () => {
     // the error already reached the consumer through `out`
@@ -268,7 +226,7 @@ export function responsesToChatJson(resp: any, modelId: string): unknown {
 }
 
 // stateful: chat needs a tool-call ordinal and first-delta role marker; buffer until "\n\n"
-export function responsesToChatStream(modelId: string, onEvent?: (event: any) => void): Transform {
+export function responsesToChatStream(modelId: string): Transform {
   const id = randomId("chatcmpl");
   const created = Math.floor(Date.now() / 1000);
   const splitter = createSseFrameSplitter();
@@ -410,13 +368,7 @@ export function responsesToChatStream(modelId: string, onEvent?: (event: any) =>
           const payload = line.slice(5).trim();
           if (!payload || payload === "[DONE]") continue;
           try {
-            const event = JSON.parse(payload);
-            try {
-              onEvent?.(event);
-            } catch {
-              // tap must never break the stream
-            }
-            handle(event, (s) => this.push(s));
+            handle(JSON.parse(payload), (s) => this.push(s));
           } catch {
             // a malformed frame is not worth killing the stream over
           }
