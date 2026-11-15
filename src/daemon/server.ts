@@ -252,6 +252,34 @@ const API_EXACT_PATHS = new Set([
   "/v1/models/",
 ]);
 
+export function detectHarness(req: http.IncomingMessage, kind: ActivityKind): string {
+  const ua = (req.headers["user-agent"] || "").toLowerCase();
+
+  if (ua.includes("oh-my-pi") || ua.includes("omp/") || ua.includes("omp ") || ua === "omp") {
+    return "omp";
+  }
+  if (ua.startsWith("pi/") || ua.includes("pi/") || ua.includes("pi-coding-agent") || ua.includes("pi-bansos")) {
+    return "pi";
+  }
+  if (ua.includes("claude-code") || ua.includes("claude_code") || ua.includes("claude-cli") || ua.includes("anthropic")) {
+    return "claude-code";
+  }
+  if (ua.includes("opencode")) return "opencode";
+  if (ua.includes("aider")) return "aider";
+  if (ua.includes("codex")) return "codex";
+  if (ua.includes("goose")) return "goose";
+  if (ua.includes("cline")) return "cline";
+  if (ua.includes("roo")) return "roo";
+  if (ua.includes("continue")) return "continue";
+  if (ua.includes("hermes")) return "hermes";
+  if (ua.includes("jcode")) return "jcode";
+  if (ua.includes("openclaw")) return "openclaw";
+  if (ua.includes("curl")) return "curl";
+  if (kind === "anthropic") return "claude-code";
+  if (kind === "responses") return "codex";
+  return "pi";
+}
+
 function isAllowedInboundPath(pathname: string): boolean {
   if (STATIC_ROOT_FILES.has(pathname) || API_EXACT_PATHS.has(pathname)) {
     return true;
@@ -2749,6 +2777,7 @@ async function handleChat(
   security: SecurityConfig,
   signal: AbortSignal,
 ): Promise<void> {
+  const client = detectHarness(req, "chat");
   let bodyText: string;
   try {
     bodyText = await readBody(req);
@@ -2951,6 +2980,7 @@ async function handleResponses(
   security: SecurityConfig,
   signal: AbortSignal,
 ): Promise<void> {
+  const client = detectHarness(req, "responses");
   let bodyText: string;
   try {
     bodyText = await readBody(req);
@@ -3157,6 +3187,7 @@ async function handleAnthropic(
   security: SecurityConfig,
   signal: AbortSignal,
 ): Promise<void> {
+  const client = detectHarness(req, "anthropic");
   let bodyText: string;
   try {
     bodyText = await readBody(req);
