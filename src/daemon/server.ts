@@ -130,10 +130,29 @@ export interface ServerOptions {
   startedAt: number;
   security?: SecurityConfig;
   activity?: ActivityStore;
+  bodyCapBytes?: number;
   admin?: Partial<Omit<AdminOptions, "security" | "catalog" | "port">>;
 }
 
 const ALLOWED_METHODS = new Set(["GET", "POST", "OPTIONS"]);
+
+export const DEFAULT_BODY_CAP_BYTES = 10 * 1024 * 1024;
+let bodyCapBytes = DEFAULT_BODY_CAP_BYTES;
+
+// a fallback model may cap output lower than the caller asked for
+export function clampMaxTokens(
+  body: Record<string, unknown>,
+  model: { maxTokens: number },
+): Record<string, unknown> {
+  if (!Number.isFinite(model.maxTokens) || model.maxTokens <= 0) return body;
+  if (typeof body.max_completion_tokens === "number" && body.max_completion_tokens > model.maxTokens) {
+    body.max_completion_tokens = model.maxTokens;
+  }
+  if (typeof body.max_tokens === "number" && body.max_tokens > model.maxTokens) {
+    body.max_tokens = model.maxTokens;
+  }
+  return body;
+}
 
 export { pickSmartDefaultModel };
 
@@ -567,7 +586,7 @@ function sendJson(
 
 async function readBody(
   req: http.IncomingMessage,
-  cap = 10 * 1024 * 1024,
+  cap = bodyCapBytes,
 ): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -595,8 +614,9 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 export function extractUsage(json: unknown): TokenUsage | null {
   const usage = asRecord(asRecord(json)?.usage);
   if (!usage) return null;
-  const prompt = usage.prompt_tokens;
-  const completion = usage.completion_tokens;
+  // chat wire reports prompt/completion, the responses wire reports input/output
+  const prompt = usage.prompt_tokens ?? usage.input_tokens;
+  const completion = usage.completion_tokens ?? usage.output_tokens;
   if (typeof prompt !== "number" || typeof completion !== "number") return null;
   // openai chat reports prompt_tokens_details, the responses wire reports input_tokens_details
   const cached =
@@ -608,6 +628,80 @@ export function extractUsage(json: unknown): TokenUsage | null {
     outputTokens: completion,
     ...(typeof cached === "number" ? { cachedTokens: cached } : {}),
   };
+}
+
+// books the request even when the reply carried no usage object
+function recordCompletion(
+  store: ActivityStore,
+  log: Logger,
+  kind: ActivityKind,
+  doneMsg: string,
+  done: {
+    model: string;
+    requestedModel: string;
+    upstream: string;
+    usage: TokenUsage | null;
+    startedAt: number;
+    client?: string;
+    relay?: string;
+  },
+): void {
+  const { model, requestedModel, upstream, usage, startedAt, client, relay } = done;
+  const durationMs = Date.now() - startedAt;
+  const failoverFrom = model !== requestedModel ? requestedModel : undefined;
+  log.info(doneMsg, {
+    model,
+    upstream,
+    durationMs,
+    inputTokens: usage?.inputTokens ?? 0,
+    outputTokens: usage?.outputTokens ?? 0,
+    ...(usage?.cachedTokens === undefined ? {} : { cachedTokens: usage.cachedTokens }),
+    ...(failoverFrom ? { failoverFrom } : {}),
+  });
+  store.record({
+    kind,
+    model,
+    requestedModel,
+    upstream,
+    ...(relay ? { relay } : {}),
+    inputTokens: usage?.inputTokens ?? 0,
+    outputTokens: usage?.outputTokens ?? 0,
+    cachedTokens: usage?.cachedTokens ?? 0,
+    durationMs,
+    status: "ok",
+    ...(failoverFrom ? { failoverFrom } : {}),
+    ...(client ? { client } : {}),
+  });
+}
+
+// some upstreams stream `"usage": null` before the real totals
+function findUsageObject(tail: string): Record<string, unknown> | null {
+  let from = 0;
+  while (true) {
+    const at = tail.indexOf('"usage"', from);
+    if (at < 0) return null;
+    from = at + 7;
+    const brace = tail.indexOf("{", at);
+    if (brace < 0) return null;
+    let depth = 0;
+    for (let i = brace; i < tail.length; i++) {
+      const ch = tail[i];
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const candidate = JSON.parse(tail.slice(brace, i + 1)) as Record<string, unknown>;
+            const prompt = candidate.prompt_tokens ?? candidate.input_tokens;
+            if (typeof prompt === "number") return candidate;
+          } catch {
+            // not a usage object yet
+          }
+          break;
+        }
+      }
+    }
+  }
 }
 
 // fold reasoning into content when a model streams reasoning_content but no content (C5)
@@ -852,6 +946,7 @@ export function logUsageTransform(
   kind: ActivityKind = "chat",
   relay = "",
   client?: string,
+  booked?: { recorded: boolean },
 ): Transform {
   const splitter = createSseFrameSplitter();
   const state: ChatFoldState = { sawContent: false, sawToolCalls: false, reasoning: "", envelope: {} };
@@ -863,6 +958,7 @@ export function logUsageTransform(
   const reportUsage = () => {
     if (reported || !usage) return;
     reported = true;
+    if (booked) booked.recorded = true;
     log.info("chat done", { model, upstream, durationMs: Date.now() - startedAt, ...usage });
     activity?.record({
       kind,
@@ -2313,9 +2409,10 @@ async function runChatForward(
     // A labeled catalog entry carries the bare upstream id separately; sending
     // the label itself would be an unknown model upstream.
     const wireId = current.upstreamId ?? current.id;
+    const attemptBody = clampMaxTokens({ ...sanitizedBody, model: wireId }, current);
     const transformedBody = currentUpstream.transformRequestBody
-      ? currentUpstream.transformRequestBody({ ...sanitizedBody, model: wireId }, current)
-      : { ...sanitizedBody, model: wireId };
+      ? currentUpstream.transformRequestBody(attemptBody, current)
+      : attemptBody;
     let outboundBody = JSON.stringify(
       responsesWire
         ? chatToResponsesBody(transformedBody, wireId)
@@ -2728,6 +2825,7 @@ async function handleChat(
     // non-stream: buffer once to read usage, then forward the exact bytes
     const text = await upstreamRes.text();
     let outText = text;
+    let usage: TokenUsage | null = null;
     try {
       const json = JSON.parse(text);
       const msg = json?.choices?.[0]?.message;
@@ -2739,33 +2837,19 @@ async function handleChat(
           outText = JSON.stringify(json);
         }
       }
-      const usage = extractUsage(json);
-      if (usage) {
-        const fields: Record<string, unknown> = {
-          model: current.id,
-          upstream: currentUpstream.id,
-          durationMs: Date.now() - requestStartedAt,
-          ...usage,
-        };
-        if (current.id !== model.id) fields.failoverFrom = model.id;
-        log.info("chat done", fields);
-        activity.record({
-          kind: "chat",
-          model: current.id,
-          requestedModel: model.id,
-          upstream: currentUpstream.id,
-          relay: result.relay,
-          inputTokens: usage.inputTokens,
-          outputTokens: usage.outputTokens,
-          cachedTokens: usage.cachedTokens ?? 0,
-          durationMs: Date.now() - requestStartedAt,
-          status: "ok",
-          ...(current.id !== model.id ? { failoverFrom: model.id } : {}),
-        });
-      }
+      usage = extractUsage(json);
     } catch {
-      // usage is informational only; the plain response still goes out
+      // a non-JSON reply still goes out; it just carries no token counts
     }
+    recordCompletion(activity, log, "chat", "chat done", {
+      model: current.id,
+      requestedModel: model.id,
+      upstream: currentUpstream.id,
+      relay: result.relay,
+      usage,
+      startedAt: requestStartedAt,
+      client,
+    });
     res.end(outText);
     return;
   }
@@ -2774,13 +2858,16 @@ async function handleChat(
     const src = Readable.fromWeb(
       upstreamRes.body as import("node:stream/web").ReadableStream,
     );
-    const usageTx = logUsageTransform(current.id, currentUpstream.id, log, requestStartedAt, model.id, activity, "chat", result.relay);
+    const booked = { recorded: false };
+    const usageTx = logUsageTransform(current.id, currentUpstream.id, log, requestStartedAt, model.id, activity, "chat", result.relay, client, booked);
     const filterTx = filterInjectedToolCallsTransform(callerTools);
     let closing = false;
+    let streamFailed = false;
     // a mid-stream upstream failure ends the client response, not the daemon; client abort releases the upstream
     const failStream = () => {
       if (closing) return;
       closing = true;
+      streamFailed = true;
       if (signal.aborted) {
         try {
           res.destroy();
@@ -2820,6 +2907,35 @@ async function handleChat(
     // this filter drops them. Folding first meant `sawToolCalls` latched on those phantom
     // calls (the fold declined) and the filter then removed them, so a reasoning-only answer
     // reached the client as an empty `content` with finish_reason=stop.
+    res.on("close", () => {
+      // a stream that ended without a usage frame (or died) still counts as one request
+      if (booked.recorded || signal.aborted) return;
+      if (streamFailed) {
+        activity.record({
+          kind: "chat",
+          model: current.id,
+          requestedModel: model.id,
+          upstream: currentUpstream.id,
+          relay: result.relay,
+          inputTokens: 0,
+          outputTokens: 0,
+          durationMs: Date.now() - requestStartedAt,
+          status: "error",
+          statusCode: 502,
+          ...(client ? { client } : {}),
+        });
+        return;
+      }
+      recordCompletion(activity, log, "chat", "chat done", {
+        model: current.id,
+        requestedModel: model.id,
+        upstream: currentUpstream.id,
+        relay: result.relay,
+        usage: null,
+        startedAt: requestStartedAt,
+        client,
+      });
+    });
     src.pipe(filterTx).pipe(reasoningToContentTransform()).pipe(usageTx).pipe(res);
   } else {
     res.end();
@@ -2953,29 +3069,15 @@ async function handleResponses(
       return;
     }
     const usage = extractUsage(json);
-    if (usage) {
-      const fields: Record<string, unknown> = {
-        model: current.id,
-        upstream: currentUpstream.id,
-        durationMs: Date.now() - requestStartedAt,
-        ...usage,
-      };
-      if (current.id !== resolved.id) fields.failoverFrom = resolved.id;
-      log.info("responses done", fields);
-      activity.record({
-        kind: "responses",
-        model: current.id,
-        requestedModel: resolved.id,
-        upstream: currentUpstream.id,
-        relay: result.relay,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cachedTokens: usage.cachedTokens ?? 0,
-        durationMs: Date.now() - requestStartedAt,
-        status: "ok",
-        ...(current.id !== resolved.id ? { failoverFrom: resolved.id } : {}),
-      });
-    }
+    recordCompletion(activity, log, "responses", "responses done", {
+      model: current.id,
+      requestedModel: resolved.id,
+      upstream: currentUpstream.id,
+      relay: result.relay,
+      usage,
+      startedAt: requestStartedAt,
+      client,
+    });
     const out = renderResponse(json, current.id);
     res.writeHead(upstreamRes.status, { "content-type": "application/json", ...corsFor(res) });
     res.end(JSON.stringify(out));
@@ -3027,21 +3129,14 @@ async function handleResponses(
     }
   }
   if (!failed) for (const ev of encoder.close()) res.write(ev);
-  if (streamUsage) {
-    const fields: Record<string, unknown> = {
-      model: current.id,
-      upstream: currentUpstream.id,
-      durationMs: Date.now() - requestStartedAt,
-      ...streamUsage,
-    };
-    if (current.id !== resolved.id) fields.failoverFrom = resolved.id;
-    log.info("responses done", fields);
+  if (failed) {
     activity.record({
       kind: "responses",
       model: current.id,
       requestedModel: resolved.id,
       upstream: currentUpstream.id,
       relay: result.relay,
+      ...(client ? { client } : {}),
       inputTokens: streamUsage.inputTokens,
       outputTokens: streamUsage.outputTokens,
       cachedTokens: streamUsage.cachedTokens ?? 0,
@@ -3099,10 +3194,6 @@ async function handleAnthropic(
   const requestStartedAt = Date.now();
   const chatBody = parsed.value.chatBody as Record<string, unknown>;
   chatBody.model = model.id;
-  // cap max_tokens to the model's limit so a stale client value never reaches the upstream
-  if (typeof chatBody.max_tokens === "number" && chatBody.max_tokens > model.maxTokens) {
-    chatBody.max_tokens = model.maxTokens;
-  }
 
   const callerTools = callerToolsFromBody(chatBody);
   const result = await runChatForward(
@@ -3148,30 +3239,15 @@ async function handleAnthropic(
       return;
     }
     const message = openAiCompletionToAnthropicMessage(json, current.id);
-    const usage = extractUsage(json);
-    if (usage) {
-      const fields: Record<string, unknown> = {
-        model: current.id,
-        upstream: currentUpstream.id,
-        durationMs: Date.now() - requestStartedAt,
-        ...usage,
-      };
-      if (current.id !== model.id) fields.failoverFrom = model.id;
-      log.info("anthropic done", fields);
-      activity.record({
-        kind: "anthropic",
-        model: current.id,
-        requestedModel: model.id,
-        upstream: currentUpstream.id,
-        relay: result.relay,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cachedTokens: usage.cachedTokens ?? 0,
-        durationMs: Date.now() - requestStartedAt,
-        status: "ok",
-        ...(current.id !== model.id ? { failoverFrom: model.id } : {}),
-      });
-    }
+    recordCompletion(activity, log, "anthropic", "anthropic done", {
+      model: current.id,
+      requestedModel: model.id,
+      upstream: currentUpstream.id,
+      relay: result.relay,
+      usage: extractUsage(json),
+      startedAt: requestStartedAt,
+      client,
+    });
     sendJson(res, upstreamRes.status === 200 ? 200 : upstreamRes.status, message);
     return;
   }
@@ -3185,6 +3261,7 @@ async function handleAnthropic(
   const encoder = new AnthropicStreamEncoder(callerTools);
   let streamUsage: TokenUsage | null = null;
   let streamClosed = false;
+  let failed = false;
   try {
     if (upstreamRes.body) {
       for await (const frame of readSseStream(
@@ -3201,6 +3278,7 @@ async function handleAnthropic(
         const streamError = sseErrorMessage(json);
         if (streamError) {
           streamClosed = true;
+          failed = true;
           log.warn("upstream stream error", { model: current.id, upstream: currentUpstream.id, upstreamError: streamError });
           for (const ev of encoder.fail(streamError)) res.write(ev);
           break;
@@ -3223,21 +3301,14 @@ async function handleAnthropic(
   if (!streamClosed) {
     for (const ev of encoder.close()) res.write(ev);
   }
-  if (streamUsage) {
-    const fields: Record<string, unknown> = {
-      model: current.id,
-      upstream: currentUpstream.id,
-      durationMs: Date.now() - requestStartedAt,
-      ...streamUsage,
-    };
-    if (current.id !== model.id) fields.failoverFrom = model.id;
-    log.info("anthropic done", fields);
+  if (failed) {
     activity.record({
       kind: "anthropic",
       model: current.id,
       requestedModel: model.id,
       upstream: currentUpstream.id,
       relay: result.relay,
+      ...(client ? { client } : {}),
       inputTokens: streamUsage.inputTokens,
       outputTokens: streamUsage.outputTokens,
       cachedTokens: streamUsage.cachedTokens ?? 0,
@@ -3277,6 +3348,7 @@ export function createServer(opts: ServerOptions): http.Server {
   const { catalog, rateLimiter, port, log, startedAt } = opts;
   const security = opts.security ?? DEFAULT_SECURITY_CONFIG;
   activity = opts.activity ?? new ActivityStore();
+  bodyCapBytes = opts.bodyCapBytes && opts.bodyCapBytes > 0 ? opts.bodyCapBytes : DEFAULT_BODY_CAP_BYTES;
   // The zen stage gate accepts at most STAGE_TOOL_BUDGET tools, so a caller with
   // a wider surface (this CLI profile resolves 37) silently loses the tail. The
   // request still succeeds, which is exactly why it must be visible: an agentic
@@ -3295,6 +3367,7 @@ export function createServer(opts: ServerOptions): http.Server {
     bind: "127.0.0.1",
     refreshIntervalMs: 0,
     ...opts.admin,
+    bodyCapBytes,
     activity,
     security,
     catalog,

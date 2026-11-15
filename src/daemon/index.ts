@@ -305,6 +305,7 @@ function startServer(
     startedAt,
     security: config.security,
     activity,
+    bodyCapBytes: config.maxBodyBytes,
     admin: { requestedPort, bind, refreshIntervalMs: config.refreshIntervalMs, flags, restart },
   });
 
@@ -507,6 +508,7 @@ async function main(argv: string[]): Promise<void> {
 
   const shutdown = () => {
     log.info("shutting down");
+    activity.flush();
     if (!current) process.exit(0);
     shutdownServer(current.server, SHUTDOWN_GRACE_MS, () => {
       try {

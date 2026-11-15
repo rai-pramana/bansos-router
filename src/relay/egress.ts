@@ -21,6 +21,7 @@ export const ALLOWED_TARGETS = [
   "https://dev.opencode.ai",
   "https://api.kilo.ai",
   "https://api.llm7.io",
+  "https://api.beatapi.io",
 ];
 
 export interface KnownRelay {

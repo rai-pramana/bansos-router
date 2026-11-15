@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { BANSOS_DIR, ensureBansosDir } from "./state";
+import { BANSOS_DIR, ensureBansosDir, writeJsonAtomic } from "./state";
 
 export type ActivityKind = "chat" | "responses" | "anthropic";
 export type ActivityStatus = "ok" | "error";
@@ -14,7 +14,7 @@ export interface ActivityEvent {
   upstream: string;
   // Egress relay that served the request ("" when direct). Without it the
   // watchdog sees "upstream=zen failed" and cannot tell a gated relay from a
-  // gated upstream, so it cannot decide whether switching egress would help.
+  // gated upstream.
   relay?: string;
   inputTokens: number;
   outputTokens: number;
@@ -73,374 +73,363 @@ export interface ActivityInput {
   client?: string;
 }
 
-// Append-only JSONL, one event per line. The old single-JSON-array file forced a
-// full rewrite of every retained event on each chat: measured 1071 KiB written
-// per chat against a 1067 KiB file (~3.7 GiB/day at 3618 events/day). One line
-// is ~200 bytes, so the same traffic writes ~0.7 MiB/day instead.
-export const ACTIVITY_FILE = path.join(BANSOS_DIR, "activity.jsonl");
-// Pre-JSONL layout, converted on first boot and then left as *.migrated.
-export const LEGACY_ACTIVITY_FILE = path.join(BANSOS_DIR, "activity.json");
+// events stay in append-only month files; usage is per-month day rollups
+export const ACTIVITY_DIR = path.join(BANSOS_DIR, "activity");
+const LEGACY_ACTIVITY_FILE = path.join(BANSOS_DIR, "activity.json");
+const RECENT_CAP = 2000;
+const READ_CHUNK = 64 * 1024;
+const ROLLUP_SAVE_MS = 5000;
 
-const MAX_RETENTION_MS = 60 * 24 * 60 * 60 * 1000; // 60 days
-// Compaction trigger. At ~200 B/event this file reaches 64 MiB after ~330k
-// events (~90 days at this machine's rate), so compaction is a rare
-// boot/outlier cost rather than a per-request one.
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
-// Detail retained for the activity feed. Aggregates do NOT depend on this: they
-// come from hourly buckets covering the full retention. Only the feed is capped,
-// and getEvents always returns the newest `limit` rows, which are by definition
-// inside the newest `cap`.
-const DEFAULT_EVENT_CAP = 5000;
-
-// Per-hour aggregate. Wide windows (7d/30d/60d/all) are summed from these rather
-// than scanning events: measured 45.9 ms for a 217k-event scan at full 60-day
-// retention (and 618 ms to parse 50 MiB of JSONL for it), versus O(1) per write.
-interface Bucket {
+interface DayBucket {
   requests: number;
   ok: number;
-  errors: number;
+  error: number;
+  failover: number;
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
   durationMs: number;
-  failovers: number;
   perModel: Record<string, ModelActivity>;
   perUpstream: Record<string, { requests: number; ok: number }>;
 }
 
-function emptyBucket(): Bucket {
+interface MonthRollup {
+  version: 1;
+  days: Record<string, DayBucket>;
+}
+
+function pad(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function monthKeyOf(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+}
+
+function dayKeyOf(ts: number): string {
+  const d = new Date(ts);
+  return `${monthKeyOf(ts)}-${pad(d.getDate())}`;
+}
+
+function dayStartOf(ts: number): number {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function eventsFileOf(month: string): string {
+  return path.join(ACTIVITY_DIR, `events-${month}.jsonl`);
+}
+
+function rollupFileOf(month: string): string {
+  return path.join(ACTIVITY_DIR, `usage-${month}.json`);
+}
+
+function emptyBucket(): DayBucket {
   return {
     requests: 0,
     ok: 0,
-    errors: 0,
+    error: 0,
+    failover: 0,
     inputTokens: 0,
     outputTokens: 0,
     cachedTokens: 0,
     durationMs: 0,
-    failovers: 0,
     perModel: {},
     perUpstream: {},
   };
 }
 
-// Local-hour key, so "today" (which starts at local midnight) lands exactly on a
-// bucket boundary. Rolling windows are hour-granular at their trailing edge —
-// they can include up to one hour of extra events, which is immaterial for
-// totals and is the price of not rescanning events.
-function hourKey(ts: number): number {
-  const d = new Date(ts);
-  d.setMinutes(0, 0, 0);
-  return d.getTime();
+function listFiles(prefix: string, suffix: string): string[] {
+  try {
+    return fs
+      .readdirSync(ACTIVITY_DIR)
+      .filter((name) => name.startsWith(prefix) && name.endsWith(suffix))
+      .sort()
+      .map((name) => path.join(ACTIVITY_DIR, name));
+  } catch {
+    return [];
+  }
+}
+
+function parseEventLine(line: string): ActivityEvent | null {
+  if (!line) return null;
+  try {
+    const e = JSON.parse(line) as ActivityEvent;
+    if (!e || typeof e !== "object" || typeof e.timestamp !== "number") return null;
+    if (typeof e.model !== "string" || typeof e.upstream !== "string") return null;
+    if (e.status !== "ok" && e.status !== "error") return null;
+    return e;
+  } catch {
+    return null;
+  }
+}
+
+// newest-first, so an old query never reads a whole month file
+function* reverseLines(file: string, chunkSize = READ_CHUNK): Generator<string> {
+  let fd: number;
+  try {
+    fd = fs.openSync(file, "r");
+  } catch {
+    return;
+  }
+  try {
+    const size = fs.fstatSync(fd).size;
+    let pos = size;
+    let carry = "";
+    const buf = Buffer.allocUnsafe(chunkSize);
+    while (pos > 0) {
+      const read = Math.min(chunkSize, pos);
+      pos -= read;
+      const bytes = fs.readSync(fd, buf, 0, read, pos);
+      const text = carry + buf.toString("utf8", 0, bytes);
+      const lines = text.split("\n");
+      carry = lines.shift() ?? "";
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i]) yield lines[i]!;
+      }
+    }
+    if (carry) yield carry;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readMonthEvents(file: string): ActivityEvent[] {
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  const out: ActivityEvent[] = [];
+  for (const line of text.split("\n")) {
+    const event = parseEventLine(line);
+    if (event) out.push(event);
+  }
+  return out;
+}
+
+function windowStart(window: TimeWindow, now = Date.now()): number {
+  if (window === "all") return 0;
+  if (window === "today") return dayStartOf(now);
+  const days = window === "7d" ? 7 : window === "30d" ? 30 : 60;
+  return dayStartOf(now - (days - 1) * 24 * 60 * 60 * 1000);
 }
 
 export class ActivityStore {
-  private events: ActivityEvent[] = [];
+  private recent: ActivityEvent[] = [];
+  private days = new Map<string, DayBucket>();
+  private dirtyMonths = new Set<string>();
   private inFlight = new Map<number, InFlightRequest>();
   private nextId = 1;
   private nextInFlightId = 1;
-  private readonly cap: number;
-  private buckets = new Map<number, Bucket>();
-  private fd: number | null = null;
-  private bytes = 0;
-  private _reloadTimer: NodeJS.Timeout | null = null;
-  private _freshAt = 0;
+  private rollupTimer: NodeJS.Timeout | null = null;
+  private appendChain: Promise<void> = Promise.resolve();
 
-  constructor(cap = DEFAULT_EVENT_CAP) {
-    this.cap = cap;
-    this.loadFromDisk();
+  constructor() {
+    ensureBansosDir();
+    this.loadRollups();
+    this.migrateLegacyFile();
+    this.loadRecent();
   }
 
-  // ---------- boot ----------
+  private loadRollups(): void {
+    for (const file of listFiles("usage-", ".json")) {
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as MonthRollup;
+        if (!parsed || typeof parsed !== "object" || typeof parsed.days !== "object") continue;
+        for (const [day, bucket] of Object.entries(parsed.days)) {
+          if (bucket && typeof bucket === "object") this.days.set(day, this.normalizeBucket(bucket));
+        }
+      } catch {
+        // a corrupt rollup only costs the fast path, never the events
+      }
+    }
+  }
 
-  /** Convert the legacy single-object file to JSONL, once. */
-  private migrateLegacy(): void {
+  private normalizeBucket(raw: Partial<DayBucket>): DayBucket {
+    const bucket = emptyBucket();
+    for (const key of ["requests", "ok", "error", "failover", "inputTokens", "outputTokens", "cachedTokens", "durationMs"] as const) {
+      const value = raw[key];
+      if (typeof value === "number" && Number.isFinite(value)) bucket[key] = value;
+    }
+    if (raw.perModel && typeof raw.perModel === "object") {
+      for (const [model, stats] of Object.entries(raw.perModel)) {
+        if (!stats || typeof stats !== "object") continue;
+        bucket.perModel[model] = {
+          requests: Number(stats.requests) || 0,
+          ok: Number(stats.ok) || 0,
+          inputTokens: Number(stats.inputTokens) || 0,
+          outputTokens: Number(stats.outputTokens) || 0,
+          cachedTokens: Number(stats.cachedTokens) || 0,
+        };
+      }
+    }
+    if (raw.perUpstream && typeof raw.perUpstream === "object") {
+      for (const [upstream, stats] of Object.entries(raw.perUpstream)) {
+        if (!stats || typeof stats !== "object") continue;
+        bucket.perUpstream[upstream] = { requests: Number(stats.requests) || 0, ok: Number(stats.ok) || 0 };
+      }
+    }
+    return bucket;
+  }
+
+  private migrateLegacyFile(): void {
     if (!fs.existsSync(LEGACY_ACTIVITY_FILE)) return;
     try {
-      const data = JSON.parse(fs.readFileSync(LEGACY_ACTIVITY_FILE, "utf8")) as {
-        events?: ActivityEvent[];
-      };
-      const list = Array.isArray(data?.events) ? data.events : [];
-      const now = Date.now();
-      const lines = list
-        .filter((e) => typeof e?.timestamp === "number" && now - e.timestamp <= MAX_RETENTION_MS)
-        .map((e) => `${JSON.stringify(e)}\n`)
-        .join("");
-      if (lines) fs.appendFileSync(ACTIVITY_FILE, lines);
+      const raw = JSON.parse(fs.readFileSync(LEGACY_ACTIVITY_FILE, "utf8")) as { events?: unknown };
+      if (Array.isArray(raw?.events)) this.importEvents(raw.events as ActivityEvent[], false);
       fs.renameSync(LEGACY_ACTIVITY_FILE, `${LEGACY_ACTIVITY_FILE}.migrated`);
     } catch {
-      // a corrupt legacy file must not block the daemon; leave it untouched
+      // a corrupt old file is left in place for a manual look
     }
   }
 
-  private loadFromDisk(): void {
-    this.migrateLegacy();
-    this.events = [];
-    this.buckets.clear();
-    this.nextId = 1;
-    this.bytes = 0;
-    let raw: string;
-    try {
-      raw = fs.readFileSync(ACTIVITY_FILE, "utf8");
-    } catch {
-      return;
-    }
-    this.bytes = Buffer.byteLength(raw);
-    const now = Date.now();
-    const kept: ActivityEvent[] = [];
-    for (const line of raw.split("\n")) {
-      if (!line) continue;
-      let e: ActivityEvent;
+  private loadRecent(): void {
+    const tail = this.readFromDisk(RECENT_CAP, 0, Number.POSITIVE_INFINITY).reverse();
+    this.recent = tail;
+    if (tail.length > 0) this.nextId = Math.max(this.nextId, tail[tail.length - 1]!.id + 1);
+  }
+
+  private append(event: ActivityEvent): void {
+    const line = `${JSON.stringify(event)}\n`;
+    const file = eventsFileOf(monthKeyOf(event.timestamp));
+    this.appendChain = this.appendChain
+      .then(() => fs.promises.mkdir(ACTIVITY_DIR, { recursive: true }))
+      .then(() => fs.promises.appendFile(file, line, { mode: 0o600 }))
+      .catch(() => {
+        // the rollup already has the event; a failed append only loses history detail
+      });
+  }
+
+  private addToRollup(event: ActivityEvent): void {
+    const day = dayKeyOf(event.timestamp);
+    const bucket = this.days.get(day) ?? emptyBucket();
+    bucket.requests++;
+    if (event.status === "ok") bucket.ok++;
+    else bucket.error++;
+    if (event.failoverFrom) bucket.failover++;
+    const input = event.inputTokens || 0;
+    const output = event.outputTokens || 0;
+    const cached = event.cachedTokens || 0;
+    bucket.inputTokens += input;
+    bucket.outputTokens += output;
+    bucket.cachedTokens += cached;
+    bucket.durationMs += event.durationMs || 0;
+
+    const model = bucket.perModel[event.model] ?? {
+      requests: 0,
+      ok: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedTokens: 0,
+    };
+    model.requests++;
+    if (event.status === "ok") model.ok++;
+    model.inputTokens += input;
+    model.outputTokens += output;
+    model.cachedTokens += cached;
+    bucket.perModel[event.model] = model;
+
+    const upstream = bucket.perUpstream[event.upstream] ?? { requests: 0, ok: 0 };
+    upstream.requests++;
+    if (event.status === "ok") upstream.ok++;
+    bucket.perUpstream[event.upstream] = upstream;
+
+    this.days.set(day, bucket);
+    this.dirtyMonths.add(monthKeyOf(event.timestamp));
+  }
+
+  private scheduleRollupSave(): void {
+    if (this.rollupTimer) return;
+    this.rollupTimer = setTimeout(() => {
+      this.rollupTimer = null;
+      this.saveRollups();
+    }, ROLLUP_SAVE_MS);
+    this.rollupTimer.unref?.();
+  }
+
+  private saveRollups(): void {
+    if (this.dirtyMonths.size === 0) return;
+    const months = [...this.dirtyMonths];
+    this.dirtyMonths.clear();
+    for (const month of months) {
+      const days: Record<string, DayBucket> = {};
+      for (const [day, bucket] of this.days) {
+        if (day.startsWith(month)) days[day] = bucket;
+      }
       try {
-        e = JSON.parse(line) as ActivityEvent;
+        writeJsonAtomic(rollupFileOf(month), { version: 1, days } satisfies MonthRollup);
       } catch {
-        continue; // torn trailing line from a crash mid-append
-      }
-      if (typeof e?.timestamp !== "number") continue;
-      if (now - e.timestamp > MAX_RETENTION_MS) continue;
-      kept.push(e);
-      if (e.id >= this.nextId) this.nextId = e.id + 1;
-      this.addToBucket(e);
-    }
-    // Buckets cover the whole retention; the event array only feeds the feed.
-    this.events = kept.length > this.cap ? kept.slice(-this.cap) : kept;
-  }
-
-  // ---------- write ----------
-
-  private addToBucket(e: ActivityEvent): void {
-    const key = hourKey(e.timestamp);
-    let b = this.buckets.get(key);
-    if (!b) {
-      b = emptyBucket();
-      this.buckets.set(key, b);
-    }
-    b.requests++;
-    if (e.status === "ok") b.ok++;
-    else b.errors++;
-    b.inputTokens += e.inputTokens ?? 0;
-    b.outputTokens += e.outputTokens ?? 0;
-    b.cachedTokens += e.cachedTokens ?? 0;
-    b.durationMs += e.durationMs ?? 0;
-    if (e.failoverFrom) b.failovers++;
-
-    const m =
-      b.perModel[e.model] ??
-      (b.perModel[e.model] = { requests: 0, ok: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 });
-    m.requests++;
-    if (e.status === "ok") m.ok++;
-    m.inputTokens += e.inputTokens ?? 0;
-    m.outputTokens += e.outputTokens ?? 0;
-    m.cachedTokens += e.cachedTokens ?? 0;
-
-    const u = b.perUpstream[e.upstream] ?? (b.perUpstream[e.upstream] = { requests: 0, ok: 0 });
-    u.requests++;
-    if (e.status === "ok") u.ok++;
-  }
-
-  private appendLine(e: ActivityEvent): void {
-    const line = `${JSON.stringify(e)}\n`;
-    try {
-      ensureBansosDir();
-      if (this.fd === null) this.fd = fs.openSync(ACTIVITY_FILE, "a");
-      fs.writeSync(this.fd, line);
-      this.bytes += Buffer.byteLength(line);
-    } catch {
-      // a failed append must never break a request; drop the fd so the next
-      // event retries the open
-      this.closeFd();
-    }
-  }
-
-  private closeFd(): void {
-    if (this.fd === null) return;
-    try {
-      fs.closeSync(this.fd);
-    } catch {
-      // already closed
-    }
-    this.fd = null;
-  }
-
-  /** Rewrite the file with only retained events. Rare: boot, or file oversized. */
-  private compact(): void {
-    const now = Date.now();
-    const kept: ActivityEvent[] = [];
-    try {
-      const raw = fs.readFileSync(ACTIVITY_FILE, "utf8");
-      for (const line of raw.split("\n")) {
-        if (!line) continue;
-        try {
-          const e = JSON.parse(line) as ActivityEvent;
-          if (typeof e?.timestamp === "number" && now - e.timestamp <= MAX_RETENTION_MS) kept.push(e);
-        } catch {
-          // torn line: dropping it is the point of compaction
-        }
-      }
-      const body = kept.map((e) => `${JSON.stringify(e)}\n`).join("");
-      this.closeFd();
-      const tmp = `${ACTIVITY_FILE}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, body, { mode: 0o600 });
-      fs.renameSync(tmp, ACTIVITY_FILE);
-      this.bytes = Buffer.byteLength(body);
-    } catch {
-      return;
-    }
-    this.buckets.clear();
-    for (const e of kept) this.addToBucket(e);
-    this.events = kept.length > this.cap ? kept.slice(-this.cap) : kept;
-  }
-
-  /**
-   * Historical name kept for callers. Appends are already durable, so this only
-   * forces them to disk and drops expired hourly buckets.
-   */
-  public flushToDisk(): void {
-    if (this.fd !== null) {
-      try {
-        fs.fsyncSync(this.fd);
-      } catch {
-        // fsync is best-effort
+        this.dirtyMonths.add(month);
       }
     }
-    this.pruneBuckets();
   }
 
-  private pruneBuckets(): void {
-    const cutoff = hourKey(Date.now() - MAX_RETENTION_MS);
-    for (const key of this.buckets.keys()) {
-      if (key < cutoff) this.buckets.delete(key);
+  /** write pending rollups now; called on shutdown so counters survive a signal */
+  flush(): void {
+    if (this.rollupTimer) {
+      clearTimeout(this.rollupTimer);
+      this.rollupTimer = null;
     }
+    this.saveRollups();
   }
 
-  private rebuildBuckets(): void {
-    this.buckets.clear();
-    for (const e of this.events) this.addToBucket(e);
-    this.pruneBuckets();
+  /** resolves once every queued event append has hit the disk (tests and shutdown paths) */
+  whenIdle(): Promise<void> {
+    return this.appendChain;
   }
 
   record(input: ActivityInput): void {
     const now = Date.now();
-    // id/timestamp after the spread: ActivityInput has no id, but a caller (or a
-    // test fixture) passing one must never rewrite the identity of an event.
+    // the store owns the id: a caller-supplied one would collide with the sequence
     const event: ActivityEvent = { ...input, id: this.nextId++, timestamp: now };
-    this.events.push(event);
-    if (this.events.length > this.cap) this.events = this.events.slice(-this.cap);
-    this.addToBucket(event);
-    this.appendLine(event);
-    if (this.bytes > MAX_FILE_BYTES) this.compact();
+    this.recent.push(event);
+    if (this.recent.length > RECENT_CAP) this.recent.splice(0, this.recent.length - RECENT_CAP);
+    this.addToRollup(event);
+    this.append(event);
+    this.scheduleRollupSave();
   }
 
-  // ---------- read ----------
-
-  /**
-   * Only the daemon appends now, so this has to notice just a shrink or a
-   * replacement (manual edit, compaction by another process). Our own appends
-   * are tracked in `bytes`, so they never trigger a reload.
-   */
-  public checkDiskFreshness(): void {
-    const now = Date.now();
-    if (now - this._freshAt < 1000) return; // stat throttle
-    this._freshAt = now;
-    let size: number;
-    try {
-      size = fs.statSync(ACTIVITY_FILE).size;
-    } catch {
-      if (this.bytes > 0) {
-        this.bytes = 0;
-        this.events = [];
-        this.buckets.clear();
+  private readFromDisk(limit: number, start: number, belowId: number): ActivityEvent[] {
+    const out: ActivityEvent[] = [];
+    if (limit <= 0) return out;
+    const months = listFiles("events-", ".jsonl").reverse();
+    for (const file of months) {
+      for (const line of reverseLines(file)) {
+        const event = parseEventLine(line);
+        if (!event) continue;
+        if (event.id >= belowId) continue;
+        if (event.timestamp < start) return out;
+        out.push(event);
+        if (out.length >= limit) return out;
       }
-      return;
     }
-    if (size === this.bytes) return;
-    if (this._reloadTimer) return; // one pending reload is enough
-    this._reloadTimer = setTimeout(() => {
-      this._reloadTimer = null;
-      this.closeFd();
-      this.loadFromDisk();
-    }, 0);
+    return out;
   }
 
   getEvents(limit = 100, window: TimeWindow = "all"): ActivityEvent[] {
-    const threshold = this.thresholdFor(window);
-    const filtered =
-      threshold === null ? this.events : this.events.filter((e) => e.timestamp >= threshold);
-    return filtered.slice(-limit).reverse();
-  }
-
-  private thresholdFor(window: TimeWindow): number | null {
-    if (window === "all") return null;
-    const now = Date.now();
-    if (window === "today") {
-      const startOfDay = new Date();
-      startOfDay.setHours(0, 0, 0, 0);
-      return startOfDay.getTime();
+    const start = windowStart(window);
+    const capped = Math.max(0, limit);
+    if (capped === 0) return [];
+    const local = this.recent.filter((e) => e.timestamp >= start);
+    if (local.length >= capped || this.recent.length < RECENT_CAP) {
+      return local.slice(-capped).reverse();
     }
-    if (window === "7d") return now - 7 * 24 * 60 * 60 * 1000;
-    if (window === "30d") return now - 30 * 24 * 60 * 60 * 1000;
-    return now - 60 * 24 * 60 * 60 * 1000;
-  }
-
-  /**
-   * Summed from hourly buckets, so this is O(hours) instead of O(events): a full
-   * 60-day window is ~1440 map lookups instead of a 217k-event scan.
-   */
-  getUsage(window: TimeWindow = "all"): UsageStats {
-    const threshold = this.thresholdFor(window);
-    const from = threshold === null ? -Infinity : hourKey(threshold);
-    let requests = 0;
-    let ok = 0;
-    let errors = 0;
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let cachedTokens = 0;
-    let durationMs = 0;
-    let failovers = 0;
-    const perModel: Record<string, ModelActivity> = {};
-    const perUpstream: Record<string, { requests: number; ok: number }> = {};
-
-    for (const [key, b] of this.buckets) {
-      if (key < from) continue;
-      requests += b.requests;
-      ok += b.ok;
-      errors += b.errors;
-      inputTokens += b.inputTokens;
-      outputTokens += b.outputTokens;
-      cachedTokens += b.cachedTokens ?? 0;
-      durationMs += b.durationMs;
-      failovers += b.failovers;
-      for (const [id, m] of Object.entries(b.perModel)) {
-        const acc =
-          perModel[id] ?? (perModel[id] = { requests: 0, ok: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0 });
-        acc.requests += m.requests;
-        acc.ok += m.ok;
-        acc.inputTokens += m.inputTokens;
-        acc.outputTokens += m.outputTokens;
-        acc.cachedTokens += m.cachedTokens ?? 0;
-      }
-      for (const [id, u] of Object.entries(b.perUpstream)) {
-        const acc = perUpstream[id] ?? (perUpstream[id] = { requests: 0, ok: 0 });
-        acc.requests += u.requests;
-        acc.ok += u.ok;
-      }
-    }
-
-    return {
-      totalRequests: requests,
-      okRequests: ok,
-      errorRequests: errors,
-      totalInputTokens: inputTokens,
-      totalOutputTokens: outputTokens,
-      totalCachedTokens: cachedTokens,
-      failoverCount: failovers,
-      avgDurationMs: requests ? Math.round(durationMs / requests) : 0,
-      perModel,
-      perUpstream,
-    };
+    // the window reaches past the ring: fill the rest from the month files
+    const oldest = this.recent[0]!;
+    const rest = this.readFromDisk(capped - local.length, start, oldest.id);
+    return [...rest, ...local.slice(-capped).reverse()];
   }
 
   getAllEvents(): ActivityEvent[] {
-    return [...this.events];
+    const months = listFiles("events-", ".jsonl");
+    const all: ActivityEvent[] = [];
+    for (const file of months) all.push(...readMonthEvents(file));
+    all.sort((a, b) => a.id - b.id);
+    return all;
   }
 
   startRequest(input: Omit<InFlightRequest, "id">): number {
@@ -462,47 +451,121 @@ export class ActivityStore {
   }
 
   clear(): void {
-    this.closeFd();
-    this.events = [];
-    this.buckets.clear();
+    if (this.rollupTimer) {
+      clearTimeout(this.rollupTimer);
+      this.rollupTimer = null;
+    }
+    this.recent = [];
+    this.days.clear();
+    this.dirtyMonths.clear();
     this.nextId = 1;
-    this.flushToDisk();
+    try {
+      fs.rmSync(ACTIVITY_DIR, { recursive: true, force: true });
+    } catch {
+      // nothing on disk yet
+    }
+    ensureBansosDir();
   }
 
   importEvents(incoming: ActivityEvent[], replace = false): number {
     if (!Array.isArray(incoming)) return 0;
-    const now = Date.now();
     const valid = incoming.filter(
       (e) =>
         e &&
         typeof e === "object" &&
         typeof e.timestamp === "number" &&
-        now - e.timestamp <= MAX_RETENTION_MS &&
         typeof e.model === "string" &&
         typeof e.upstream === "string" &&
         (e.status === "ok" || e.status === "error"),
     );
-    if (replace) {
-      this.events = valid;
-    } else {
-      const seen = new Set(this.events.map((e) => `${e.timestamp}_${e.model}_${e.upstream}`));
-      for (const e of valid) {
-        const key = `${e.timestamp}_${e.model}_${e.upstream}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          this.events.push(e);
-        }
+    if (replace) this.clear();
+    // ids are the stable key: a merge twice from the same backup changes nothing
+    const seen = new Set<number>(this.getAllEvents().map((e) => e.id));
+    const byMonth = new Map<string, string[]>();
+    const accepted: ActivityEvent[] = [];
+    for (const event of valid) {
+      const id = typeof event.id === "number" ? event.id : this.nextId++;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const materialized: ActivityEvent = {
+        ...event,
+        id,
+        inputTokens: Number(event.inputTokens) || 0,
+        outputTokens: Number(event.outputTokens) || 0,
+        durationMs: Number(event.durationMs) || 0,
+        cachedTokens: Number(event.cachedTokens) || undefined,
+      };
+      accepted.push(materialized);
+      const month = monthKeyOf(materialized.timestamp);
+      byMonth.set(month, [...(byMonth.get(month) ?? []), `${JSON.stringify(materialized)}\n`]);
+      this.addToRollup(materialized);
+      if (materialized.id >= this.nextId) this.nextId = materialized.id + 1;
+    }
+    for (const [month, lines] of byMonth) {
+      try {
+        fs.mkdirSync(ACTIVITY_DIR, { recursive: true });
+        fs.appendFileSync(eventsFileOf(month), lines.join(""), { mode: 0o600 });
+      } catch {
+        // keep the in-memory view working when the disk write fails
       }
     }
-    this.events.sort((a, b) => a.timestamp - b.timestamp);
-    if (this.events.length > this.cap) {
-      this.events = this.events.slice(-this.cap);
+    if (accepted.length > 0) {
+      this.recent = [...this.recent, ...accepted].sort((a, b) => a.id - b.id);
+      if (this.recent.length > RECENT_CAP) this.recent = this.recent.slice(-RECENT_CAP);
+      this.flush();
     }
-    if (this.events.length > 0) {
-      this.nextId = Math.max(...this.events.map((e) => e.id || 0)) + 1;
+    return accepted.length;
+  }
+
+  getUsage(window: TimeWindow = "all"): UsageStats {
+    const start = windowStart(window);
+    const stats: UsageStats = {
+      totalRequests: 0,
+      okRequests: 0,
+      errorRequests: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCachedTokens: 0,
+      failoverCount: 0,
+      avgDurationMs: 0,
+      perModel: {},
+      perUpstream: {},
+    };
+    let durationMs = 0;
+    for (const [day, bucket] of this.days) {
+      const dayStart = new Date(`${day}T00:00:00`).getTime();
+      if (Number.isFinite(dayStart) ? dayStart < start : start > 0) continue;
+      stats.totalRequests += bucket.requests;
+      stats.okRequests += bucket.ok;
+      stats.errorRequests += bucket.error;
+      stats.totalInputTokens += bucket.inputTokens;
+      stats.totalOutputTokens += bucket.outputTokens;
+      stats.totalCachedTokens += bucket.cachedTokens;
+      stats.failoverCount += bucket.failover;
+      durationMs += bucket.durationMs;
+      for (const [model, m] of Object.entries(bucket.perModel)) {
+        const target =
+          stats.perModel[model] ??
+          (stats.perModel[model] = {
+            requests: 0,
+            ok: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cachedTokens: 0,
+          });
+        target.requests += m.requests;
+        target.ok += m.ok;
+        target.inputTokens += m.inputTokens;
+        target.outputTokens += m.outputTokens;
+        target.cachedTokens += m.cachedTokens;
+      }
+      for (const [upstream, u] of Object.entries(bucket.perUpstream)) {
+        const target = stats.perUpstream[upstream] ?? (stats.perUpstream[upstream] = { requests: 0, ok: 0 });
+        target.requests += u.requests;
+        target.ok += u.ok;
+      }
     }
-    this.rebuildBuckets();
-    this.flushToDisk();
-    return valid.length;
+    stats.avgDurationMs = stats.totalRequests ? Math.round(durationMs / stats.totalRequests) : 0;
+    return stats;
   }
 }
