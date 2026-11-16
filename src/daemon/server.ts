@@ -2217,6 +2217,12 @@ async function runChatForward(
   // relay that may never have carried it (measured 2026-11-16: 34/34 events in
   // one hour attributed to the pinned relay while the daemon rotated the fleet).
   const servingRelay = relay.enabled && relay.url ? relay.url : "";
+  // The last egress this request actually reached. A transport failure leaves
+  // `transientError` with no relay field of its own (there is no response to
+  // read it from), and the watchdog reads errors — an unattributed 429/502 hides
+  // whether one egress is gated or the lane is closed. Recorded as each attempt
+  // completes, stamped onto the final error only when it has none.
+  let lastRelayUsed = "";
   const failoverAllowed =
     req.headers["x-bansos-no-failover"] !== "1" &&
     // Per-request opt-in. The global switch stays off (the operator manages
@@ -2529,6 +2535,7 @@ async function runChatForward(
         duplex: "half",
         signal: chatCtl.signal,
       }, isRelayAllowed(security));
+      lastRelayUsed = servedBy(upstreamRes, servingRelay);
       disarmHeadersTimer();
     } catch {
       disarmHeadersTimer();
@@ -2792,7 +2799,11 @@ async function runChatForward(
     };
   }
 
-  return transientError ?? { status: 502, message: "no upstream candidates left" };
+  if (transientError) {
+    if (!transientError.relay && lastRelayUsed) transientError.relay = lastRelayUsed;
+    return transientError;
+  }
+  return { status: 502, message: "no upstream candidates left" };
 }
 
 // The relay that actually carried this response.
