@@ -245,10 +245,21 @@ function penalized(url: string, now: number, target?: URL, model?: string): bool
   return false;
 }
 // Exposed for `bansos doctor` and tests; not part of the request path.
-export function relayRetryState(): { preferred: string; penalized: string[] } {
+export function relayRetryState(): { preferred: string; preferredOrigin: string; penalized: string[] } {
   const now = Date.now();
+  const live = _preferred && _preferred.until > now ? _preferred : null;
   return {
-    preferred: _preferred && _preferred.until > now ? _preferred.url : "",
+    preferred: live ? live.url : "",
+    // WHICH deployment the preferred relay failed on.
+    //
+    // The preferred relay is per-ORIGIN: it is stamped when the active relay
+    // fails for one target, and a different target's failover says nothing about
+    // this one. A consumer that watches a specific upstream (the deepseek healer
+    // watches the `de` row on production opencode.ai) must be able to tell its
+    // own refusal from unrelated traffic — measured 2026-11-16: a kilo failover
+    // set `preferred` with no origin reported, which the deepseek healer read as
+    // "the relay I care about refused".
+    preferredOrigin: live?.origin ?? "",
     // The penalty keys are "<target origin>|<relay url>" or
     // "<target origin>|<relay url>|<model id>" so a relay spent on production
     // is not hidden from the stage, and a relay spent for one model is not

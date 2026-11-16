@@ -904,6 +904,33 @@ test("the relay header is absent when the fleet was never used", async () => {
   }
 });
 
+test("the preferred marker reports WHICH deployment failed, not just a relay", async () => {
+  // retry.preferred is per-origin: the same relay serves kilo, llm7 and both
+  // opencode deployments, so a consumer watching one upstream must be able to
+  // tell its own refusal from unrelated traffic. Measured 2026-11-16: a kilo
+  // promotion-limit failover set `preferred` with no origin, and the deepseek
+  // healer (which watches production opencode.ai) read it as its own failure and
+  // marked a healthy relay bad for an hour.
+  const { restore } = stubFetch((url) => (url.includes("r1") ? 429 : 200));
+  try {
+    await relayFetch(
+      state("https://r1.example", ["https://r2.example"]),
+      TARGET,
+      { method: "POST", body: '{"model":"deepseek-v4.1-flash-free"}' },
+    );
+    const st = relayRetryState();
+    assert.equal(st.preferred, "https://r2.example");
+    assert.equal(st.preferredOrigin, "https://opencode.ai", "the failing deployment is named");
+  } finally {
+    restore();
+  }
+});
+
+test("no preferred marker means no origin either", () => {
+  assert.equal(relayRetryState().preferred, "");
+  assert.equal(relayRetryState().preferredOrigin, "");
+});
+
 test("a stale ranking is ignored rather than trusted", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-rank-"));
   const rank = path.join(dir, "rank.json");
