@@ -45,6 +45,7 @@ import {
   deploymentEssentiallySpent,
   quotaRefillInSeconds,
   FLEET_EXHAUSTED_HEADER,
+  RELAY_USED_HEADER,
   type RelayState,
 } from "../relay/egress";
 import { ADAPTERS, buildSetupContext, findAdapter } from "../adapters";
@@ -2188,8 +2189,13 @@ async function runChatForward(
   // Which egress served this request. The watchdog can only attribute failures
   // to a relay if the event says which relay was in use, otherwise it sees
   // "upstream=zen failed" and cannot tell a gated relay from a gated upstream.
-  // Computed once: relay state is loaded here and the failover loop below only
-  // swaps model/upstream, never the egress.
+  //
+  // This is the CONFIG relay: the first candidate. relayFetch fails over inside
+  // one request, so the relay that actually answered arrives on the response
+  // (RELAY_USED_HEADER) and is preferred wherever the response is available —
+  // see servedBy(). Recording this value unconditionally made every event name a
+  // relay that may never have carried it (measured 2026-11-16: 34/34 events in
+  // one hour attributed to the pinned relay while the daemon rotated the fleet).
   const servingRelay = relay.enabled && relay.url ? relay.url : "";
   const failoverAllowed =
     req.headers["x-bansos-no-failover"] !== "1" &&
@@ -2762,11 +2768,26 @@ async function runChatForward(
       response: finalResponse,
       model: current,
       upstream: currentUpstream,
-      relay: servingRelay,
+      relay: servedBy(finalResponse, servingRelay),
     };
   }
 
   return transientError ?? { status: 502, message: "no upstream candidates left" };
+}
+
+// The relay that actually carried this response.
+//
+// relayFetch fails over inside the request and reports the winner on
+// RELAY_USED_HEADER; `fallback` is the configured relay, which is only correct
+// when the response did not travel through the relay path at all (direct egress,
+// a cached response, a stage/mirror answer). Without this, every event named the
+// CONFIG relay — for a spread target, usually not the one that served.
+function servedBy(res: Response, fallback: string): string {
+  try {
+    return res.headers.get(RELAY_USED_HEADER) ?? fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 async function handleChat(

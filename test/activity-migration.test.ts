@@ -60,7 +60,7 @@ test("imported ids are renumbered so they cannot collide with the month files", 
   freshStore();
   const store = new ActivityStore();
   // an event recorded natively first: it owns id 1 in the month files
-  store.record({ timestamp: Date.now(), model: "native", requestedModel: "native", upstream: "kilo", inputTokens: 1, outputTokens: 1, durationMs: 5, status: "ok" });
+  store.record({ kind: "chat", model: "native", requestedModel: "native", upstream: "kilo", inputTokens: 1, outputTokens: 1, durationMs: 5, status: "ok" });
   await store.whenIdle();
   store.flush();
 

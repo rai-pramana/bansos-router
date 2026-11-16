@@ -12,6 +12,7 @@ import {
   expirePenaltyForTest,
   resetSpreadCursorForTest,
   FLEET_EXHAUSTED_HEADER,
+  RELAY_USED_HEADER,
   type RelayState,
 } from "../src/relay/egress";
 
@@ -859,6 +860,47 @@ test("the preferred marker IS set when the active relay really refused", async (
     assert.notEqual(pref, "https://active.example");
   } finally {
     restore();
+  }
+});
+
+test("the response names the relay that actually served, not the configured one", async () => {
+  // relayFetch fails over inside one request. An event that records the CONFIG
+  // relay therefore names a relay that may never have carried it — measured
+  // 2026-11-16: every event in an hour attributed to the pinned relay while the
+  // daemon rotated across the fleet, which breaks the watchdog's per-relay
+  // attribution and any incident review.
+  const { calls, restore } = stubFetch((url) => (url.includes("r1") ? 429 : 200));
+  try {
+    const res = await relayFetch(
+      state("https://r1.example", ["https://r2.example"]),
+      TARGET,
+      { method: "POST", body: '{"model":"deepseek-v4.1-flash-free"}' },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(
+      res.headers.get(RELAY_USED_HEADER),
+      "https://r2.example",
+      "the header names the relay that answered",
+    );
+    assert.ok(calls.some((c) => c.url === "https://r2.example"));
+  } finally {
+    restore();
+  }
+});
+
+test("the relay header is absent when the fleet was never used", async () => {
+  // Direct egress: relay disabled means relayFetch never touches a relay, so
+  // there is nothing to report and the caller keeps its own fallback.
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{"ok":true}', { status: 200 })) as typeof fetch;
+  try {
+    const res = await relayFetch({ enabled: false, url: "", relays: [] }, TARGET, {
+      method: "POST",
+      body: "{}",
+    });
+    assert.equal(res.headers.get(RELAY_USED_HEADER), null, "no relay, no attribution");
+  } finally {
+    globalThis.fetch = original;
   }
 });
 

@@ -642,7 +642,7 @@ export async function relayFetch(
   // budget for nothing.
   const first = await attempt(candidates[0]!);
   record(first);
-  if (first.kind === "ok") return first.res;
+  if (first.kind === "ok") return markRelayUsed(first.res, first.url);
 
   // A QUOTA 429 means the fleet may be spent, so the REST of the candidates can
   // be raced instead of walked one by one.
@@ -688,14 +688,14 @@ export async function relayFetch(
     const width = Math.min(RACE_WIDTH, rest.length);
     await Promise.all(Array.from({ length: width }, () => worker()));
     const winner = attempts.find((a) => a.kind === "ok");
-    if (winner && winner.kind === "ok") return winner.res;
+    if (winner && winner.kind === "ok") return markRelayUsed(winner.res, winner.url);
   } else {
     // Not a quota rejection: walk the rest one by one. Each step keeps the
     // old semantics, including the direct fallback when the fleet is exhausted.
     for (let i = 0; i < rest.length; i++) {
       const a = await attempt(rest[i]!);
       record(a);
-      if (a.kind === "ok") return a.res;
+      if (a.kind === "ok") return markRelayUsed(a.res, a.url);
       if (a.kind === "transport" || a.kind === "refusal") {
         if (i === rest.length - 1) {
           // No relay in the fleet forwards this target. Fall back to direct.
@@ -1118,6 +1118,31 @@ export function deploymentEssentiallySpent(
 // response body is the upstream's own error text and the daemon reads it
 // verbatim for the client.
 export const FLEET_EXHAUSTED_HEADER = "x-bansos-fleet-exhausted";
+
+// WHICH relay actually answered travels the same way.
+//
+// It cannot be derived by the caller: `relayFetch` fails over INSIDE one request,
+// so the relay in the config (`state.url`) is merely the first candidate — often
+// not the one that served, and for a spread target (both opencode deployments)
+// usually not the one that served. The activity store used to record the config
+// value, which made every event claim a relay that had not carried it: measured
+// 2026-11-16, `/bansos/usage` attributed 34/34 requests in an hour to the pinned
+// relay while the daemon was rotating across the fleet. Anything that reads
+// `relay` per event (the watchdog's per-relay attribution, an incident review)
+// was reading the wrong relay.
+export const RELAY_USED_HEADER = "x-bansos-relay-used";
+
+function markRelayUsed(res: Response, url: string): Response {
+  if (!url) return res;
+  try {
+    const headers = new Headers(res.headers);
+    headers.set(RELAY_USED_HEADER, url);
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  } catch {
+    // an already-consumed body cannot be re-wrapped; the caller falls back
+    return res;
+  }
+}
 
 // Mark a response as "the whole fleet is spent for this model". The daemon
 // reads this to decide whether the model may be parked fleet-wide.
