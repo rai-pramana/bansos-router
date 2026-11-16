@@ -76,6 +76,11 @@ export interface ActivityInput {
 // events stay in append-only month files; usage is per-month day rollups
 export const ACTIVITY_DIR = path.join(BANSOS_DIR, "activity");
 const LEGACY_ACTIVITY_FILE = path.join(BANSOS_DIR, "activity.json");
+// The JSONL store that 0.5.x-0.6.1 wrote (one event per line, flat in BANSOS_DIR).
+// 0.6.2 moved events under ACTIVITY_DIR/ and this file was left behind, frozen:
+// nothing reads it and nothing migrates it, so an upgrade silently orphans the
+// whole history. migrateLegacyFile() now converts it too.
+const LEGACY_JSONL_FILE = path.join(BANSOS_DIR, "activity.jsonl");
 const RECENT_CAP = 2000;
 const READ_CHUNK = 64 * 1024;
 const ROLLUP_SAVE_MS = 5000;
@@ -164,6 +169,30 @@ function parseEventLine(line: string): ActivityEvent | null {
   } catch {
     return null;
   }
+}
+
+// Identity of an event's CONTENT, for deduping an import.
+//
+// The store's own merge key is the numeric `id`, which cannot be used here: the
+// pre-0.6.2 flat file and the month files both number their events from 1, so the
+// ids of the same period collide without being the same events. Every field the
+// daemon derives from one request is included, so two genuinely distinct requests
+// cannot look identical while a re-import of the same line does.
+function contentKeyOf(e: ActivityEvent): string {
+  return [
+    e.timestamp,
+    e.kind ?? "",
+    e.model,
+    e.requestedModel ?? "",
+    e.upstream,
+    e.inputTokens ?? 0,
+    e.outputTokens ?? 0,
+    e.cachedTokens ?? 0,
+    e.durationMs ?? 0,
+    e.status,
+    e.statusCode ?? "",
+    e.failoverFrom ?? "",
+  ].join("\u0001");
 }
 
 // newest-first, so an old query never reads a whole month file
@@ -277,13 +306,88 @@ export class ActivityStore {
   }
 
   private migrateLegacyFile(): void {
-    if (!fs.existsSync(LEGACY_ACTIVITY_FILE)) return;
+    if (fs.existsSync(LEGACY_ACTIVITY_FILE)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(LEGACY_ACTIVITY_FILE, "utf8")) as { events?: unknown };
+        if (Array.isArray(raw?.events)) this.importEvents(raw.events as ActivityEvent[], false);
+        fs.renameSync(LEGACY_ACTIVITY_FILE, `${LEGACY_ACTIVITY_FILE}.migrated`);
+      } catch {
+        // a corrupt old file is left in place for a manual look
+      }
+    }
+    this.migrateLegacyJsonlFile();
+  }
+
+  /**
+   * Convert the flat activity.jsonl that pre-0.6.2 wrote, once.
+   *
+   * The month-file layout replaced it without a migration, so an upgrade left the
+   * whole history in a file nothing reads: measured 2026-11-16 on this install,
+   * 40,454 events (2026-10-20 -> 11-16) invisible to `/bansos/usage?window=all`
+   * and to the dashboard, which reported 60 requests for the same period.
+   *
+   * Properties this must hold:
+   *  - ids are NOT preserved: the old file and the month files both start at 1,
+   *    so reusing them would make `seen` reject every imported event as a
+   *    duplicate on a second boot (ids are the store's merge key). The importer
+   *    assigns fresh ids in timestamp order instead.
+   *  - dedupe is by CONTENT, not id: a re-run of a partial migration must not
+   *    double-count, and the existing month files have no id overlap to lean on.
+   *  - the file is renamed, never deleted, so a failed import is recoverable and
+   *    a second boot does not re-import.
+   */
+  private migrateLegacyJsonlFile(): void {
+    if (!fs.existsSync(LEGACY_JSONL_FILE)) return;
+    let lines: string[];
     try {
-      const raw = JSON.parse(fs.readFileSync(LEGACY_ACTIVITY_FILE, "utf8")) as { events?: unknown };
-      if (Array.isArray(raw?.events)) this.importEvents(raw.events as ActivityEvent[], false);
-      fs.renameSync(LEGACY_ACTIVITY_FILE, `${LEGACY_ACTIVITY_FILE}.migrated`);
+      lines = fs.readFileSync(LEGACY_JSONL_FILE, "utf8").split("\n");
     } catch {
-      // a corrupt old file is left in place for a manual look
+      return;
+    }
+    const parsed: ActivityEvent[] = [];
+    for (const line of lines) {
+      const event = parseEventLine(line.trim());
+      if (event) parsed.push(event);
+    }
+    if (parsed.length === 0) {
+      // Nothing salvageable: leave the file alone rather than renaming it away.
+      return;
+    }
+    // Seed the id sequence from what is already on disk BEFORE importing.
+    //
+    // migrateLegacyFile() runs before loadRecent() (which is what normally lifts
+    // nextId past the existing tail), so nextId is still 1 here. importEvents
+    // assigns `this.nextId++` to every id-less event and then SKIPS it when that
+    // id is already in `seen` — so the first legacy event would collide with the
+    // native id 1 and be dropped as a duplicate. Verified by test: "imported ids
+    // are renumbered so they cannot collide with the month files".
+    const existing = this.getAllEvents();
+    let maxId = 0;
+    for (const event of existing) {
+      if (typeof event.id === "number" && event.id > maxId) maxId = event.id;
+    }
+    if (maxId >= this.nextId) this.nextId = maxId + 1;
+
+    // Order by time so the fresh ids describe the real sequence, then drop the
+    // events the month files already hold by comparing on content. The `id` is
+    // dropped entirely (not zeroed): importEvents assigns this.nextId++ only when
+    // the field is not a number, so a numeric 0 would collide across every event.
+    parsed.sort((a, b) => a.timestamp - b.timestamp);
+    const seenContent = new Set<string>();
+    for (const event of existing) seenContent.add(contentKeyOf(event));
+    const incoming: ActivityEvent[] = [];
+    for (const event of parsed) {
+      const key = contentKeyOf(event);
+      if (seenContent.has(key)) continue;
+      seenContent.add(key);
+      const { id: _assignedByImport, ...rest } = event;
+      incoming.push(rest as ActivityEvent);
+    }
+    if (incoming.length > 0) this.importEvents(incoming, false);
+    try {
+      fs.renameSync(LEGACY_JSONL_FILE, `${LEGACY_JSONL_FILE}.migrated`);
+    } catch {
+      // leave it in place; a later boot retries against content dedupe
     }
   }
 
