@@ -816,6 +816,52 @@ test("the scheduler's FOT ranking decides which alternate is tried first", async
   }
 });
 
+test("the preferred marker is NOT set when a spread rotation skips a healthy active relay", async () => {
+  // The stage is a SPREAD target: the candidate list is rotated per request, so
+  // the winner differs from the active relay most of the time WITHOUT the active
+  // relay ever being contacted or failing. Stamping `preferred` there made
+  // /bansos/relay tell every consumer "the active relay refused real traffic" —
+  // 285 false heal-log alarms and a healthy pinned relay marked bad for an hour.
+  //
+  // The rotation starts at cursor 0 (= the active relay), so ONE request cannot
+  // see this: it must run a second request, when the cursor has advanced and the
+  // winner is some other relay while the active one is never tried.
+  const spreadTarget = "https://dev.opencode.ai/zen/v1/chat/completions";
+  const { calls, restore } = stubFetch(() => 200);
+  try {
+    const st = state("https://active.example", ["https://b1.example", "https://b2.example", "https://b3.example"]);
+    await relayFetch(st, spreadTarget, { method: "POST", body: '{"model":"muse-spark-1.3-contributor-free"}' });
+    assert.equal(relayRetryState().preferred, "", "the active relay served: nothing to report");
+
+    const before = calls.length;
+    await relayFetch(st, spreadTarget, { method: "POST", body: '{"model":"muse-spark-1.3-contributor-free"}' });
+    const second = calls.slice(before);
+    assert.ok(!second.some((c) => c.url === "https://active.example"), "the rotation skipped the active relay");
+    assert.equal(
+      relayRetryState().preferred,
+      "",
+      "a rotation that never touched the active relay must not claim it failed",
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("the preferred marker IS set when the active relay really refused", async () => {
+  const spreadTarget = "https://dev.opencode.ai/zen/v1/chat/completions";
+  const { calls, restore } = stubFetch((url) => (url.includes("active") ? 429 : 200));
+  try {
+    const st = state("https://active.example", ["https://b1.example", "https://b2.example"]);
+    await relayFetch(st, spreadTarget, { method: "POST", body: '{"model":"muse-spark-1.3-contributor-free"}' });
+    const pref = relayRetryState().preferred;
+    assert.ok(calls.some((c) => c.url === "https://active.example"), "the active relay was tried");
+    assert.notEqual(pref, "", "a real refusal must still be reported");
+    assert.notEqual(pref, "https://active.example");
+  } finally {
+    restore();
+  }
+});
+
 test("a stale ranking is ignored rather than trusted", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-rank-"));
   const rank = path.join(dir, "rank.json");

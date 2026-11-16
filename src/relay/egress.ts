@@ -575,14 +575,32 @@ export async function relayFetch(
 
   let last: Response | null = null;
   let quotaHit = false;
+  // Did the ACTIVE relay (state.url) actually refuse during THIS request?
+  //
+  // `_preferred` means "the active relay was tried and another one served", which
+  // is the only thing the heal tooling may read it as. It must NOT be stamped
+  // merely because the winner differs from state.url: a spread target (both
+  // opencode deployments) rotates its candidate list, so the winner is USUALLY
+  // not the active relay even when the active relay is perfectly healthy and was
+  // never contacted. Stamping it there made `/bansos/relay` claim "the active
+  // relay refused real traffic" on every stage request — measured 2026-11-16,
+  // 285 false alarms in the heal log and a healthy pinned relay marked bad for an
+  // hour at a time, which then excluded it from rotation.
+  let activeFailed = false;
 
   // Record one attempt's consequence: the penalty, the spent evidence, and the
   // preferred relay. Kept in one place so the sequential attempt and the raced
   // attempts cannot drift apart.
   const record = (a: Attempt): void => {
+    if (a.url === state.url && a.kind !== "ok") activeFailed = true;
     if (a.kind === "ok") {
-      if (a.url !== state.url) _preferred = { url: a.url, until: Date.now() + PREFER_MS, origin: u.origin };
-      else _preferred = null;
+      if (a.url !== state.url) {
+        if (activeFailed) {
+          _preferred = { url: a.url, until: Date.now() + PREFER_MS, origin: u.origin };
+        }
+      } else {
+        _preferred = null;
+      }
       // This address answered: its bucket still has room, so it is not part of
       // the spent evidence for this (deployment, model).
       noteQuotaServed(u, model, a.url);
