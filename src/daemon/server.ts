@@ -1734,6 +1734,10 @@ type StageVerdict = {
   status: number;
   message: string;
   retryAfter?: number;
+  // Which relay carried the failed attempt. Without it an error event has no
+  // attribution, and the watchdog reads errors — a 429/502 that cannot name its
+  // relay hides whether one egress is gated or the whole lane is closed.
+  relay?: string;
   // Which deployment produced this verdict. Carried so the activity log names
   // the stage instead of falling back to the model's registered source.
   upstream?: string;
@@ -1779,7 +1783,8 @@ type StageAttempt =
 // The retryAfter is carried over from the previous error only when the stage
 // gave none: both deployments refill at the same UTC midnight, so the older
 // deadline is still the better answer than no deadline at all.
-function stageVerdictError(
+// exported for the regression test that pins relay survival across the verdict swap
+export function stageVerdictError(
   verdict: StageVerdict | null,
   previous: ForwardError | null,
 ): ForwardError | null {
@@ -1793,12 +1798,14 @@ function stageVerdictError(
       : previous?.retryAfter !== undefined
         ? previous.retryAfter
         : undefined;
+  const relay = verdict.relay ?? previous?.relay;
   return {
     status: verdict.status,
     message: verdict.message,
     // The verdict came from the STAGE, so say so. Falling back to `previous`
     // here is what labelled a stage refusal as the production lane's.
     upstream: verdict.upstream ?? previous?.upstream,
+    ...(relay ? { relay } : {}),
     ...(retryAfter !== undefined ? { retryAfter } : {}),
   };
 }
@@ -1911,6 +1918,10 @@ async function tryZenStage(
   }
   clearTimeout(timer);
 
+  // Which relay carried this stage attempt. Captured on the response relayFetch
+  // handed back, because the converters below re-wrap it without headers.
+  const stageRelay = servedBy(res, "");
+
   if (res.status >= 400) {
     const text = await res.text().catch(() => "");
     const stageRetryAfterMs = parseRetryAfterMs(res.headers.get("retry-after"));
@@ -1935,16 +1946,15 @@ async function tryZenStage(
         status: res.status,
         message: text.slice(0, 256) || `zen stage returned HTTP ${res.status}`,
         upstream: stage.upstream.id,
+        // which relay carried this failed attempt, so the error event can be
+        // attributed to an egress instead of dropping the field
+        ...(stageRelay ? { relay: stageRelay } : {}),
         ...(stageRetryAfterMs !== undefined
           ? { retryAfter: Math.ceil(stageRetryAfterMs / 1000) }
           : {}),
       },
     };
   }
-
-  // Which relay carried the stage request. Captured HERE, on the response
-  // relayFetch handed back, because everything below may re-wrap it.
-  const stageRelay = servedBy(res, "");
 
   // The answer is converted back to what the caller asked for, the same way
   // the production path does it.
@@ -2573,7 +2583,7 @@ async function runChatForward(
           durationMs: Date.now() - requestStartedAt,
           upstreamError: errorMsg,
         });
-        return { status: upstreamRes.status, message: errorMsg, relay: servingRelay };
+        return { status: upstreamRes.status, message: errorMsg, relay: servedBy(upstreamRes, servingRelay) };
       }
 
       if (zenRetired) {

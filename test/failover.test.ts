@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { RuntimeCatalog } from "../src/daemon/catalog";
-import { createServer, isQuotaExhaustion, parseRetryAfterMs, peekStreamError, pickFailover, retryAfterFromMessage, streamToChatResponse } from "../src/daemon/server";
+import { createServer, isQuotaExhaustion, parseRetryAfterMs, peekStreamError, pickFailover, retryAfterFromMessage, stageVerdictError, streamToChatResponse } from "../src/daemon/server";
 import { RateLimiter } from "../src/daemon/rate-limit";
 import { normalizeSecurityConfig } from "../src/security/policy";
 import type { Logger } from "../src/logger";
@@ -863,4 +863,28 @@ test("an OpenRouter-style error frame that still carries choices is recognised",
   assert.match(peeked.error ?? "", /overloaded/, "a keepalive before the error does not commit the stream");
   const out = await streamToChatResponse(new Response(`data: ${frame}\n\ndata: [DONE]\n\n`), "m");
   assert.equal(out.status, 502);
+});
+
+test("a stage verdict keeps the relay that carried the failed attempt", () => {
+  // Error events are what the watchdog reads, and an error that cannot name its
+  // relay hides whether an egress is gated or the whole lane is closed.
+  // stageVerdictError swaps the error for the stage's verdict; the relay must
+  // survive that swap, from the stage verdict or the previous error.
+  const fromVerdict = stageVerdictError(
+    { status: 429, message: "Free usage limit reached", upstream: "zen-stage", relay: "https://relay-a.example" },
+    { status: 502, message: "upstream failed", upstream: "zen", relay: "https://relay-b.example" },
+  );
+  assert.ok(fromVerdict);
+  assert.equal(fromVerdict!.relay, "https://relay-a.example", "the stage's own relay wins");
+
+  const fromPrevious = stageVerdictError(
+    { status: 429, message: "Free usage limit reached", upstream: "zen-stage" },
+    { status: 502, message: "upstream failed", upstream: "zen", relay: "https://relay-b.example" },
+  );
+  assert.ok(fromPrevious);
+  assert.equal(fromPrevious!.relay, "https://relay-b.example", "falls back to the previous attempt's relay");
+
+  const neither = stageVerdictError({ status: 429, message: "spent", upstream: "zen-stage" }, null);
+  assert.ok(neither);
+  assert.ok(!("relay" in neither!), "no relay is invented when neither side has one");
 });
