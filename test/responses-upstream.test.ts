@@ -350,6 +350,25 @@ test("crouton alpha is seeded on the responses wire", () => {
   assert.equal(pickSmartDefaultModel(SEEDED_MODELS), "deepseek-v4.1-flash-free");
 });
 
+test("toChatResponse drops response headers, so relay attribution must travel with the answer", async () => {
+  // This is why StageAttempt carries `relay` as its own field instead of the
+  // caller reading RELAY_USED_HEADER off the converted response: every branch
+  // below builds a NEW Response with only a content-type, so the relay header
+  // set by relayFetch does not survive. Reading it after the conversion would
+  // silently attribute every responses-wire stage request to nothing (measured
+  // 2026-11-16: the stage lane recorded relay:"" on 41 of 49 events).
+  const upstream = new Response(JSON.stringify({ choices: [] }), {
+    status: 200,
+    headers: { "content-type": "application/json", "x-bansos-relay-used": "https://relay.example" },
+  });
+  const out = await toChatResponse(upstream, "muse", false);
+  assert.equal(
+    out.headers.get("x-bansos-relay-used"),
+    null,
+    "the converter does not carry arbitrary headers — capture the relay before it runs",
+  );
+});
+
 test("toChatResponse leaves a non-JSON reply readable instead of consuming it", async () => {
   const upstream = new Response("<html>gateway error</html>", {
     status: 200,

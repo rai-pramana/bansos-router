@@ -1743,8 +1743,12 @@ type StageVerdict = {
 // A verdict is separate from "no answer" because the caller must be able to
 // tell the stage's refusal apart from a stage that was never tried.
 type StageAttempt =
-  | { answer: Response; verdict: null }
-  | { answer: null; verdict: StageVerdict | null };
+  // `relay` travels WITH the answer rather than being read off the response:
+  // the wire converters below (toChatResponse / streamToChatResponse) build a
+  // NEW Response and do not carry the relay header across, so reading it later
+  // would silently lose the attribution for every responses-wire stage request.
+  | { answer: Response; verdict: null; relay: string }
+  | { answer: null; verdict: StageVerdict | null; relay?: string };
 
 // Try the zen STAGE deployment for a model id.
 //
@@ -1861,6 +1865,8 @@ async function tryZenStage(
           }),
           { status: 422, headers: { "content-type": "application/json" } },
         ),
+        // refused locally, before any egress: no relay carried it
+        relay: "",
         verdict: null,
       };
     }
@@ -1936,6 +1942,10 @@ async function tryZenStage(
     };
   }
 
+  // Which relay carried the stage request. Captured HERE, on the response
+  // relayFetch handed back, because everything below may re-wrap it.
+  const stageRelay = servedBy(res, "");
+
   // The answer is converted back to what the caller asked for, the same way
   // the production path does it.
   const forcedStream = !sanitizedBody.stream && transformedBody.stream === true;
@@ -1958,7 +1968,7 @@ async function tryZenStage(
     upstream: stage.upstream.id,
     durationMs: Date.now() - requestStartedAt,
   });
-  return { answer: finalResponse, verdict: null };
+  return { answer: finalResponse, verdict: null, relay: stageRelay };
 }
 
 // Try the zen stage for a model whose production bucket is closed. The
@@ -2154,7 +2164,7 @@ async function runChatForward(
         relay,
       );
       if (stageTry.answer) {
-        return { response: stageTry.answer, model, upstream: zenStage.upstream, relay: "" };
+        return { response: stageTry.answer, model, upstream: zenStage.upstream, relay: stageTry.relay };
       }
       // The stage is spent for this id too. Keep its verdict: a 429 says
       // "wait for the refill" and carries the deadline, while the retirement
@@ -2174,7 +2184,7 @@ async function runChatForward(
         requestStartedAt,
       );
       if (mirrored) {
-        return { response: mirrored, model, upstream: zenMirror.upstream, relay: "" };
+        return { response: mirrored, model, upstream: zenMirror.upstream, relay: servedBy(mirrored, "") };
       }
     }
     // The stage refused with a verdict and the mirror had nothing. Answering
@@ -2315,7 +2325,7 @@ async function runChatForward(
           relay,
         );
         if (stageTry.answer) {
-          return { response: stageTry.answer, model: current, upstream: zenStage.upstream, relay: "" };
+          return { response: stageTry.answer, model: current, upstream: zenStage.upstream, relay: stageTry.relay };
         }
         // The stage is spent for this id as well. Its verdict is the freshest
         // one, so it replaces the park's own 429 when it carries a refill
@@ -2338,7 +2348,7 @@ async function runChatForward(
           requestStartedAt,
         );
         if (mirrored) {
-          return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: "" };
+          return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: servedBy(mirrored, "") };
         }
       }
       log.warn("model parked after a recent rate limit", {
@@ -2424,7 +2434,7 @@ async function runChatForward(
         relay,
       );
       if (stageTry.answer) {
-        return { response: stageTry.answer, model: current, upstream: zenStage.upstream, relay: "" };
+        return { response: stageTry.answer, model: current, upstream: zenStage.upstream, relay: stageTry.relay };
       }
       // The pre-walk stage attempt found the stage spent. Remember its verdict:
       // the production walk below is about to produce its own error, and the
@@ -2662,7 +2672,7 @@ async function runChatForward(
           relay,
         );
         if (stageTry.answer) {
-          return { response: stageTry.answer, model: current, upstream: zenStage.upstream, relay: "" };
+          return { response: stageTry.answer, model: current, upstream: zenStage.upstream, relay: stageTry.relay };
         }
         // The stage refused too. Its verdict is the freshest one about this
         // id: a 429 there means "wait for the refill", while production's 400
@@ -2687,7 +2697,7 @@ async function runChatForward(
           requestStartedAt,
         );
         if (mirrored) {
-          return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: "" };
+          return { response: mirrored, model: current, upstream: zenMirror.upstream, relay: servedBy(mirrored, "") };
         }
       }
 
