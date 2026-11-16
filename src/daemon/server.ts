@@ -3167,12 +3167,21 @@ async function handleResponses(
       upstream: currentUpstream.id,
       relay: result.relay,
       ...(client ? { client } : {}),
-      inputTokens: streamUsage.inputTokens,
-      outputTokens: streamUsage.outputTokens,
-      cachedTokens: streamUsage.cachedTokens ?? 0,
+      inputTokens: 0,
+      outputTokens: 0,
       durationMs: Date.now() - requestStartedAt,
-      status: "ok",
-      ...(current.id !== resolved.id ? { failoverFrom: resolved.id } : {}),
+      status: "error",
+      statusCode: 502,
+    });
+  } else if (!signal.aborted) {
+    recordCompletion(activity, log, "responses", "responses done", {
+      model: current.id,
+      requestedModel: resolved.id,
+      upstream: currentUpstream.id,
+      relay: result.relay,
+      usage: streamUsage,
+      startedAt: requestStartedAt,
+      client,
     });
   }
   res.end();
@@ -3340,12 +3349,21 @@ async function handleAnthropic(
       upstream: currentUpstream.id,
       relay: result.relay,
       ...(client ? { client } : {}),
-      inputTokens: streamUsage.inputTokens,
-      outputTokens: streamUsage.outputTokens,
-      cachedTokens: streamUsage.cachedTokens ?? 0,
+      inputTokens: 0,
+      outputTokens: 0,
       durationMs: Date.now() - requestStartedAt,
-      status: "ok",
-      ...(current.id !== model.id ? { failoverFrom: model.id } : {}),
+      status: "error",
+      statusCode: 502,
+    });
+  } else if (!signal.aborted) {
+    recordCompletion(activity, log, "anthropic", "anthropic done", {
+      model: current.id,
+      requestedModel: model.id,
+      upstream: currentUpstream.id,
+      relay: result.relay,
+      usage: streamUsage,
+      startedAt: requestStartedAt,
+      client,
     });
   }
   res.end();
@@ -3610,7 +3628,6 @@ export function createServer(opts: ServerOptions): http.Server {
     }
 
     if (method === "GET" && url === "/bansos/usage") {
-      activity.checkDiskFreshness(); // bansos-opt3: the CLI may have written the file
       const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
       const window = (parsedUrl.searchParams.get("window") || "all") as import("./activity").TimeWindow;
       sendJson(res, 200, activity.getUsage(window));
@@ -3618,7 +3635,6 @@ export function createServer(opts: ServerOptions): http.Server {
     }
 
     if (method === "GET" && url === "/bansos/events") {
-      activity.checkDiskFreshness(); // bansos-opt3: the CLI may have written the file
       const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
       const limitParam = Number(parsedUrl.searchParams.get("limit"));
       const window = (parsedUrl.searchParams.get("window") || "all") as import("./activity").TimeWindow;

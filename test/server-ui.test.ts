@@ -290,6 +290,31 @@ test("render writes only the picked models and upstreams, and refuses bad picks"
   }
 });
 
+// the dashboard polls these two every 15s; a store method that does not exist
+// here throws inside the request handler and takes the whole daemon down with it
+// (2026-11-16: the 0.6.2 activity-store rewrite left two stale calls behind).
+test("GET /bansos/usage and /bansos/events answer for the dashboard poll", async () => {
+  const { baseUrl, close } = await setupTestServer();
+  try {
+    const usage = await fetch(`${baseUrl}/bansos/usage`);
+    assert.equal(usage.status, 200);
+    const usageBody = (await usage.json()) as { totalRequests: number; perModel: Record<string, unknown> };
+    assert.equal(typeof usageBody.totalRequests, "number");
+    assert.equal(typeof usageBody.perModel, "object");
+
+    const events = await fetch(`${baseUrl}/bansos/events?limit=50&window=today`);
+    assert.equal(events.status, 200);
+    const eventsBody = (await events.json()) as { events: unknown[] };
+    assert.ok(Array.isArray(eventsBody.events));
+
+    // the daemon must still be alive after both polls
+    const health = await fetch(`${baseUrl}/healthz`);
+    assert.equal(health.status, 200);
+  } finally {
+    await close();
+  }
+});
+
 // the dashboard polls status every 5s, so the update field comes from the 24h cache, never a live registry call
 test("GET /bansos/status reports a cached update and NO_UPDATE_NOTIFIER hides it", async (t) => {
   const cacheFile = path.join(BANSOS_DIR, "update-check.json");

@@ -248,7 +248,7 @@ test("a stream that never reports usage leaves the booking open for the caller",
   const source = Readable.from([Buffer.from('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n')]);
   const sink = new Transform({ transform: (c, _e, cb) => cb(null, c) });
   await new Promise<void>((resolve, reject) => {
-    source.pipe(logUsageTransform("m", "zen", log, Date.now(), undefined, undefined, "chat", undefined, booked)).pipe(sink);
+    source.pipe(logUsageTransform("m", "zen", log, Date.now(), undefined, undefined, "chat", undefined, undefined, booked)).pipe(sink);
     sink.on("error", reject);
     sink.on("finish", resolve);
   });

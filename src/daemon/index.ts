@@ -512,7 +512,7 @@ async function main(argv: string[]): Promise<void> {
     if (!current) process.exit(0);
     shutdownServer(current.server, SHUTDOWN_GRACE_MS, () => {
       try {
-        activity.flushToDisk();
+        activity.flush();
       } catch {
         // durable appends already landed; a failed fsync must not block exit
       }
