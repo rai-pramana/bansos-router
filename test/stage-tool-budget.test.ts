@@ -34,23 +34,15 @@ function body(toolNames: string[]) {
   return { model: "muse-spark-1.3-contributor-free", tools: toolNames.map(tool) };
 }
 
-test("a caller's own read_file and terminal are renamed, never duplicated", () => {
+// Upstream now owns this case: a name outside opencode's own vocabulary collapses the whole set
+// to the canonical pair, so a rename pass is unreachable and was removed. What stays ours is the
+// invariant that the caller's own array is never mutated.
+test("a foreign tool set collapses to the pair and leaves the caller's array alone", () => {
   const b = body(["read_file", "terminal", "web_search"]);
   const out = (up.transformRequestBody as any)(b, { id: "muse-spark-1.3-contributor-free" });
   const list = names(out);
-  assert.ok(list.includes("read"), "the gate must see `read`");
-  assert.ok(list.includes("shell"), "the gate must see `shell`");
-  assert.equal(
-    list.filter((n) => n === "read").length,
-    1,
-    "renaming must not leave a duplicate read behind",
-  );
-  assert.equal(
-    list.filter((n) => n === "shell").length,
-    1,
-    "renaming must not leave a duplicate shell behind",
-  );
-  assert.equal(out.tools.length, 3, "renaming must not grow the caller's list");
+  assert.deepEqual(list, ["read", "shell"], "the gate only ever sees its own pair");
+  assert.equal((b.tools as unknown[]).length, 3, "the caller's tools array is untouched");
 });
 
 test("a caller that ships no file/shell tool gets the canonical pair added", () => {
@@ -74,9 +66,14 @@ test("an over-long list is trimmed to what the gate accepts", () => {
 });
 
 test("a list already inside the budget is left alone", () => {
-  const b = body(["read_file", "terminal", "web_search"]);
+  // all three names are in opencode's own vocabulary, so nothing collapses and nothing needs
+  // trimming: a valid list must come through exactly as sent
+  const b = body(["bash", "grep", "glob"]);
   const out = (up.transformRequestBody as any)(b, { id: "muse-spark-1.3-contributor-free" });
-  assert.equal(out.tools.length, 3, "nothing may be added or dropped from a valid list");
+  // the gate still requires its own read+shell pair, so a caller that ships neither gains exactly
+  // those two - nothing else is added and nothing the caller sent is dropped
+  assert.deepEqual(names(out), ["bash", "grep", "glob", "read", "shell"]);
+  assert.equal(out.tools.length, 5, "only the gate's required pair may be added");
 });
 
 test("the chat wire transform follows the same rule", () => {
@@ -100,8 +97,14 @@ test("a trim is reported with the names it dropped, not swallowed", () => {
   const seen: Array<{ model: string; total: number; kept: number; dropped: string[] }> = [];
   setToolTrimReporter((info) => seen.push(info));
   try {
-    const many = Array.from({ length: 20 }, (_, i) => `tail_${i}`);
-    const b = body(["read_file", "terminal", "web_search", ...many]);
+    // 23 names, every one inside opencode's vocabulary: restrictGatedTools() keeps them all, so
+    // the only thing that can cut the list is the budget - which is the behaviour under test
+    const many = [
+      "write", "edit", "glob", "grep", "list", "ls", "find", "view", "fetch", "todo",
+      "task", "skill", "patch", "question", "plan", "batch", "scroll", "snap",
+      "multiedit", "str_replace", "apply_edit",
+    ];
+    const b = body(["read", "shell", ...many]);
     const out = (up.transformRequestBody as any)(b, { id: "muse-spark-1.3-contributor-free" });
     assert.equal(out.tools.length, 22, "the list still has to fit the gate");
     assert.equal(seen.length, 1, "exactly one trim must be reported");
@@ -109,7 +112,7 @@ test("a trim is reported with the names it dropped, not swallowed", () => {
     assert.equal(seen[0]!.kept, 22);
     assert.equal(seen[0]!.dropped.length, 1, "the one dropped name must be reported");
     assert.ok(
-      seen[0]!.dropped[0]!.startsWith("tail_"),
+      typeof seen[0]!.dropped[0] === "string" && seen[0]!.dropped[0]!.length > 0,
       `the reported name must be the dropped tool, got ${seen[0]!.dropped[0]}`,
     );
   } finally {

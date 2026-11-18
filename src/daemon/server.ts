@@ -253,34 +253,6 @@ const API_EXACT_PATHS = new Set([
   "/v1/models/",
 ]);
 
-export function detectHarness(req: http.IncomingMessage, kind: ActivityKind): string {
-  const ua = (req.headers["user-agent"] || "").toLowerCase();
-
-  if (ua.includes("oh-my-pi") || ua.includes("omp/") || ua.includes("omp ") || ua === "omp") {
-    return "omp";
-  }
-  if (ua.startsWith("pi/") || ua.includes("pi/") || ua.includes("pi-coding-agent") || ua.includes("pi-bansos")) {
-    return "pi";
-  }
-  if (ua.includes("claude-code") || ua.includes("claude_code") || ua.includes("claude-cli") || ua.includes("anthropic")) {
-    return "claude-code";
-  }
-  if (ua.includes("opencode")) return "opencode";
-  if (ua.includes("aider")) return "aider";
-  if (ua.includes("codex")) return "codex";
-  if (ua.includes("goose")) return "goose";
-  if (ua.includes("cline")) return "cline";
-  if (ua.includes("roo")) return "roo";
-  if (ua.includes("continue")) return "continue";
-  if (ua.includes("hermes")) return "hermes";
-  if (ua.includes("jcode")) return "jcode";
-  if (ua.includes("openclaw")) return "openclaw";
-  if (ua.includes("curl")) return "curl";
-  if (kind === "anthropic") return "claude-code";
-  if (kind === "responses") return "codex";
-  return "pi";
-}
-
 function isAllowedInboundPath(pathname: string): boolean {
   if (STATIC_ROOT_FILES.has(pathname) || API_EXACT_PATHS.has(pathname)) {
     return true;
@@ -321,6 +293,44 @@ interface CorsAwareResponse extends http.ServerResponse {
 function corsFor(res: http.ServerResponse): Record<string, string> {
   return (res as CorsAwareResponse).bansosCors ?? {};
 }
+// a harness names itself here when its UA is a gateway's or a browser's; the dashboard's own probes do
+const CLIENT_HEADER = "x-bansos-client";
+
+export function detectHarness(req: http.IncomingMessage): string {
+  const claimed = String(req.headers[CLIENT_HEADER] ?? "").trim().toLowerCase();
+  if (/^[a-z0-9][a-z0-9._/-]{0,31}$/.test(claimed)) return claimed;
+
+  const ua = (req.headers["user-agent"] || "").toLowerCase();
+
+  if (ua.includes("oh-my-pi") || ua.includes("omp/") || ua.includes("omp ") || ua === "omp") {
+    return "omp";
+  }
+  if (ua.startsWith("pi/") || ua.includes("pi/") || ua.includes("pi-coding-agent") || ua.includes("pi-bansos")) {
+    return "pi";
+  }
+  if (ua.includes("claude-code") || ua.includes("claude_code") || ua.includes("claude-cli") || ua.includes("anthropic")) {
+    return "claude-code";
+  }
+  if (ua.includes("opencode")) return "opencode";
+  if (ua.includes("aider")) return "aider";
+  if (ua.includes("codex")) return "codex";
+  if (ua.includes("goose")) return "goose";
+  if (ua.includes("cline")) return "cline";
+  if (ua.includes("roo")) return "roo";
+  if (ua.includes("continue")) return "continue";
+  if (ua.includes("hermes")) return "hermes";
+  if (ua.includes("jcode")) return "jcode";
+  if (ua.includes("openclaw")) return "openclaw";
+  if (ua.includes("deepseek") || ua.includes("dsh/")) return "dsh";
+  if (ua.includes("9router")) return "9router";
+  if (ua.includes("litellm")) return "litellm";
+  if (ua.includes("curl")) return "curl";
+  // a browser, undici or a bare node UA is a gateway or a script: naming it pi would be a lie
+  return "gateway";
+}
+
+// the zen gate words its tool-set refusal as a free-tier quota message
+const GATE_TOOLSET_RE = /free usage limit/i;
 
 // DNS-rebinding guard: loopback clients must present a loopback Host
 let ownAddresses: Set<string> | null = null;
@@ -2551,6 +2561,32 @@ async function runChatForward(
       continue;
     }
 
+    // a gateway gate 429s a tool vocabulary it does not recognise, not the turn: resend once in its own words
+    if (upstreamRes.status === 429 && currentUpstream.retryShape) {
+      const peek = await upstreamRes.clone().text();
+      if (GATE_TOOLSET_RE.test(peek)) {
+        const shaped = currentUpstream.retryShape(transformedBody, current);
+        if (shaped) {
+          log.warn("upstream rejected the tool set, retrying with its own vocabulary", {
+            model: current.id,
+            upstream: currentUpstream.id,
+            status: 429,
+          });
+          try {
+            upstreamRes = await relayFetch(relay, outboundUrl, {
+              method: "POST",
+              headers,
+              body: JSON.stringify(responsesWire ? chatToResponsesBody(shaped, current.id) : shaped),
+              duplex: "half",
+              signal,
+            }, isRelayAllowed(security));
+          } catch {
+            upstreamRes = new Response(null, { status: 502 });
+          }
+        }
+      }
+    }
+
     if (upstreamRes.status >= 400) {
       const text = await upstreamRes.text();
       let errorMsg = `upstream returned HTTP ${upstreamRes.status}`;
@@ -2829,7 +2865,7 @@ async function handleChat(
   security: SecurityConfig,
   signal: AbortSignal,
 ): Promise<void> {
-  const client = detectHarness(req, "chat");
+  const client = detectHarness(req);
   let bodyText: string;
   try {
     bodyText = await readBody(req);
@@ -3032,7 +3068,7 @@ async function handleResponses(
   security: SecurityConfig,
   signal: AbortSignal,
 ): Promise<void> {
-  const client = detectHarness(req, "responses");
+  const client = detectHarness(req);
   let bodyText: string;
   try {
     bodyText = await readBody(req);
@@ -3248,7 +3284,7 @@ async function handleAnthropic(
   security: SecurityConfig,
   signal: AbortSignal,
 ): Promise<void> {
-  const client = detectHarness(req, "anthropic");
+  const client = detectHarness(req);
   let bodyText: string;
   try {
     bodyText = await readBody(req);

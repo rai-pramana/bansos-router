@@ -16,6 +16,8 @@ export interface ConfigWrite {
   markers?: [string, string];
   // for toml-block: the table name the block defines (e.g. "providers.bansos")
   tomlTable?: string;
+  // for toml-block: keep values the user already set instead of replacing them
+  fillOnly?: boolean;
   // for yaml-block: the top-level key the block nests under (e.g. "providers")
   yamlParent?: string;
   // for merge: dotted paths replaced wholesale so a rerun drops models that left the catalog
@@ -33,6 +35,10 @@ export interface HarnessAdapter {
   // pure render; file writing happens in the cli (milestone M2)
   render(ctx: SetupContext): ConfigWrite[];
   undo(ctx: SetupContext): string[]; // paths that would be touched
+  // harnesses that rewrite their config and drop comments need their own "is it set up" test
+  detect?(content: string): boolean;
+  // same reason: cleanup that does not depend on the markers being still there
+  undoContent?(content: string): string;
   // for merge-mode writes: dotted keys that --undo removes
   undoKeys?: string[];
 }

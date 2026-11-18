@@ -2,8 +2,8 @@
 
 > Companion to `architecture.md`. Details the keyless free upstreams, the
 > curated model catalog, health checking, rate-limit handling, and the relay
-> egress design (patterns carried over from `pi-bansos`; local-gateway
-> chaining and ban-risk hygiene informed by `freebuff-proxy`).
+> egress design (patterns carried over from `pi-bansos`; ban-risk hygiene
+> informed by `freebuff-proxy`, which this project deliberately does not adopt).
 
 ## 1. Design goals for the upstream layer
 
@@ -17,9 +17,13 @@
 - **Upstream taxonomy**: two kinds:
   - *remote keyless* (Zen, Kilo, LLM7, OVH): zero credentials; spoofed headers
     where needed; relay egress allowed (OVH: direct only).
-  - *local token gateways* (freebuff-proxy, LiteLLM, 9router, ollama):
-    **roadmap (M5)**: opt-in, chained at `127.0.0.1:<port>`; may carry a
-    token; relay egress **off**.
+  - *local gateways* a user already runs (LiteLLM, 9router, ollama, …):
+    reached through `localUpstreams` in `~/.bansos/config.json`, at
+    `127.0.0.1:<port>`, token or not; relay egress **off**. They never join the
+    default set: that is keyless only, and a source needing an account
+    (FreeBuff through `freebuff-proxy`, OpenRouter `:free`) is not a target.
+    The catalog for a local gateway is not implemented yet, so it serves no
+    models until it is.
 
 ### 1.1 Dynamic catalog & pinned fallback
 
@@ -53,7 +57,7 @@ The catalog is **live-first with a pinned fallback**:
 | Spoofed headers | `User-Agent: opencode/latest/2.1.3/cli`, `authorization: Bearer public`, `x-opencode-client: cli`, `x-opencode-project: <hex40>`, `x-opencode-session: <session_id>`, `x-session-affinity: <session_id>`, `b3`, `traceparent` |
 | Model source | models.dev free models (`cost.input === 0`, not deprecated) intersected with live `GET /v1/models`, plus the pinned seed (`src/upstreams/zen.ts`); seeded ids missing from the live list, or marked paid or deprecated by models.dev, are probed keyless and dropped if the probe fails. A non-seeded id models.dev marks paid never enters, and a seeded one stays only while it still answers without a key, so the catalog cannot leak paid models |
 | Rate limit | Unpublished; treated as best-effort |
-| Gateway quirk | The free-tier gate requires `stream: true`, the presence of core tools (`read` + `shell`), an `<env>` block in the system prompt, and Cloudflare JA4 TLS fingerprint matching BoringSSL. The daemon auto-spawns the local OpenCode background service (`opencode serve --service`) if installed to reuse live session affinity. When neither OpenCode nor Bun is available, requests auto-failover to Kilo/LLM7/OVH. |
+| Gateway quirk | The free-tier gate requires `stream: true`, the presence of core tools (`read` + `shell`), a tool vocabulary it recognises (see §2.1.1: any foreign tool name *or* description answers `429`), an `<env>` block in the system prompt, and Cloudflare JA4 TLS fingerprint matching BoringSSL. The daemon auto-spawns the local OpenCode background service (`opencode serve --service`) if installed to reuse live session affinity. When neither OpenCode nor Bun is available, requests auto-failover to Kilo/LLM7/OVH. |
 
 #### 2.1.1 Consequences of the injected tools
 
@@ -103,6 +107,17 @@ looks for the caller's equivalent and re-emits the call under that name:
 - a caller's own `edit` without opencode's `filePath` argument is advertised
   as `apply_edit`, because the gate answers `429` to a bare `edit`, and bridged
   back to the caller's `edit` with identical arguments;
+- a caller that declares any tool outside opencode's vocabulary (`read`, `write`,
+  `edit`, `bash`, `shell`, `glob`, `grep`, `list`, `webfetch`, `todowrite`,
+  `task`, `batch`, `patch`, `skill`, …) gets the fingerprint pair only: the gate
+  answers `429` to every foreign tool name and description, so dsh's 23 tools
+  (`create_goal`, `job_kill`, `workflow`, …) never reach it and the bridge maps
+  its `shell` call back onto the caller's `bash`;
+- the vocabulary list is a guess about what the gate tolerates, so a `429`
+  whose body reads `free usage limit` re-sends that single turn once with the
+  fingerprint pair (`Upstream.retryShape`) when the tools were not narrowed
+  already, so the upstream decides, not the list; an exhausted daily quota
+  still fails after that one retry;
 - a caller's own `read`/`shell` is never bridged;
 - required description-style fields (`i` in OMP, `intent`, `description`,
   `reason`) are filled with a short "Run …"/"Read …" line; any other required
@@ -168,24 +183,6 @@ forwarded byte-for-byte.
 | Routing | Direct only (`relayAllowed: false`) |
 | Ids | Served as `ovh/<id>`; `transformRequestBody` strips the prefix. The prefix keeps OVH ids apart from look-alikes such as LLM7's `mistral-Nemo-Instruct-2407` |
 | Quirk | Chat wire only: OVH's `/v1/responses` rejects array `input` with 422, so Codex traffic is translated to chat like any other chat model. `reasoning_effort` and tool calls verified on gpt-oss and Qwen (2026-10-16); `supportsReasoningEffort` stays `false` like every other source so failover can pair OVH with Zen/Kilo models |
-
-### 2.5 Future (roadmap: out of v1 scope)
-
-v1 ships **keyless upstreams only**. These land later:
-
-- **FreeBuff: via `freebuff-proxy` (token-based local gateway)**. `freebuff-proxy`
-  (Go, MIT) exposes FreeBuff/Codebuff CLI models through OpenAI, Anthropic, and
-  Responses wires at `http://127.0.0.1:3457/v1`. Chaining it as a *local
-  upstream* is designed but deferred: it needs a `cb_...` token, has **high
-  ban risk** (ToS conflict), and requires relay egress **off** (its own docs
-  warn against VPN/hosting egress). Design rules are captured in
-  `docs/architecture.md` §7.7 + this section's history; implementation lands
-  with `localUpstreams: [{ name, baseUrl, apiKey? }]` in `~/.bansos/config.json`.
-- **OpenRouter `:free`** models (20 req/min, 200 req/day per model: needs no
-  key for some models, else optional key)
-- **Routeway `:free`**, DashScope free tokens
-- Each new upstream must declare: base URL, auth mode, catalog source, rate
-  limits, and `compat` flags (see `docs/protocols.md` §5).
 
 ## 3. Catalog format
 
@@ -370,10 +367,10 @@ x-relay-path:   /api/gateway/chat/completions
 - **Allowlist:** `ALLOWED_TARGETS` = known upstream origins only
   (`opencode.ai`, `api.kilo.ai`, `api.llm7.io`). Relay cannot be abused as an
   open proxy to arbitrary hosts.
-- **Local gateways bypass the relay (M5)**: chained local upstreams
-  (freebuff-proxy at `127.0.0.1:3457`, LiteLLM, 9router, ollama) will always
-  be reached directly. For FreeBuff this is mandatory: relaying would route
-  through a hosting egress IP and trigger upstream abuse scoring.
+- **Local gateways bypass the relay**: chained local upstreams (LiteLLM,
+  9router, ollama, …) are always reached directly, never through the relay:
+  they sit on loopback, and their own abuse scoring thinks in terms of the
+  caller's IP.
 - Fallback: if the relay itself errors (unreachable, timeout, 5xx), egress
   silently falls back to direct so requests keep working. There is **no
   strict relay-only mode yet**; when the relay is flaky, traffic may leave

@@ -1,8 +1,8 @@
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { ADAPTERS, buildSetupContext, findAdapter } from "../adapters";
-import type { HarnessAdapter, SetupContext } from "../adapters/types";
+import { ADAPTERS, buildSetupContext, findAdapter, dshMergeProviders } from "../adapters";
+import type { HarnessAdapter, SetupContext, ConfigWrite } from "../adapters/types";
+import { END_MARKER } from "../adapters/types";
 import { effectiveBind, effectivePort } from "../daemon/state";
 import { SEEDED_MODELS } from "../upstreams";
 import { modelDef, type ModelDef } from "../upstreams/types";
@@ -43,6 +43,23 @@ function parseArgs(argv: string[]): SetupArgs {
     else args.harnesses.push(a);
   }
   return args;
+}
+
+// first default_provider inside [provider]; jcode ignores it at root scope
+function readProviderDefault(file: string): string | undefined {
+  if (!fs.existsSync(file)) return undefined;
+  let inProvider = false;
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    const header = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (header) {
+      inProvider = header[1] === "provider";
+      continue;
+    }
+    if (!inProvider) continue;
+    const match = /^\s*default_provider\s*=\s*"([^"]*)"/.exec(line);
+    if (match) return match[1];
+  }
+  return undefined;
 }
 
 function resolveTargetFile(adapter: HarnessAdapter, defaultPath: string): string {
@@ -110,30 +127,18 @@ function update9RouterSqlite(dbPath: string, ctx: SetupContext): boolean {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sqliteMod = (globalThis as any).process?.getBuiltinModule?.("node:sqlite");
-    if (sqliteMod?.DatabaseSync) {
-      const db = new sqliteMod.DatabaseSync(dbPath);
-      db.prepare(
-        "INSERT OR REPLACE INTO providerNodes(id, type, name, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)",
-      ).run(nodeId, "openai-compatible", "Bansos Router", nodeData, now, now);
+    if (!sqliteMod?.DatabaseSync) return false;
+    const db = new sqliteMod.DatabaseSync(dbPath);
+    db.prepare(
+      "INSERT OR REPLACE INTO providerNodes(id, type, name, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?)",
+    ).run(nodeId, "openai-compatible", "Bansos Router", nodeData, now, now);
 
-      db.prepare(
-        "INSERT OR REPLACE INTO providerConnections(id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(connId, nodeId, "api_key", "Bansos Router", null, 1, 1, connData, now, now);
+    db.prepare(
+      "INSERT OR REPLACE INTO providerConnections(id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(connId, nodeId, "api_key", "Bansos Router", null, 1, 1, connData, now, now);
 
-      db.close();
-      return true;
-    }
-  } catch {
-    // fall through to the sqlite3 CLI
-  }
-
-  try {
-    const sql = [
-      `INSERT OR REPLACE INTO providerNodes(id, type, name, data, createdAt, updatedAt) VALUES('${nodeId}', 'openai-compatible', 'Bansos Router', '${nodeData.replace(/'/g, "''")}', '${now}', '${now}');`,
-      `INSERT OR REPLACE INTO providerConnections(id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt) VALUES('${connId}', '${nodeId}', 'api_key', 'Bansos Router', NULL, 1, 1, '${connData.replace(/'/g, "''")}', '${now}', '${now}');`,
-    ].join("\n");
-    const res = spawnSync("sqlite3", [dbPath, sql], { encoding: "utf8" });
-    return res.status === 0;
+    db.close();
+    return true;
   } catch {
     return false;
   }
@@ -145,24 +150,12 @@ function undo9RouterSqlite(dbPath: string): boolean {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sqliteMod = (globalThis as any).process?.getBuiltinModule?.("node:sqlite");
-    if (sqliteMod?.DatabaseSync) {
-      const db = new sqliteMod.DatabaseSync(dbPath);
-      db.prepare("DELETE FROM providerNodes WHERE id = ?").run(nodeId);
-      db.prepare("DELETE FROM providerConnections WHERE id = ?").run(connId);
-      db.close();
-      return true;
-    }
-  } catch {
-    // fall through to the sqlite3 CLI
-  }
-
-  try {
-    const sql = [
-      `DELETE FROM providerNodes WHERE id = '${nodeId}';`,
-      `DELETE FROM providerConnections WHERE id = '${connId}';`,
-    ].join("\n");
-    const res = spawnSync("sqlite3", [dbPath, sql], { encoding: "utf8" });
-    return res.status === 0;
+    if (!sqliteMod?.DatabaseSync) return false;
+    const db = new sqliteMod.DatabaseSync(dbPath);
+    db.prepare("DELETE FROM providerNodes WHERE id = ?").run(nodeId);
+    db.prepare("DELETE FROM providerConnections WHERE id = ?").run(connId);
+    db.close();
+    return true;
   } catch {
     return false;
   }
@@ -179,7 +172,69 @@ function printSetupLine(line: SetupLine): void {
   else console.log(out);
 }
 
+// dsh keeps one llm-pi-ai entry per profile, so the provider is spliced into it instead of appended
+function applyDeepseek(adapter: HarnessAdapter, ctx: SetupContext, report: SetupReport): number {
+  let failures = 0;
+  for (const write of adapter.render(ctx)) {
+    failures += applyDeepseekProfile(write, ctx, report);
+  }
+  return failures;
+}
+
+function applyDeepseekProfile(write: ConfigWrite, ctx: SetupContext, report: SetupReport): number {
+  // dsh has one real path per profile: never redirect a profile write elsewhere
+  const targetPath = write.path;
+  const fullPath = expandHome(targetPath);
+  const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, "utf8") : null;
+  const stripped = existing ? removeBlock(existing, write.markers!) : "";
+
+  if (targetPath.endsWith(".env")) {
+    writeConfig(targetPath, applyBlockWrite(stripped, write.content, write.markers!));
+    report({ kind: "ok", text: `wrote ${targetPath} (BANSOS_API_KEY, any value: the router checks none)` });
+    return 0;
+  }
+
+  const merge = dshMergeProviders(stripped, ctx);
+
+  if (merge.status === "merged") {
+    writeConfig(targetPath, dshEnsureDefaultModel(merge.content, ctx));
+    report({ kind: "ok", text: `wrote ${targetPath} (bansos provider inside the existing llm-pi-ai entry)` });
+    return 0;
+  }
+  if (merge.status === "present") {
+    report({ kind: "skip", text: `${targetPath}: llm-pi-ai already serves a bansos provider` });
+    return 0;
+  }
+  if (merge.status === "manual") {
+    report({ kind: "error", text: `${targetPath}: llm-pi-ai providers are not a block mapping, add the bansos provider by hand` });
+    report({ kind: "error", text: `bansos setup dsh --dry-run prints the block to paste` });
+    return 1;
+  }
+
+  writeConfig(targetPath, dshEnsureDefaultModel(applyBlockWrite(stripped, write.content, write.markers!), ctx));
+  report({ kind: "ok", text: `wrote ${targetPath}` });
+  return 0;
+}
+
+// without this entry dsh keeps answering from deepseek-official, which needs a key the user may not have
+export function dshEnsureDefaultModel(content: string, ctx: SetupContext): string {
+  if (/^\s*-\s*id:\s*['"]?agent-default-model['"]?\s*$/m.test(content)) return content;
+  const entry = ["- id: agent-default-model", "  config:", "    provider: bansos", `    model: ${ctx.defaultModel}`];
+  const lines = content.split("\n");
+  const end = lines.findIndex((l) => l.trim() === `# ${END_MARKER}`);
+  if (end === -1) return `${content.replace(/\n*$/, "\n")}${entry.join("\n")}\n`;
+  lines.splice(end, 0, ...entry);
+  return lines.join("\n");
+}
+
+const CONTINUE_HEADER = "name: bansos-router\nversion: 0.0.1\nschema: v1\n";
+
 export function applyAdapter(adapter: HarnessAdapter, ctx: SetupContext, report: SetupReport = printSetupLine): number {
+  if (adapter.id === "dsh") return applyDeepseek(adapter, ctx, report);
+  if (adapter.id === "continue") return applyContinue(adapter, ctx, report);
+  // setup never overwrites a provider the user already selected, so say what stayed
+  const keptDefault =
+    adapter.id === "jcode" ? readProviderDefault(expandHome(adapter.configPaths[0]!)) : undefined;
   let failed = 0;
   for (const write of adapter.render(ctx)) {
     const targetPath = resolveTargetFile(adapter, write.path);
@@ -197,7 +252,7 @@ export function applyAdapter(adapter: HarnessAdapter, ctx: SetupContext, report:
         continue;
       }
     } else if (write.mode === "toml-block") {
-      content = applyTomlBlockWrite(existing ?? "", write.content, write.markers!, write.tomlTable!);
+      content = applyTomlBlockWrite(existing ?? "", write.content, write.markers!, write.tomlTable!, write.fillOnly ?? false);
     } else if (write.mode === "yaml-block") {
       try {
         content = applyYamlBlockWrite(existing ?? "", write.content, write.markers!, write.yamlParent!);
@@ -213,14 +268,42 @@ export function applyAdapter(adapter: HarnessAdapter, ctx: SetupContext, report:
     report({ kind: "ok", text: `wrote ${targetPath}` });
   }
 
+  if (keptDefault && keptDefault !== "bansos") {
+    report({
+      kind: "skip",
+      text: `${adapter.configPaths[0]}: kept default_provider = "${keptDefault}"; pick bansos with /model`,
+    });
+  }
+
   if (adapter.id === "9router") {
     const sqlitePath = expandHome("~/.9router/db/data.sqlite");
-    if (fs.existsSync(sqlitePath) && update9RouterSqlite(sqlitePath, ctx)) {
-      report({ kind: "ok", text: "updated ~/.9router/db/data.sqlite" });
+    if (fs.existsSync(sqlitePath)) {
+      if (update9RouterSqlite(sqlitePath, ctx)) report({ kind: "ok", text: "updated ~/.9router/db/data.sqlite" });
+      else report({ kind: "error", text: "~/.9router/db/data.sqlite: needs node:sqlite (Node >= 22.5)" });
     }
   }
 
   return failed;
+}
+
+// a config.yaml without the header fails continue's schema check, so a fresh file gets one first
+function applyContinue(adapter: HarnessAdapter, ctx: SetupContext, report: SetupReport): number {
+  let failures = 0;
+  for (const write of adapter.render(ctx)) {
+    const targetPath = write.path;
+    const fullPath = expandHome(targetPath);
+    const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, "utf8") : "";
+    if (existing.trim() === "" && !fs.existsSync(fullPath)) report({ kind: "ok", text: `${targetPath}: created with a schema header` });
+    const seeded = existing.trim() === "" ? CONTINUE_HEADER : existing;
+    try {
+      writeConfig(targetPath, applyYamlBlockWrite(seeded, write.content, write.markers!, write.yamlParent!));
+      report({ kind: "ok", text: `wrote ${targetPath}` });
+    } catch (err) {
+      report({ kind: "error", text: `${targetPath}: ${(err as Error).message}` });
+      failures++;
+    }
+  }
+  return failures;
 }
 
 export function undoAdapter(adapter: HarnessAdapter, ctx: SetupContext, report: SetupReport = printSetupLine): void {
@@ -257,9 +340,11 @@ export function undoAdapter(adapter: HarnessAdapter, ctx: SetupContext, report: 
       const first = adapter.render(ctx)[0];
       const markers = first?.markers;
       if (markers) {
-        const out = first.mode === "toml-block" && writePath.endsWith(".toml")
+        const marked = first.mode === "toml-block" && writePath.endsWith(".toml")
           ? removeTomlBlock(existing, markers)
           : removeBlock(existing, markers);
+        // the harness may have rewritten the file without our comments
+        const out = marked === existing && adapter.undoContent ? adapter.undoContent(existing) : marked;
         if (out === existing) {
           report({ kind: "skip", text: `${writePath}: no bansos block found` });
         } else {
@@ -272,8 +357,9 @@ export function undoAdapter(adapter: HarnessAdapter, ctx: SetupContext, report: 
 
   if (adapter.id === "9router") {
     const sqlitePath = expandHome("~/.9router/db/data.sqlite");
-    if (fs.existsSync(sqlitePath) && undo9RouterSqlite(sqlitePath)) {
-      report({ kind: "removed", text: "~/.9router/db/data.sqlite: bansos keys removed" });
+    if (fs.existsSync(sqlitePath)) {
+      if (undo9RouterSqlite(sqlitePath)) report({ kind: "removed", text: "~/.9router/db/data.sqlite: bansos keys removed" });
+      else report({ kind: "error", text: "~/.9router/db/data.sqlite: needs node:sqlite (Node >= 22.5)" });
     }
   }
 }

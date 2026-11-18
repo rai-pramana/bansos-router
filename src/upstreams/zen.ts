@@ -363,31 +363,8 @@ function toolNameOf(tool: unknown): string {
 // under the names the gate expects, and only add the exact specs when the caller
 // ships neither - then the total never exceeds what the caller asked for, and
 // the gate still sees what it requires.
-const STAGE_READ_TARGETS = ["read_file", "readfile", "view", "file_read", "cat"];
-const STAGE_SHELL_TARGETS = ["terminal", "run_command", "exec_command", "bash", "exec"];
-
 // The most tools the gate was measured to accept, INCLUDING its own read+shell.
 const STAGE_TOOL_BUDGET = 22;
-
-function renameForGate(body: Record<string, unknown>, targets: string[], canonical: string): boolean {
-  if (!Array.isArray(body.tools)) return false;
-  const tools = body.tools as unknown[];
-  for (const tool of tools) {
-    if (!tool || typeof tool !== "object" || Array.isArray(tool)) continue;
-    const t = tool as Record<string, unknown>;
-    const name = toolNameOf(tool);
-    if (!targets.includes(name)) continue;
-    // The responses wire carries `name` at the top level; the chat wire nests it
-    // under `function`. Rename in place, whichever shape this request uses.
-    const fn = t.function && typeof t.function === "object" && !Array.isArray(t.function)
-      ? (t.function as Record<string, unknown>)
-      : null;
-    if (fn && typeof fn.name === "string") fn.name = canonical;
-    else t.name = canonical;
-    return true;
-  }
-  return false;
-}
 
 // Trim the caller's list down to the gate's budget, returning the names that
 // were dropped so the caller's lost capabilities can be reported.
@@ -453,17 +430,16 @@ function ensureChatFingerprintTools(body: Record<string, unknown>): void {
   }
 }
 
-// Rename first (never grow the list), then only add the canonical pair when the
-// caller genuinely ships no file/shell tool of its own.
-function prepareToolsForGate(body: Record<string, unknown>, responsesWire: boolean): void {
-  const renamedRead = renameForGate(body, STAGE_READ_TARGETS, "read");
-  const renamedShell = renameForGate(body, STAGE_SHELL_TARGETS, "shell");
-  if (!renamedRead || !renamedShell) {
-    // One or both are missing: the exact specs are added, then the budget trims
-    // whatever no longer fits. This is the only path that can grow the list.
-    if (responsesWire) ensureResponsesFingerprintTools(body);
-    else ensureChatFingerprintTools(body);
-  }
+// Enforce the gate's tool budget and REPORT what it removed.
+//
+// Renaming is gone: upstream's restrictGatedTools() now collapses any set that mentions a name
+// outside opencode's own vocabulary, so a renamed list is unreachable - the caller either speaks
+// the vocabulary (kept as sent) or gets the canonical pair. What upstream has no equivalent for is
+// the budget: the gate counts tools and refuses a long list with the SAME FreeUsageLimitError as a
+// spent bucket (measured 2026-11-01: read+shell+20 others answered 200 every call, one more tool
+// answered 429 every call). A trim keeps the request working but silently removes capabilities, so
+// every trim is reported.
+function prepareToolsForGate(body: Record<string, unknown>): void {
   const before = Array.isArray(body.tools) ? (body.tools as unknown[]).length : 0;
   const dropped = enforceToolBudget(body);
   if (dropped.length > 0 && toolTrimReporter) {
@@ -522,11 +498,11 @@ function transformOpencodeBody(
     delete body.max_tokens;
     delete body.max_completion_tokens;
     body.store = false;
-    prepareToolsForGate(body, true);
+    prepareToolsForGate(body);
     sanitizeResponsesItems(body);
     return { body, responsesPath: true };
   }
-  prepareToolsForGate(body, false);
+  prepareToolsForGate(body);
   return { body, responsesPath: false };
 }
 
@@ -584,11 +560,48 @@ function aliasCallerEditTool(body: Record<string, unknown>): void {
   }
 }
 
+// the gate answers 429 when the caller declares a tool outside OpenCode's own vocabulary, so those turns
+// advertise the fingerprint pair only and the tool bridge maps the calls onto the caller's real tools
+const OPENCODE_TOOL_NAMES = new Set([
+  "read", "write", "edit", "bash", "shell", "glob", "grep", "list", "ls", "find", "view", "fetch",
+  "webfetch", "web_fetch", "todo", "todowrite", "todoread", "task", "subagent", "skill", "batch",
+  "patch", "apply_patch", "multiedit", "str_replace", "question", "plan", "scroll", "snap", "apply_edit",
+]);
+
+// the pair every gated turn advertises: opencode's own read + shell
+function fingerprintTools(shape: "chat" | "responses"): unknown[] {
+  return OPENCODE_EXACT_TOOLS.map((t) =>
+    shape === "responses"
+      ? {
+          type: "function",
+          name: t.function.name,
+          description: t.function.description,
+          parameters: t.function.parameters,
+        }
+      : structuredClone(t),
+  );
+}
+
+function restrictGatedTools(
+  body: Record<string, unknown>,
+  shape: "chat" | "responses" = "chat",
+): void {
+  if (!Array.isArray(body.tools) || body.tools.length === 0) return;
+  const foreign = (body.tools as unknown[]).some((tool) => {
+    const name = toolNameOf(tool).toLowerCase();
+    return name !== "" && !OPENCODE_TOOL_NAMES.has(name);
+  });
+  if (!foreign) return;
+  body.tools = fingerprintTools(shape);
+}
+
 function transformOpencodeBodyChat(body: Record<string, unknown>): Record<string, unknown> {
   body.stream = true;
-  prepareToolsForGate(body, false);
+  ensureChatFingerprintTools(body);
+  prepareToolsForGate(body);
   aliasCallerEditTool(body);
   ensureOpencodeSystemPrompt(body);
+  restrictGatedTools(body);
   return body;
 }
 
@@ -603,9 +616,11 @@ function transformOpencodeBodyResponses(body: Record<string, unknown>): Record<s
   delete body.max_completion_tokens;
   body.store = false;
   body.stream = true;
-  prepareToolsForGate(body, true);
+  ensureResponsesFingerprintTools(body);
+  prepareToolsForGate(body);
   aliasCallerEditTool(body);
   sanitizeResponsesItems(body);
+  restrictGatedTools(body, "responses");
   return body;
 }
 
@@ -867,6 +882,15 @@ export const zenUpstream: Upstream = {
     callerHeaders?: Record<string, string | string[] | undefined>,
   ): Record<string, string> {
     return opencodeHeaders(callerHeaders);
+  },
+
+  // the gate answers 429 on a tool set it does not know, so the same turn goes out once more with the pair
+  retryShape(body: Record<string, unknown>, model: ModelDef): Record<string, unknown> | null {
+    if (!Array.isArray(body.tools) || body.tools.length === 0) return null;
+    const shape = model.wireApi === "responses" ? "responses" : "chat";
+    const tools = fingerprintTools(shape);
+    if (JSON.stringify(body.tools) === JSON.stringify(tools)) return null;
+    return { ...body, tools };
   },
 
   transformRequestBody(body: Record<string, unknown>, model: ModelDef): Record<string, unknown> {

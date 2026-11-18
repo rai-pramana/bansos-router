@@ -1,11 +1,19 @@
 {
   "name": "bansos-router",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Bansos for your AI agents. Free, keyless coding models routed to every coding harness through one local endpoint. No accounts, no keys, no cost.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ihsan-ramadhan/bansos-router.git"
+  },
+  "homepage": "https://github.com/ihsan-ramadhan/bansos-router#readme",
+  "bugs": {
+    "url": "https://github.com/ihsan-ramadhan/bansos-router/issues"
+  },
   "license": "GPL-3.0-only",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5"
   },
   "bin": {
     "bansos": "dist/cli/index.js",

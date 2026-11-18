@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { findAdapter } from "../src/adapters";
+import { findAdapter, dshMergeProviders } from "../src/adapters";
+import { dshEnsureDefaultModel } from "../src/cli/setup";
 import { applyMergeWrite, applyTomlBlockWrite, applyYamlBlockWrite, expandHome, parseJsonc, removeBlock, removeKeys, removeTomlBlock } from "../src/cli/write";
 import { SEEDED_MODELS } from "../src/upstreams";
 import { START_MARKER, END_MARKER } from "../src/adapters/types";
@@ -180,130 +181,208 @@ test("9router merge and undo preserve other providers in db.json", () => {
   assert.equal(parsedMerged.providerConnections[0].id, "kiro-1");
 });
 
-test("continue adapter populates models array and supports merge", () => {
+test("continue writes the config.yaml v1 reads, nested under models", () => {
   const adapter = findAdapter("continue")!;
-  assert.ok(adapter);
   assert.equal(adapter.id, "continue");
+  assert.deepEqual(adapter.configPaths, ["~/.continue/config.yaml", ".continue/config.yaml"]);
 
-  const existingConfig = JSON.stringify({
-    models: [
-      { title: "Existing Ollama", provider: "ollama", model: "llama3" },
-    ],
-  });
-
-  const writes = adapter.render({
+  const write = adapter.render({
     baseUrl: "http://127.0.0.1:17070/v1",
     defaultModel: "mimo-v2.6-flash-free",
     models: SEEDED_MODELS,
     specificModel: false,
+  })[0]!;
+
+  assert.equal(write.path, "~/.continue/config.yaml");
+  assert.equal(write.mode, "yaml-block");
+  assert.equal(write.yamlParent, "models");
+
+  const existing = ["name: Mine", "version: 0.0.1", "schema: v1", "", "models:", "  - name: Mine", "    provider: ollama", "    model: llama3", ""].join("\n");
+  const merged = applyYamlBlockWrite(existing, write.content, write.markers!, write.yamlParent!);
+
+  assert.match(merged, /^  - name: Bansos - /m);
+  assert.equal(merged.match(/^models:/gm)?.length, 1);
+  assert.match(merged, /^  - name: Mine$/m);
+  assert.match(merged, /apiBase: http:\/\/127\.0\.0\.1:17070\/v1/);
+  assert.match(merged, /roles: \[chat, edit, apply\]/);
+
+  // a file without models: gets the key, and a rerun replaces instead of piling up
+  const created = applyYamlBlockWrite("name: Mine\nversion: 0.0.1\nschema: v1\n", write.content, write.markers!, write.yamlParent!);
+  assert.match(created, /^models:$/m);
+  const twice = applyYamlBlockWrite(created, write.content, write.markers!, write.yamlParent!);
+  assert.equal(twice, created);
+  assert.equal(twice.match(/Bansos - /g)?.length, SEEDED_MODELS.length);
+});
+
+test("continue undo drops our models whether or not continue kept the comments", () => {
+  const adapter = findAdapter("continue")!;
+  const write = adapter.render({
+    baseUrl: "http://127.0.0.1:17070/v1",
+    defaultModel: "a",
+    models: SEEDED_MODELS.slice(0, 2),
+    specificModel: false,
+  })[0]!;
+
+  const merged = applyYamlBlockWrite("models:\n  - name: Mine\n    provider: ollama\n", write.content, write.markers!, write.yamlParent!);
+  const withComments = removeBlock(merged, write.markers!);
+  assert.doesNotMatch(withComments, /Bansos - /);
+  assert.match(withComments, /- name: Mine/);
+
+  const rewritten = merged.replace(/^\s*# bansos-router.*\n/gm, "");
+  assert.equal(adapter.detect!(merged), true);
+  assert.equal(adapter.detect!(rewritten), true, "detection survives continue stripping our comments");
+  assert.equal(adapter.detect!("models:\n  - name: Mine\n"), false);
+  const stripped = adapter.undoContent!(rewritten);
+  assert.doesNotMatch(stripped, /Bansos - /);
+  assert.match(stripped, /- name: Mine/);
+});
+
+test("cline writes the providers file its extension, CLI and SDK all read", () => {
+  const adapter = findAdapter("cline")!;
+  const write = adapter.render({
+    baseUrl: "http://127.0.0.1:17070/v1",
+    defaultModel: "mimo-v2.6-flash-free",
+    models: SEEDED_MODELS,
+    specificModel: true,
+  })[0]!;
+
+  assert.equal(write.path, "~/.cline/data/settings/providers.json");
+  assert.equal(write.mode, "merge");
+
+  const merged = JSON.parse(applyMergeWrite(JSON.stringify({ customSetting: true }), write.content, write.replace));
+  const provider = merged.providers["openai-compatible"];
+  assert.equal(merged.customSetting, true);
+  assert.equal(merged.lastUsedProvider, "openai-compatible");
+  assert.equal(provider.provider, "openai-compatible");
+  assert.equal(provider.baseUrl, "http://127.0.0.1:17070/v1");
+  assert.equal(provider.apiKey, "bansos");
+  assert.equal(provider.model, "mimo-v2.6-flash-free");
+});
+
+test("antigravity and roo have no adapter: neither CLI can take a custom endpoint", () => {
+  assert.equal(findAdapter("antigravity"), undefined);
+  assert.equal(findAdapter("roo"), undefined);
+});
+test("jcode writes the profile plus the [provider] default jcode actually reads", () => {
+  const adapter = findAdapter("jcode")!;
+  const writes = adapter.render({
+    baseUrl: "http://127.0.0.1:17070/v1",
+    defaultModel: "big-pickle",
+    models: SEEDED_MODELS,
+    specificModel: false,
   });
 
-  assert.equal(writes.length, 1);
-  assert.equal(writes[0]!.mode, "merge");
+  // one write per table: the merge writer can only patch a single table per block
+  assert.equal(writes.length, 2);
+  assert.equal(writes[0]!.tomlTable, "provider");
+  assert.equal(writes[1]!.tomlTable, "providers.bansos");
 
-  const merged = applyMergeWrite(existingConfig, writes[0]!.content);
-  const parsed = JSON.parse(merged);
-  assert.ok(parsed.models.length > 1);
-  assert.equal(parsed.models[0].title, "Existing Ollama");
-  assert.ok(parsed.models.some((m: any) => m.provider === "openai" && m.apiBase === "http://127.0.0.1:17070/v1"));
-});
-
-test("cline and roo adapters render valid openai-compatible configs and support merge", () => {
-  for (const id of ["cline", "roo"]) {
-    const adapter = findAdapter(id)!;
-    assert.ok(adapter, `findAdapter("${id}")`);
-
-    const writes = adapter.render({
-      baseUrl: "http://127.0.0.1:17070/v1",
-      defaultModel: "mimo-v2.6-flash-free",
-      models: SEEDED_MODELS,
-      specificModel: true,
-    });
-
-    assert.equal(writes.length, 1);
-    assert.equal(writes[0]!.mode, "merge");
-
-    const parsed = JSON.parse(writes[0]!.content);
-    assert.equal(parsed.apiProvider, "openai-compatible");
-    assert.equal(parsed.openAiBaseUrl, "http://127.0.0.1:17070/v1");
-    assert.equal(parsed.openAiApiKey, "bansos");
-    assert.equal(parsed.openAiModelId, "mimo-v2.6-flash-free");
-
-    const merged = applyMergeWrite(JSON.stringify({ customSetting: true }), writes[0]!.content);
-    const parsedMerged = JSON.parse(merged);
-    assert.equal(parsedMerged.customSetting, true);
-    assert.equal(parsedMerged.apiProvider, "openai-compatible");
-
-    removeKeys(parsedMerged, adapter.undoKeys!);
-    assert.equal(parsedMerged.customSetting, true);
-    assert.equal(parsedMerged.apiProvider, undefined);
-    assert.equal(parsedMerged.openAiBaseUrl, undefined);
+  let out = "";
+  for (const write of writes) {
+    out = applyTomlBlockWrite(out, write.content, write.markers!, write.tomlTable!, write.fillOnly ?? false);
   }
+
+  // root-level default_provider is ignored by jcode, so it has to sit in [provider]
+  assert.equal(out.split("\n").filter((l) => l.trim() === "[provider]").length, 1);
+  assert.equal(out.split("\n").filter((l) => l.trim() === "[providers.bansos]").length, 1);
+  const providerIdx = out.indexOf("[provider]");
+  const profileIdx = out.indexOf("[providers.bansos]");
+  const defaultIdx = out.indexOf('default_provider = "bansos"');
+  assert.ok(providerIdx !== -1 && providerIdx < defaultIdx && defaultIdx < profileIdx);
+  assert.match(out, /type = "openai-compatible"/);
+  assert.match(out, /base_url = "http:\/\/127\.0\.0\.1:17070\/v1"/);
+  // no env file, no key to look up
+  assert.match(out, /auth = "none"/);
+  assert.match(out, /requires_api_key = false/);
+  assert.match(out, /model_catalog = true/);
+  // jcode only builds picker routes for a non-active profile from models/default_model
+  assert.match(out, /default_model = "big-pickle"/);
+  assert.match(out, /models = \[\{ id = "[^"]+" \}/);
+  assert.equal(writes[0]!.fillOnly, true);
+  assert.equal(adapter.undo({ baseUrl: "", defaultModel: "", models: [] }).length, 1);
 });
 
-test("jcode toml-block patches existing [providers.openai-compatible] without duplicating tables", () => {
+test("jcode setup stays valid when it runs twice", () => {
+  const adapter = findAdapter("jcode")!;
+  const ctx = {
+    baseUrl: "http://127.0.0.1:17070/v1",
+    defaultModel: "big-pickle",
+    models: SEEDED_MODELS,
+    specificModel: false,
+  };
+
+  let out = "";
+  for (let run = 0; run < 3; run++) {
+    for (const write of adapter.render(ctx)) {
+      out = applyTomlBlockWrite(out, write.content, write.markers!, write.tomlTable!, write.fillOnly ?? false);
+    }
+  }
+
+  // a second [providers.bansos] table makes the whole config unparseable for jcode
+  assert.equal(out.split("\n").filter((l) => l.trim() === "[providers.bansos]").length, 1);
+  assert.equal(out.split("\n").filter((l) => l.trim() === "[provider]").length, 1);
+  assert.equal(out.split("\n").filter((l) => l.startsWith("models = ")).length, 1);
+  assert.equal(out.split("\n").filter((l) => l.startsWith("default_provider = ")).length, 1);
+});
+
+test("jcode is still detected and undoable after jcode rewrites the file without our comments", () => {
+  const adapter = findAdapter("jcode")!;
+  // jcode drops comments on every save: the block markers are gone, the values are not
+  const rewritten = [
+    "[provider]",
+    'default_provider = "bansos"',
+    'default_model = "big-pickle"',
+    "",
+    "[providers.bansos]",
+    'type = "openai-compatible"',
+    'base_url = "http://127.0.0.1:17070/v1"',
+    "",
+    "[keybindings]",
+    'scroll_up = "ctrl+shift+k"',
+    "",
+  ].join("\n");
+
+  assert.equal(adapter.detect!(rewritten), true);
+  assert.equal(adapter.detect!("[providers.deepseek]\n"), false);
+
+  const undone = adapter.undoContent!(rewritten);
+  assert.doesNotMatch(undone, /providers\.bansos/);
+  assert.doesNotMatch(undone, /default_provider/);
+  assert.doesNotMatch(undone, /default_model/);
+  assert.match(undone, /\[keybindings\]/);
+  assert.match(undone, /scroll_up = "ctrl\+shift\+k"/);
+});
+
+test("jcode keeps a provider the user already picked and still writes the profile", () => {
   const existing = [
     "[keybindings]",
     'scroll_up = "ctrl+shift+k"',
     "",
-    "[providers.openai-compatible]",
-    'type = "open-ai-compatible"',
-    'base_url = "http://127.0.0.1:9999/v1"',
-    'auth = "bearer"',
-    "model_catalog = false",
-    "allow_provider_pinning = false",
+    "[provider]",
+    'default_provider = "claude"',
+    'default_model = "claude-opus-4-8"',
     "",
     "[agents]",
     'swarm_spawn_mode = "inline"',
   ].join("\n");
 
   const adapter = findAdapter("jcode")!;
-  const write = adapter.render({
+  let out = existing;
+  for (const write of adapter.render({
     baseUrl: "http://127.0.0.1:17070/v1",
-    defaultModel: "mimo-v2.6-flash-free",
+    defaultModel: "big-pickle",
     models: SEEDED_MODELS,
-    specificModel: true,
-  })[0]!;
+    specificModel: false,
+  })) {
+    out = applyTomlBlockWrite(out, write.content, write.markers!, write.tomlTable!, write.fillOnly ?? false);
+  }
 
-  const out = applyTomlBlockWrite(existing, write.content, write.markers!, write.tomlTable!);
-
-  // no duplicate table headers
-  const headers = out.split("\n").filter((l) => l.trim() === "[providers.openai-compatible]");
-  assert.equal(headers.length, 1);
-
-  // root keys landed in root scope (before any section header)
-  const firstSection = out.split("\n").findIndex((l) => /^\s*\[/.test(l));
-  const before = out.split("\n").slice(0, firstSection).join("\n");
-  assert.match(before, /default_provider = "openai-compatible"/);
-  assert.match(before, /default_model = "mimo-v2\.6-flash-free"/);
-
-  // patched values inside the existing section
-  assert.match(out, /base_url = "http:\/\/127\.0\.0\.1:17070\/v1"/);
-  assert.match(out, /model_catalog = true/);
-  assert.doesNotMatch(out, /model_catalog = false/);
-  assert.match(out, /context_window = 200000/);
-
-  // untouched neighbours survive
+  // setup registers the router, it does not decide which provider the user starts on
+  assert.match(out, /default_provider = "claude"/);
+  assert.doesNotMatch(out, /default_provider = "bansos"/);
+  assert.equal(out.split("\n").filter((l) => l.trim() === "[providers.bansos]").length, 1);
   assert.match(out, /\[keybindings\]/);
   assert.match(out, /\[agents\]/);
-  assert.match(out, /swarm_spawn_mode = "inline"/);
-  assert.match(out, /allow_provider_pinning = false/);
-});
-
-test("jcode toml-block on fresh file keeps root keys at top and single table", () => {
-  const adapter = findAdapter("jcode")!;
-  const write = adapter.render({
-    baseUrl: "http://127.0.0.1:17070/v1",
-    defaultModel: "mimo-v2.6-flash-free",
-    models: SEEDED_MODELS,
-    specificModel: true,
-  })[0]!;
-
-  const out = applyTomlBlockWrite("", write.content, write.markers!, write.tomlTable!);
-  assert.equal(out.split("\n").filter((l) => l.trim() === "[providers.openai-compatible]").length, 1);
-  const idxRoot = out.indexOf('default_provider = "openai-compatible"');
-  const idxTable = out.indexOf("[providers.openai-compatible]");
-  assert.ok(idxRoot !== -1 && idxTable !== -1 && idxRoot < idxTable);
 });
 
 test("claude-code adapter maps smart tiers in auto mode and pinned model in specific mode", () => {
@@ -357,7 +436,7 @@ test("omp adapter renders a providers-nested yaml-block write", () => {
   assert.equal(write.mode, "yaml-block");
   assert.equal(write.yamlParent, "providers");
   // child is emitted at column 0; the writer owns the nesting
-  assert.match(write.content, /^bansos:\n {2}baseUrl: "http:\/\/127\.0\.0\.1:17070\/v1"/);
+  assert.match(write.content, /^bansos:\n {2}name: bansos-router\n {2}baseUrl: "http:\/\/127\.0\.0\.1:17070\/v1"/);
   assert.deepEqual(adapter.undo(OMP_CTX), ["~/.omp/agent/models.yml"]);
 });
 
@@ -369,6 +448,7 @@ test("omp on a fresh file creates providers: and nests bansos under it", () => {
     `# ${START_MARKER}\n` +
       `providers:\n` +
       `  bansos:\n` +
+      `    name: bansos-router\n` +
       `    baseUrl: "http://127.0.0.1:17070/v1"\n` +
       `    apiKey: bansos\n` +
       `    api: openai-completions\n` +
@@ -391,6 +471,7 @@ test("omp nests under an existing providers: that is not the last key", () => {
       `    apiKey: sk-xxx\n` +
       `  # ${START_MARKER}\n` +
       `  bansos:\n` +
+      `    name: bansos-router\n` +
       `    baseUrl: "http://127.0.0.1:17070/v1"\n` +
       `    apiKey: bansos\n` +
       `    api: openai-completions\n` +
@@ -484,22 +565,124 @@ function renderAll(id: string, models: Array<{ id: string; name?: string; contex
 test("rerunning setup drops models that left the catalog instead of piling them up", () => {
   const before = [{ id: "old-a", name: "old-a" }, { id: "keep", name: "keep" }];
   const after = [{ id: "keep", name: "keep" }, { id: "new-b", name: "new-b" }];
-  for (const id of ["opencode", "goose", "openclaw", "continue"]) {
+  for (const id of ["opencode", "goose", "openclaw"]) {
     const w1 = renderAll(id, before);
-    const user = id === "continue" ? '{"models":[{"title":"Mine","model":"x"}]}' : id === "opencode" ? '{"theme":"dark"}' : null;
+    const user = id === "opencode" ? '{"theme":"dark"}' : null;
     const once = applyMergeWrite(user, w1.content, w1.replace);
     const w2 = renderAll(id, after);
     const twice = applyMergeWrite(once, w2.content, w2.replace);
     assert.doesNotMatch(twice, /old-a/, id);
     assert.match(twice, /new-b/, id);
     assert.equal(twice.match(/"keep"/g)?.length, 1, `${id} keeps one copy`);
-    if (user) assert.match(twice, id === "continue" ? /"Mine"/ : /"dark"/, `${id} keeps the user's own entries`);
+    if (user) assert.match(twice, /"dark"/, `${id} keeps the user's own entries`);
   }
 });
 
-test("continue undo removes every bansos entry and keeps the user's", () => {
-  const w = renderAll("continue", [{ id: "a", name: "A" }, { id: "b", name: "B" }]);
-  const merged = JSON.parse(applyMergeWrite('{"models":[{"title":"Mine","model":"x"}]}', w.content, w.replace));
-  removeKeys(merged, findAdapter("continue")!.undoKeys!);
-  assert.deepEqual(merged.models.map((m: any) => m.title), ["Mine"]);
+
+test("dsh harness writes one llm-pi-ai entry with the bansos provider", () => {
+  const adapter = findAdapter("dsh");
+  assert.ok(adapter);
+  const write = adapter.render({
+    baseUrl: "http://127.0.0.1:17070/v1",
+    defaultModel: "glm-4.6",
+    models: [{ id: "glm-4.6" }, { id: "kilo-auto/free" }] as any,
+    specificModel: false,
+  })[0]!;
+  assert.equal(write.path, "~/.dsh/profiles/web/cordis.patch.yml");
+  assert.match(write.content, /^- id: llm-pi-ai$/m);
+  assert.match(write.content, /^ {8}baseURL: http:\/\/127\.0\.0\.1:17070\/v1$/m);
+  assert.match(write.content, /^ {10}- id: kilo-auto\/free$/m);
+  assert.match(write.content, /apiKeyEnv: BANSOS_API_KEY/);
+  assert.match(write.content, /^ {10}x-bansos-client: dsh$/m);
+
+  // terminal runs read the headless profile, so both get the same provider
+  assert.deepEqual(
+    adapter.render({ baseUrl: "http://127.0.0.1:17070/v1", defaultModel: "glm-4.6", models: [], specificModel: false }).map((w) => w.path),
+    ["~/.dsh/profiles/web/cordis.patch.yml", "~/.dsh/profiles/headless/cordis.patch.yml", "~/.dsh/.env"],
+  );
+  assert.equal(adapter.undo({} as any).length, 3);
+});
+
+test("dsh setup splices the provider into an existing llm-pi-ai entry", () => {
+  const ctx = {
+    baseUrl: "http://127.0.0.1:17070/v1",
+    defaultModel: "glm-4.6",
+    models: [{ id: "glm-4.6" }] as any,
+    specificModel: false,
+  };
+  const existing = [
+    "- id: llm-other",
+    "  config:",
+    "    x: 1",
+    "- id: llm-pi-ai",
+    "  config:",
+    "    providers:",
+    "      acme:",
+    "        api: openai-completions",
+    "        baseURL: https://acme.example/v1",
+    "        models:",
+    "          - id: acme-1",
+    "    retryPolicy:",
+    "      mode: normal",
+    "- id: llm-deepseek-account",
+    "  config: {}",
+    "",
+  ].join("\n");
+
+  const merged = dshMergeProviders(existing, ctx);
+  assert.equal(merged.status, "merged");
+  if (merged.status !== "merged") return;
+
+  // one llm-pi-ai entry only, the user's routes and the plugin fields survive
+  assert.equal(merged.content.match(/- id: llm-pi-ai/g)?.length, 1);
+  assert.match(merged.content, /^ {6}acme:$/m);
+  assert.match(merged.content, /^ {4}retryPolicy:$/m);
+  assert.match(merged.content, /^ {6}mode: normal$/m);
+  assert.match(merged.content, /^ {6}bansos:$/m);
+  assert.match(merged.content, /^ {8}models:\n {10}- id: glm-4\.6$/m);
+
+  // rerunning finds its own provider and leaves the file alone
+  assert.equal(dshMergeProviders(merged.content, ctx).status, "present");
+});
+
+test("dsh setup refuses to edit a file it cannot splice safely", () => {
+  const ctx = { baseUrl: "http://127.0.0.1:17070/v1", defaultModel: "m", models: [{ id: "m" }] as any, specificModel: false };
+  assert.equal(dshMergeProviders("- id: llm-pi-ai\n  config:\n    providers: { acme: {} }\n", ctx).status, "manual");
+  assert.equal(dshMergeProviders("- id: llm-pi-ai\n  config:\n    other: 1\n", ctx).status, "manual");
+  assert.equal(dshMergeProviders("- id: llm-other\n  config: {}\n", ctx).status, "no-entry");
+});
+
+test("removing a nested block keeps the indentation of what follows it", () => {
+  const file = ["providers:", "  # bansos-router:start", "  bansos:", "    api: chat", "  # bansos-router:end", "  acme:", "    api: chat", ""].join("\n");
+  const out = removeBlock(file, [`# ${START_MARKER}`, `# ${END_MARKER}`]);
+  assert.match(out, /^ {2}acme:$/m);
+});
+
+test("dsh setup writes the key dsh insists on into $DSH_HOME/.env", () => {
+  const adapter = findAdapter("dsh")!;
+  const writes = adapter.render({
+    baseUrl: "http://127.0.0.1:17070/v1",
+    defaultModel: "big-pickle",
+    models: SEEDED_MODELS,
+    specificModel: false,
+  });
+  const envWrite = writes.find((w) => w.path.endsWith(".env"))!;
+  assert.equal(envWrite.path, "~/.dsh/.env");
+  assert.match(envWrite.content, /^BANSOS_API_KEY=bansos$/m);
+  // the profiles stay untouched by the env write
+  assert.equal(writes.filter((w) => w.path.endsWith("cordis.patch.yml")).length, 2);
+  assert.equal(adapter.undo({} as any).length, 3);
+});
+
+test("dsh setup points its default model at the router", () => {
+  const ctx = { baseUrl: "http://127.0.0.1:17070/v1", defaultModel: "glm-4.6", models: [], specificModel: false };
+  const patched = dshEnsureDefaultModel("a: 1\n# bansos-router:end\n", ctx);
+  assert.match(patched, /^- id: agent-default-model\n {2}config:\n {4}provider: bansos\n {4}model: glm-4\.6\n# bansos-router:end$/m);
+
+  // a default model the user already set wins
+  const own = "- id: agent-default-model\n  config:\n    provider: mine\n# bansos-router:end\n";
+  assert.equal(dshEnsureDefaultModel(own, ctx), own);
+
+  // no marker in the file: append
+  assert.match(dshEnsureDefaultModel("- id: x\n", ctx), /^- id: agent-default-model$/m);
 });
