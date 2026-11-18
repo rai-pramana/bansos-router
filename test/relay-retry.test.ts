@@ -253,6 +253,59 @@ test("a per-address gateway rotates the walk head when no relay is known good", 
   }
 });
 
+// Rotating on EVERY request spread the load nicely but paid a cold start each
+// time (3.1s vs 1.7s sticky, measured 2026-11-19). Rotating never pays a
+// guaranteed round-trip either. Five uses is the middle: warm connection, and the
+// row (6-8 requests) is left alive.
+test("a per-address gateway sticks to one relay for a few requests, then rotates", async () => {
+  const fleet = Array.from({ length: 6 }, (_, i) => `https://r${i + 1}.example`);
+  const { calls, restore } = stubFetch(() => 200); // everybody healthy
+  try {
+    const st = state(fleet[0]!, fleet.slice(1));
+    const init = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"baidu/ernie-5.5-flash-preview:free"}',
+    };
+    const used: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      calls.length = 0;
+      await relayFetch(st, "https://api.kilo.ai/api/gateway/chat/completions", init);
+      used.push(calls[0]!.url);
+    }
+    // 5 requests on the first address, then the walk moves on
+    assert.equal(used.slice(0, 5).every((u) => u === used[0]), true,
+      `first 5 must reuse one address, saw ${used.slice(0, 5).join(", ")}`);
+    assert.notEqual(used[5], used[0],
+      "the 6th request must move to another address, before the row dies");
+  } finally {
+    restore();
+  }
+});
+
+// opencode's lanes have deep rows, so they keep rotating per request
+test("a spread lane without a per-address row still rotates every request", async () => {
+  const fleet = Array.from({ length: 6 }, (_, i) => `https://r${i + 1}.example`);
+  const { calls, restore } = stubFetch(() => 200);
+  try {
+    const st = state(fleet[0]!, fleet.slice(1));
+    const init = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"big-pickle"}',
+    };
+    const used: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      calls.length = 0;
+      await relayFetch(st, "https://dev.opencode.ai/inference/v1/chat/completions", init);
+      used.push(calls[0]!.url);
+    }
+    assert.equal(new Set(used).size, 4, `expected 4 different relays, saw ${used.join(", ")}`);
+  } finally {
+    restore();
+  }
+});
+
 test("a per-address 429 is walked, not raced: only the address that answers is spent", async () => {
   // It looks free to race a per-address 429 - the refusal itself costs nothing -
   // but every candidate that ANSWERS spends one request of that address' row, and

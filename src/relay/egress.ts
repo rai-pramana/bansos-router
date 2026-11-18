@@ -110,6 +110,14 @@ const PREFER_MS = 2 * 60_000;
 // then walks. This map has no telemetry meaning at all - it only orders the
 // walk - so it may be sticky for long enough to make the cliff irrelevant.
 const LAST_GOOD_MS = 30 * 60_000;
+// How many consecutive requests one address may carry before the walk moves on.
+//
+// A per-address row holds only 6-8 requests (measured), so sticking to one relay
+// until it answers 429 costs a guaranteed round-trip every few requests. Rotating
+// on EVERY request fixes that but pays a cold start each time - measured
+// 2026-11-19: 1.7s sticky vs 3.1s spread. Five keeps the connection warm and
+// leaves the row alive.
+const IP_BUCKET_STICKY_USES = 5;
 // Two alternates: enough to cross a dead region, small enough that a global 429
 // (every relay spent) does not turn into a stampede of probes per request.
 const MAX_ALTERNATES = 2;
@@ -125,19 +133,19 @@ const MAX_SPREAD_ALTERNATES = 12;
 
 // Keyless gateways whose limiter is per-EGRESS ADDRESS, not global. Kilo answers
 // a guest 429 ("Sign up for free to continue...") once an address has spent its
-// hourly allowance, and each of the fleet's ~168 addresses has its own row -
-// measured 2026-11-18: 11 of 12 relays answered 200 for the same model in the
-// same minute. Three candidates (1 + MAX_ALTERNATES) is enough to cross a dead
-// region on a global limiter but not to find a fresh row here: the daemon's log
-// shows 369 kilo 429s on baidu/ernie-5.5-flash-preview:free, each one a request
-// that walked three spent addresses and gave up while fresh ones sat behind them.
+// short window, and each address' row holds only 6-8 requests (measured
+// 2026-11-18/19). They are also in SPREAD_TARGETS, so each request lands on a
+// different address and no single row is asked to carry the fleet's traffic.
+//
+// What remains here is the PARK decision: a 429 from one of these is a statement
+// about the ONE address that answered, so the model is parked for 5s instead of
+// for the upstream's Retry-After. opencode.ai is spread but NOT in this set - its
+// Retry-After really is about the model.
 const IP_BUCKET_TARGETS = new Set([
   "https://api.kilo.ai",
   "https://api.llm7.io",
   "https://api.beatapi.io",
 ]);
-const MAX_IP_BUCKET_ALTERNATES = 6;
-
 /** Is this upstream a keyless gateway that meters per egress address? */
 export function isIpBucketTarget(url: string | undefined): boolean {
   if (!url) return false;
@@ -183,7 +191,7 @@ function quotaPenaltyMs(res: Response, bodyText: string): number {
 
 let _preferred: { url: string; until: number; origin?: string } | null = null;
 // origin -> the relay that served it most recently, used for walk ORDER only
-const _lastGood = new Map<string, { url: string; until: number }>();
+const _lastGood = new Map<string, { url: string; until: number; count: number }>();
 // A daemon restart forgets which relay was serving, so the first request after a
 // restart starts on the pinned/active relay again and pays a round-trip to
 // relearn that its row is spent. The map is small and stable - one entry per
@@ -197,13 +205,13 @@ function loadLastGood(): void {
   if (_lastGoodLoaded) return;
   _lastGoodLoaded = true;
   try {
-    const raw = readJson<{ origins?: Record<string, { url?: string; until?: number }> }>(
-      LAST_GOOD_FILE,
-    );
+    const raw = readJson<{
+      origins?: Record<string, { url?: string; until?: number; count?: number }>;
+    }>(LAST_GOOD_FILE);
     const now = Date.now();
     for (const [origin, e] of Object.entries(raw?.origins ?? {})) {
       if (e && typeof e.url === "string" && typeof e.until === "number" && e.until > now) {
-        _lastGood.set(origin, { url: e.url, until: e.until });
+        _lastGood.set(origin, { url: e.url, until: e.until, count: e.count ?? 0 });
       }
     }
   } catch {
@@ -212,7 +220,7 @@ function loadLastGood(): void {
 }
 
 function saveLastGood(): void {
-  const origins: Record<string, { url: string; until: number }> = {};
+  const origins: Record<string, { url: string; until: number; count: number }> = {};
   for (const [origin, e] of _lastGood) {
     if (e.until > Date.now()) origins[origin] = e;
   }
@@ -399,7 +407,21 @@ function nextSpreadOffset(origin: string, model: string | undefined, count: numb
 // is stamped with the relay's address, so it never touches that row.
 const SPREAD_TARGETS = new Set<string>([
   "https://opencode.ai",
+  // The zen STAGE deployment. It is a SEPARATE opencode app with its own
+  // database, so the per-IP daily bucket is a different row set than
+  // production's. The fleet's egress addresses have never been counted
+  // there, so a relay that is spent on production still has room on the
+  // stage.
   "https://dev.opencode.ai",
+  // The keyless per-address gateways. Their limiter is keyed on the egress
+  // address, so ONE relay carrying all the traffic is the worst possible
+  // arrangement: its row (6-8 requests, measured) drains and the caller gets a
+  // 429 it did not have to get. Spreading costs nothing - the bytes are the same
+  // either way (gzip is on) and FOT is metered PER ACCOUNT, so spreading is what
+  // keeps each of the 8 Hobby accounts under its 10 GB.
+  "https://api.kilo.ai",
+  "https://api.llm7.io",
+  "https://api.beatapi.io",
 ]);
 
 // A relay can refuse a target it has not been taught about: the fleet's
@@ -499,16 +521,21 @@ function relayCandidates(state: RelayState, now: number, target?: URL, model?: s
   // per-egress-address gateway its row still has room, while the active relay's
   // may not. ORDER ONLY - the pin, the penalties and the telemetry above are
   // untouched, and a spread target keeps its own rotation.
+  // A per-address gateway keeps ONE relay for a few requests instead of rotating
+  // on every call: sticking until the row dies pays a guaranteed round-trip every
+  // few requests, while rotating always pays a cold start every time (1.7s vs
+  // 3.1s, measured 2026-11-19). Five uses keeps the connection warm and leaves the
+  // row alive. opencode's lanes keep rotating per request - their rows are deep.
+  const ipBucket = target ? IP_BUCKET_TARGETS.has(target.origin) : false;
   const lastGood = target ? _lastGood.get(target.origin) : undefined;
-  let headed = false;
   if (
-    !spread &&
+    (!spread || ipBucket) &&
     lastGood &&
     lastGood.until > now &&
+    (ipBucket || lastGood.count < IP_BUCKET_STICKY_USES) &&
     state.relays.some((r) => r.url === lastGood.url)
   ) {
     push(lastGood.url);
-    headed = out.includes(lastGood.url);
   }
   push(state.url);
   // Scheduler ranking first (coolest healthy accounts), then the raw fleet order as
@@ -516,26 +543,13 @@ function relayCandidates(state: RelayState, now: number, target?: URL, model?: s
   const ranked = rankedRelays();
   for (const u of ranked) push(u);
   for (const r of state.relays) push(r.url);
-  if (spread && out.length > 1) {
+  if (spread && !(ipBucket && lastGood && lastGood.until > now && lastGood.count < IP_BUCKET_STICKY_USES) && out.length > 1) {
     // Rotate the list so consecutive requests start on a different relay.
     // The cursor is per (origin, model): each model has its own daily bucket
     // per address, so two different models must not share one rotation
     // position - they would land on the same address together and drain it
     // twice as fast.
     const off = nextSpreadOffset(target!.origin, model, out.length);
-    return out.slice(off).concat(out.slice(0, off));
-  }
-  // A per-address gateway with NO proven-good relay must not start every walk at
-  // the same head.
-  //
-  // The ranking leads with whatever answered the rotator's probe last, and on a
-  // shallow row (6-8 requests, measured) that cluster goes spent together - so a
-  // fixed head means the walk pays the same dead addresses on every request and
-  // never reaches the fresh ones behind them. Measured 2026-11-19: 12
-  // back-to-back requests all failed while a direct probe of the same fleet found
-  // 14 of 15 addresses answering 200.
-  if (target && IP_BUCKET_TARGETS.has(target.origin) && !headed && out.length > 1) {
-    const off = nextSpreadOffset(target.origin, model, out.length);
     return out.slice(off).concat(out.slice(0, off));
   }
   return out;
@@ -583,11 +597,7 @@ export async function relayFetch(
 
   const now = Date.now();
   const spread = isSpreadTarget(u.origin);
-  const maxAlternates = spread
-    ? MAX_SPREAD_ALTERNATES
-    : IP_BUCKET_TARGETS.has(u.origin)
-      ? MAX_IP_BUCKET_ALTERNATES
-      : MAX_ALTERNATES;
+  const maxAlternates = spread ? MAX_SPREAD_ALTERNATES : MAX_ALTERNATES;
   // The model id decides WHICH daily bucket the upstream counts this request
   // against (util_ipRateLimiter.ts: dailyInterval = YYYYMMDD +
   // modelId.slice(0,2) for a model with its own rateLimit), so the penalty
@@ -734,7 +744,12 @@ export async function relayFetch(
       // succeeded instead of re-probing a spent address.
       {
         const prev = _lastGood.get(u.origin);
-        _lastGood.set(u.origin, { url: a.url, until: Date.now() + LAST_GOOD_MS });
+        const same = prev && prev.url === a.url && prev.until > Date.now();
+        _lastGood.set(u.origin, {
+          url: a.url,
+          until: Date.now() + LAST_GOOD_MS,
+          count: same ? prev!.count + 1 : 1,
+        });
         // Persist when the address changed, or once a minute to keep `until`
         // fresh across a restart. Not on every request: the file is tiny but the
         // write is still disk I/O on the request path.
