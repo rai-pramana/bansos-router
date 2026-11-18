@@ -1,4 +1,4 @@
-import { test, beforeEach } from "node:test";
+import { test, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -102,6 +102,46 @@ test("isIpBucketTarget recognises the keyless per-address gateways only", () => 
   assert.equal(isIpBucketTarget("https://dev.opencode.ai/inference/v1/chat/completions"), false);
   assert.equal(isIpBucketTarget(undefined), false);
   assert.equal(isIpBucketTarget("not a url"), false);
+});
+
+// _preferred is a telemetry signal with a 2-minute life (it must not claim the
+// active relay refused when it merely lost a race). That leaves a cliff: two
+// minutes after a failover the walk would start again on the spent active relay
+// and pay a round-trip to relearn it. The last-good map has no telemetry
+// meaning - it only orders the walk - so it survives that window.
+test("the relay that served keeps the head of the list past the preferred window", async () => {
+  const realNow = Date.now();
+  mock.timers.enable({ apis: ["Date"], now: realNow });
+  try {
+    const fleet = ["https://r1.example", "https://r2.example"];
+    const { calls, restore } = stubFetch((url) => (url.includes("r1") ? 429 : 200));
+    try {
+      const st = state(fleet[0]!, fleet.slice(1));
+      const init = {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"baidu/ernie-5.5-flash-preview:free"}',
+      };
+      const first = await relayFetch(st, "https://api.kilo.ai/api/gateway/chat/completions", init);
+      assert.equal(first.status, 200);
+      assert.equal(calls[0]!.url.includes("r1"), true, "the walk starts on the active relay");
+
+      mock.timers.tick(3 * 60_000); // past PREFER_MS, inside LAST_GOOD_MS
+
+      const before = calls.length;
+      const second = await relayFetch(st, "https://api.kilo.ai/api/gateway/chat/completions", init);
+      assert.equal(second.status, 200);
+      assert.equal(
+        calls[before]!.url.includes("r2"),
+        true,
+        "must start where the last request succeeded, not re-probe the spent relay",
+      );
+    } finally {
+      restore();
+    }
+  } finally {
+    mock.timers.reset();
+  }
 });
 
 test("a per-address gateway walks deeper than the global-limiter default", async () => {

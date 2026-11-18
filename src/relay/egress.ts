@@ -100,6 +100,16 @@ const PENALTY_MS = 5 * 60_000;
 const QUOTA_PENALTY_MIN_MS = 10 * 60_000;
 const QUOTA_PENALTY_MAX_MS = 6 * 60 * 60_000;
 const PREFER_MS = 2 * 60_000;
+// How long a relay that actually SERVED keeps the head of the candidate list.
+//
+// _preferred above is a telemetry signal ("the active relay refused real
+// traffic") and must expire fast or /bansos/relay cries wolf - which is why it
+// lasts 2 minutes and is not renewed when it merely keeps working. That leaves a
+// cliff: two minutes after a failover the next request starts again on the
+// active relay, pays a round-trip to relearn that its row is spent, and only
+// then walks. This map has no telemetry meaning at all - it only orders the
+// walk - so it may be sticky for long enough to make the cliff irrelevant.
+const LAST_GOOD_MS = 30 * 60_000;
 // Two alternates: enough to cross a dead region, small enough that a global 429
 // (every relay spent) does not turn into a stampede of probes per request.
 const MAX_ALTERNATES = 2;
@@ -172,6 +182,8 @@ function quotaPenaltyMs(res: Response, bodyText: string): number {
 }
 
 let _preferred: { url: string; until: number; origin?: string } | null = null;
+// origin -> the relay that served it most recently, used for walk ORDER only
+const _lastGood = new Map<string, { url: string; until: number }>();
 const _penalty = new Map<string, number>();
 
 // The penalty map is keyed by relay URL only, but the quota bucket is NOT:
@@ -373,6 +385,7 @@ function isSpreadTarget(origin: string): boolean {
 
 export function resetRelayRetryState(): void {
   _preferred = null;
+  _lastGood.clear();
   _penalty.clear();
   _spreadCursor.clear();
   _quotaRejected.clear();
@@ -437,6 +450,12 @@ function relayCandidates(state: RelayState, now: number, target?: URL, model?: s
   if (!spread && _preferred && _preferred.until > now && (!target || !_preferred.origin || _preferred.origin === target.origin)) {
     push(_preferred.url);
   }
+  // A relay that served this origin recently is the cheapest first guess: on a
+  // per-egress-address gateway its row still has room, while the active relay's
+  // may not. ORDER ONLY - the pin, the penalties and the telemetry above are
+  // untouched, and a spread target keeps its own rotation.
+  const lastGood = target ? _lastGood.get(target.origin) : undefined;
+  if (!spread && lastGood && lastGood.until > now) push(lastGood.url);
   push(state.url);
   // Scheduler ranking first (coolest healthy accounts), then the raw fleet order as
   // a fallback for relays the last tick did not rank.
@@ -644,6 +663,9 @@ export async function relayFetch(
       // This address answered: its bucket still has room, so it is not part of
       // the spent evidence for this (deployment, model).
       noteQuotaServed(u, model, a.url);
+      // ...and remember it, so the next request starts where the last one
+      // succeeded instead of re-probing a spent address.
+      _lastGood.set(u.origin, { url: a.url, until: Date.now() + LAST_GOOD_MS });
       return;
     }
     if (a.kind === "transport" || a.kind === "refusal") {
