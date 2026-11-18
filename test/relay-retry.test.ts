@@ -13,6 +13,7 @@ import {
   resetSpreadCursorForTest,
   FLEET_EXHAUSTED_HEADER,
   RELAY_USED_HEADER,
+  isIpBucketTarget,
   type RelayState,
 } from "../src/relay/egress";
 
@@ -89,6 +90,20 @@ test("a 429 from the active relay is retried on the next relay and served", asyn
 // A three-candidate walk gave up while fresh addresses sat behind it - 369 kilo
 // 429s in the daemon log, and the only way out was a manual relay switch plus a
 // model refresh.
+// The daemon picks the park length from this predicate: a per-address gateway's
+// 429 belongs to ONE address, so the model may be retried almost immediately;
+// a global limiter's Retry-After is a statement about the model and is kept.
+test("isIpBucketTarget recognises the keyless per-address gateways only", () => {
+  assert.equal(isIpBucketTarget("https://api.kilo.ai/api/gateway/chat/completions"), true);
+  assert.equal(isIpBucketTarget("https://api.llm7.io/v1/chat/completions"), true);
+  assert.equal(isIpBucketTarget("https://api.beatapi.io/v1/chat/completions"), true);
+  // opencode's limiter is fleet-wide and has its own exhausted-window handling
+  assert.equal(isIpBucketTarget("https://opencode.ai/inference/v1/chat/completions"), false);
+  assert.equal(isIpBucketTarget("https://dev.opencode.ai/inference/v1/chat/completions"), false);
+  assert.equal(isIpBucketTarget(undefined), false);
+  assert.equal(isIpBucketTarget("not a url"), false);
+});
+
 test("a per-address gateway walks deeper than the global-limiter default", async () => {
   const fleet = [
     "https://r1.example", "https://r2.example", "https://r3.example",
