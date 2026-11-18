@@ -792,13 +792,14 @@ export async function relayFetch(
   // up to 6 healthy addresses on every call.
   const fleetKnownSpent =
     quotaRejectedCount(u, model) >= fleetSpentThreshold(state.relays.length);
-  // Racing is also right on a per-address bucket without waiting for majority
-  // evidence: a 429 there is FREE upstream (the limiter refuses before it bills)
-  // and every candidate is a different address with its own row, so racing costs
-  // nothing but a few requests from rows that still had room - while the
-  // sequential walk pays ~3.5s per spent address (measured 2026-11-18 on kilo).
-  const raceable =
-    first.kind === "quota" && (fleetKnownSpent || IP_BUCKET_TARGETS.has(u.origin));
+  // Racing stays gated on majority evidence, NOT on the origin.
+  //
+  // It looks free to race a per-address 429 - the refusal itself costs nothing -
+  // but every candidate that ANSWERS spends one request of that address' row, and
+  // a row is shallow: measured 2026-11-18, one Vercel address went 429 after 8
+  // requests and recovered in 32s. Six workers would spend six rows to serve one
+  // caller. Walking one at a time spends exactly the one that answers.
+  const raceable = first.kind === "quota" && fleetKnownSpent;
   const rest = candidates.slice(1);
   if (rest.length > 0 && raceable) {
     const attempts: Attempt[] = [];

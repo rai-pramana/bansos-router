@@ -215,12 +215,14 @@ test("a per-address gateway walks deeper than the global-limiter default", async
   }
 });
 
-test("a per-address 429 is raced instead of walked one address per round-trip", async () => {
-  // A kilo 429 is FREE upstream (the limiter refuses before it bills) and every
-  // candidate is a different row, so there is nothing to protect by walking
-  // serially - and ~3.5s per spent address is what made the lane feel dead.
+test("a per-address 429 is walked, not raced: only the address that answers is spent", async () => {
+  // It looks free to race a per-address 429 - the refusal itself costs nothing -
+  // but every candidate that ANSWERS spends one request of that address' row, and
+  // a row is shallow: measured 2026-11-18, one Vercel address went 429 after 8
+  // requests and recovered in 32s. Six workers would spend six rows to serve one
+  // caller, so the walk must stop at the first address that answers.
   const fleet = ["https://r1.example", "https://r2.example", "https://r3.example", "https://r4.example"];
-  const { calls, restore } = stubFetch((url) => (url.includes("r4") ? 200 : 429));
+  const { calls, restore } = stubFetch((url) => (url.includes("r1") ? 429 : 200));
   try {
     const res = await relayFetch(
       state(fleet[0]!, fleet.slice(1)),
@@ -232,8 +234,11 @@ test("a per-address 429 is raced instead of walked one address per round-trip", 
       },
     );
     assert.equal(res.status, 200);
-    const raced = calls.filter((c) => !c.url.includes("r1"));
-    assert.ok(raced.length >= 2, `the rest must be in flight together, saw ${raced.length}`);
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      ["https://r1.example", "https://r2.example"],
+      "the walk must stop at the first address that answers",
+    );
   } finally {
     restore();
   }
