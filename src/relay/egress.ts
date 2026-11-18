@@ -500,6 +500,7 @@ function relayCandidates(state: RelayState, now: number, target?: URL, model?: s
   // may not. ORDER ONLY - the pin, the penalties and the telemetry above are
   // untouched, and a spread target keeps its own rotation.
   const lastGood = target ? _lastGood.get(target.origin) : undefined;
+  let headed = false;
   if (
     !spread &&
     lastGood &&
@@ -507,6 +508,7 @@ function relayCandidates(state: RelayState, now: number, target?: URL, model?: s
     state.relays.some((r) => r.url === lastGood.url)
   ) {
     push(lastGood.url);
+    headed = out.includes(lastGood.url);
   }
   push(state.url);
   // Scheduler ranking first (coolest healthy accounts), then the raw fleet order as
@@ -521,6 +523,19 @@ function relayCandidates(state: RelayState, now: number, target?: URL, model?: s
     // position - they would land on the same address together and drain it
     // twice as fast.
     const off = nextSpreadOffset(target!.origin, model, out.length);
+    return out.slice(off).concat(out.slice(0, off));
+  }
+  // A per-address gateway with NO proven-good relay must not start every walk at
+  // the same head.
+  //
+  // The ranking leads with whatever answered the rotator's probe last, and on a
+  // shallow row (6-8 requests, measured) that cluster goes spent together - so a
+  // fixed head means the walk pays the same dead addresses on every request and
+  // never reaches the fresh ones behind them. Measured 2026-11-19: 12
+  // back-to-back requests all failed while a direct probe of the same fleet found
+  // 14 of 15 addresses answering 200.
+  if (target && IP_BUCKET_TARGETS.has(target.origin) && !headed && out.length > 1) {
+    const off = nextSpreadOffset(target.origin, model, out.length);
     return out.slice(off).concat(out.slice(0, off));
   }
   return out;

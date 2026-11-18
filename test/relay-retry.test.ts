@@ -215,6 +215,44 @@ test("a per-address gateway walks deeper than the global-limiter default", async
   }
 });
 
+// Without a proven-good relay the walk used to start at the SAME head every
+// request. On a shallow per-address row the head cluster goes spent together, so
+// every request re-paid the same dead addresses and never reached the fresh ones
+// behind them - measured 2026-11-19: 12 back-to-back requests all failed while a
+// direct probe of the same fleet found 14 of 15 addresses answering 200.
+test("a per-address gateway rotates the walk head when no relay is known good", async () => {
+  // Without a proven-good relay the walk used to start at the SAME head every
+  // request. On a shallow per-address row the head cluster goes spent together,
+  // so every request re-paid the same dead addresses and never reached the fresh
+  // ones behind them - measured 2026-11-19: 12 back-to-back requests all failed
+  // while a direct probe of the same fleet found 14 of 15 answering 200.
+  const fleet = Array.from({ length: 20 }, (_, i) => `https://r${i + 1}.example`);
+  const { calls, restore } = stubFetch(() => 429); // nobody answers
+  try {
+    const st = state(fleet[0]!, fleet.slice(1));
+    const init = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"baidu/ernie-5.5-flash-preview:free"}',
+    };
+    const heads: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const before = calls.length;
+      await relayFetch(st, "https://api.kilo.ai/api/gateway/chat/completions", init);
+      heads.push(calls[before]!.url);
+      // clear the 429 penalties so ONLY the rotation can move the head
+      expirePenaltyForTest();
+    }
+    assert.equal(
+      new Set(heads).size,
+      3,
+      `each walk must start on a different address, saw ${heads.join(" -> ")}`,
+    );
+  } finally {
+    restore();
+  }
+});
+
 test("a per-address 429 is walked, not raced: only the address that answers is spent", async () => {
   // It looks free to race a per-address 429 - the refusal itself costs nothing -
   // but every candidate that ANSWERS spends one request of that address' row, and
