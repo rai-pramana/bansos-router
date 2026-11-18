@@ -83,6 +83,60 @@ test("a 429 from the active relay is retried on the next relay and served", asyn
   }
 });
 
+// Kilo meters its free tier per EGRESS ADDRESS (~200 requests/hour), and each of
+// the fleet's ~168 addresses has its own row. Measured 2026-11-18: 11 of 12
+// relays answered 200 for baidu/ernie-5.5-flash-preview:free in the same minute.
+// A three-candidate walk gave up while fresh addresses sat behind it - 369 kilo
+// 429s in the daemon log, and the only way out was a manual relay switch plus a
+// model refresh.
+test("a per-address gateway walks deeper than the global-limiter default", async () => {
+  const fleet = [
+    "https://r1.example", "https://r2.example", "https://r3.example",
+    "https://r4.example", "https://r5.example", "https://r6.example", "https://r7.example",
+  ];
+  // r1..r5 spent their hourly row, r6 has room
+  const { calls, restore } = stubFetch((url) => (url.includes("r6") ? 200 : 429));
+  try {
+    const res = await relayFetch(
+      state(fleet[0]!, fleet.slice(1)),
+      "https://api.kilo.ai/api/gateway/chat/completions",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"baidu/ernie-5.5-flash-preview:free"}',
+      },
+    );
+    assert.equal(res.status, 200, "the 6th address must still be reached");
+    assert.ok(calls.some((c) => c.url.includes("r6")), "must walk past 5 spent addresses");
+  } finally {
+    restore();
+  }
+});
+
+test("a per-address 429 is raced instead of walked one address per round-trip", async () => {
+  // A kilo 429 is FREE upstream (the limiter refuses before it bills) and every
+  // candidate is a different row, so there is nothing to protect by walking
+  // serially - and ~3.5s per spent address is what made the lane feel dead.
+  const fleet = ["https://r1.example", "https://r2.example", "https://r3.example", "https://r4.example"];
+  const { calls, restore } = stubFetch((url) => (url.includes("r4") ? 200 : 429));
+  try {
+    const res = await relayFetch(
+      state(fleet[0]!, fleet.slice(1)),
+      "https://api.kilo.ai/api/gateway/chat/completions",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"baidu/ernie-5.5-flash-preview:free"}',
+      },
+    );
+    assert.equal(res.status, 200);
+    const raced = calls.filter((c) => !c.url.includes("r1"));
+    assert.ok(raced.length >= 2, `the rest must be in flight together, saw ${raced.length}`);
+  } finally {
+    restore();
+  }
+});
+
 test("a relay that refuses the target does not end the request", async () => {
   // The fleet's allowlist is per deployment. A relay deployed before a
   // target was added answers 403 "target not allowlisted" - that is a

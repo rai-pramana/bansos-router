@@ -54,7 +54,8 @@ import { harnessStatuses } from "../cli/doctor";
 import { ADMIN_PATHS, handleAdmin, type AdminOptions } from "./admin";
 import { createSseFrameSplitter, readSseStream } from "../protocols/stream";
 import { callerToolsFromBody, type CallerTools, type Translator } from "../protocols/tool-bridge";
-import type { RuntimeCatalog } from "./catalog";
+import { NON_EXHAUSTED_429_COOLDOWN_MS, type RuntimeCatalog } from "./catalog";
+import { isIpBucketTarget } from "../relay/egress";
 import type { RateLimiter } from "./rate-limit";
 import {
   ZEN_MIRROR_REFUSAL,
@@ -2673,9 +2674,24 @@ async function runChatForward(
           }
         } else if (upstreamRes.status === 429) {
           // Either a burst limit, or one address's bucket is spent while the
-          // rest of the fleet still has room. Park it briefly (not for the
-          // daily window) so the next request moves on to another address.
-          catalog.markRateLimited(current.id, retryAfterMs, { status: upstreamRes.status, message: errorMsg });
+          // rest of the fleet still has room.
+          //
+          // On a per-EGRESS-ADDRESS gateway (kilo, llm7, beat) the answer belongs
+          // to the ONE address that replied, not to the model: the next request
+          // would land on a different address with its own row, but only if the
+          // model is not parked. Honouring the upstream's Retry-After here is what
+          // used to force a manual relay switch plus a model refresh before
+          // anything worked again, so park just long enough to break a hot loop.
+          //
+          // Every other upstream keeps the upstream's own window: a global
+          // limiter's Retry-After IS a statement about the model.
+          catalog.markRateLimited(
+            current.id,
+            isIpBucketTarget(currentUpstream.chatUrl)
+              ? NON_EXHAUSTED_429_COOLDOWN_MS
+              : retryAfterMs,
+            { status: upstreamRes.status, message: errorMsg },
+          );
         }
       }
       transientError = stageVerdictError(

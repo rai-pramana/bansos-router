@@ -113,6 +113,31 @@ const MAX_ALTERNATES = 2;
 // be enough to get past them.
 const MAX_SPREAD_ALTERNATES = 12;
 
+// Keyless gateways whose limiter is per-EGRESS ADDRESS, not global. Kilo answers
+// a guest 429 ("Sign up for free to continue...") once an address has spent its
+// hourly allowance, and each of the fleet's ~168 addresses has its own row -
+// measured 2026-11-18: 11 of 12 relays answered 200 for the same model in the
+// same minute. Three candidates (1 + MAX_ALTERNATES) is enough to cross a dead
+// region on a global limiter but not to find a fresh row here: the daemon's log
+// shows 369 kilo 429s on baidu/ernie-5.5-flash-preview:free, each one a request
+// that walked three spent addresses and gave up while fresh ones sat behind them.
+const IP_BUCKET_TARGETS = new Set([
+  "https://api.kilo.ai",
+  "https://api.llm7.io",
+  "https://api.beatapi.io",
+]);
+const MAX_IP_BUCKET_ALTERNATES = 6;
+
+/** Is this upstream a keyless gateway that meters per egress address? */
+export function isIpBucketTarget(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    return IP_BUCKET_TARGETS.has(new URL(url).origin);
+  } catch {
+    return false;
+  }
+}
+
 // How many candidates may be in flight at once once the first one failed.
 //
 // The first candidate is always tried alone: on a healthy fleet it answers,
@@ -472,7 +497,11 @@ export async function relayFetch(
 
   const now = Date.now();
   const spread = isSpreadTarget(u.origin);
-  const maxAlternates = spread ? MAX_SPREAD_ALTERNATES : MAX_ALTERNATES;
+  const maxAlternates = spread
+    ? MAX_SPREAD_ALTERNATES
+    : IP_BUCKET_TARGETS.has(u.origin)
+      ? MAX_IP_BUCKET_ALTERNATES
+      : MAX_ALTERNATES;
   // The model id decides WHICH daily bucket the upstream counts this request
   // against (util_ipRateLimiter.ts: dailyInterval = YYYYMMDD +
   // modelId.slice(0,2) for a model with its own rateLimit), so the penalty
@@ -680,7 +709,13 @@ export async function relayFetch(
   // up to 6 healthy addresses on every call.
   const fleetKnownSpent =
     quotaRejectedCount(u, model) >= fleetSpentThreshold(state.relays.length);
-  const raceable = first.kind === "quota" && fleetKnownSpent;
+  // Racing is also right on a per-address bucket without waiting for majority
+  // evidence: a 429 there is FREE upstream (the limiter refuses before it bills)
+  // and every candidate is a different address with its own row, so racing costs
+  // nothing but a few requests from rows that still had room - while the
+  // sequential walk pays ~3.5s per spent address (measured 2026-11-18 on kilo).
+  const raceable =
+    first.kind === "quota" && (fleetKnownSpent || IP_BUCKET_TARGETS.has(u.origin));
   const rest = candidates.slice(1);
   if (rest.length > 0 && raceable) {
     const attempts: Attempt[] = [];

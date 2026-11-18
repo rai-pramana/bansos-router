@@ -9,6 +9,14 @@ import { CATALOG_FILE, RETIRED_FILE, readJson, writeJsonAtomic } from "./state";
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 const MAX_COOLDOWN_MS = 15 * 60_000;
+// A 429 the FLEET DID NOT UNANIMOUSLY ANSWER is about the addresses this request
+// happened to try, not about the model. On a per-egress-address limiter (kilo,
+// llm7, beat) the next request would land on a different address with its own
+// row - but only if the model is not parked. This is the length of that park:
+// long enough to stop a hot loop, short enough that the caller's retry still
+// reaches a fresh address. The upstream's own Retry-After belongs to the bucket
+// of ONE address and must not be applied to the model as a whole.
+export const NON_EXHAUSTED_429_COOLDOWN_MS = 5_000;
 // A daily free-tier quota is not a burst limit: the upstream says exactly when
 // the bucket refills (Retry-After points at the next UTC midnight, up to 24h).
 // Parking such a model for the flat 15 minutes above means the next request
