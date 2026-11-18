@@ -184,6 +184,45 @@ function quotaPenaltyMs(res: Response, bodyText: string): number {
 let _preferred: { url: string; until: number; origin?: string } | null = null;
 // origin -> the relay that served it most recently, used for walk ORDER only
 const _lastGood = new Map<string, { url: string; until: number }>();
+// A daemon restart forgets which relay was serving, so the first request after a
+// restart starts on the pinned/active relay again and pays a round-trip to
+// relearn that its row is spent. The map is small and stable - one entry per
+// origin - so it is worth carrying across restarts, exactly like the spent
+// evidence already is.
+const LAST_GOOD_FILE = path.join(BANSOS_DIR, "relay-last-good.json");
+let _lastGoodLoaded = false;
+let _lastGoodSavedAt = 0;
+
+function loadLastGood(): void {
+  if (_lastGoodLoaded) return;
+  _lastGoodLoaded = true;
+  try {
+    const raw = readJson<{ origins?: Record<string, { url?: string; until?: number }> }>(
+      LAST_GOOD_FILE,
+    );
+    const now = Date.now();
+    for (const [origin, e] of Object.entries(raw?.origins ?? {})) {
+      if (e && typeof e.url === "string" && typeof e.until === "number" && e.until > now) {
+        _lastGood.set(origin, { url: e.url, until: e.until });
+      }
+    }
+  } catch {
+    /* no state yet - a first boot or an unreadable file */
+  }
+}
+
+function saveLastGood(): void {
+  const origins: Record<string, { url: string; until: number }> = {};
+  for (const [origin, e] of _lastGood) {
+    if (e.until > Date.now()) origins[origin] = e;
+  }
+  _lastGoodSavedAt = Date.now();
+  try {
+    writeJsonAtomic(LAST_GOOD_FILE, { origins }, 0);
+  } catch {
+    /* a read-only state dir must never break the request path */
+  }
+}
 const _penalty = new Map<string, number>();
 
 // The penalty map is keyed by relay URL only, but the quota bucket is NOT:
@@ -386,6 +425,11 @@ function isSpreadTarget(origin: string): boolean {
 export function resetRelayRetryState(): void {
   _preferred = null;
   _lastGood.clear();
+  // Forget in memory only: the file is the "previous process" and must survive,
+  // exactly like the spent evidence. Clearing the flag makes the next call
+  // re-read it, which is what a restart does.
+  _lastGoodLoaded = false;
+  _lastGoodSavedAt = 0;
   _penalty.clear();
   _spreadCursor.clear();
   _quotaRejected.clear();
@@ -436,6 +480,7 @@ export function restoreQuotaEvidenceForTest(): void {
 }
 
 function relayCandidates(state: RelayState, now: number, target?: URL, model?: string): string[] {
+  loadLastGood();
   const out: string[] = [];
   const push = (u: string) => {
     if (!u || out.includes(u) || penalized(u, now, target, model)) return;
@@ -455,7 +500,14 @@ function relayCandidates(state: RelayState, now: number, target?: URL, model?: s
   // may not. ORDER ONLY - the pin, the penalties and the telemetry above are
   // untouched, and a spread target keeps its own rotation.
   const lastGood = target ? _lastGood.get(target.origin) : undefined;
-  if (!spread && lastGood && lastGood.until > now) push(lastGood.url);
+  if (
+    !spread &&
+    lastGood &&
+    lastGood.until > now &&
+    state.relays.some((r) => r.url === lastGood.url)
+  ) {
+    push(lastGood.url);
+  }
   push(state.url);
   // Scheduler ranking first (coolest healthy accounts), then the raw fleet order as
   // a fallback for relays the last tick did not rank.
@@ -665,7 +717,16 @@ export async function relayFetch(
       noteQuotaServed(u, model, a.url);
       // ...and remember it, so the next request starts where the last one
       // succeeded instead of re-probing a spent address.
-      _lastGood.set(u.origin, { url: a.url, until: Date.now() + LAST_GOOD_MS });
+      {
+        const prev = _lastGood.get(u.origin);
+        _lastGood.set(u.origin, { url: a.url, until: Date.now() + LAST_GOOD_MS });
+        // Persist when the address changed, or once a minute to keep `until`
+        // fresh across a restart. Not on every request: the file is tiny but the
+        // write is still disk I/O on the request path.
+        if (!prev || prev.url !== a.url || Date.now() - _lastGoodSavedAt > 60_000) {
+          saveLastGood();
+        }
+      }
       return;
     }
     if (a.kind === "transport" || a.kind === "refusal") {

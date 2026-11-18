@@ -61,6 +61,14 @@ beforeEach(() => {
   // isolate.ts preload.)
   resetRelayRetryState();
   process.env.BANSOS_RELAY_RANK = NO_RANK;
+  // The last-good map persists to disk on purpose, so a test that triggers a
+  // save would otherwise decide which relay the NEXT test starts on.
+  try {
+    fs.rmSync(path.join(process.env.BANSOS_DIR!, "relay-last-good.json"), { force: true });
+  } catch {
+    /* nothing written yet */
+  }
+  resetRelayRetryState();
 });
 
 test("a 429 from the active relay is retried on the next relay and served", async () => {
@@ -109,6 +117,45 @@ test("isIpBucketTarget recognises the keyless per-address gateways only", () => 
 // minutes after a failover the walk would start again on the spent active relay
 // and pay a round-trip to relearn it. The last-good map has no telemetry
 // meaning - it only orders the walk - so it survives that window.
+// A daemon restart used to forget which relay was serving, so the first request
+// afterwards started on the pinned relay and paid a round-trip to relearn that
+// its row was spent. The map is one entry per origin and now survives.
+test("the last relay that served is restored from disk after a restart", async () => {
+  const file = path.join(process.env.BANSOS_DIR!, "relay-last-good.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      origins: {
+        "https://api.kilo.ai": { url: "https://r2.example", until: Date.now() + 60_000 },
+      },
+    }),
+  );
+  // simulate the restart: memory gone, disk still there
+  resetRelayRetryState();
+
+  const fleet = ["https://r1.example", "https://r2.example"];
+  const { calls, restore } = stubFetch((url) => (url.includes("r1") ? 429 : 200));
+  try {
+    const res = await relayFetch(
+      state(fleet[0]!, fleet.slice(1)),
+      "https://api.kilo.ai/api/gateway/chat/completions",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"baidu/ernie-5.5-flash-preview:free"}',
+      },
+    );
+    assert.equal(res.status, 200);
+    assert.equal(
+      calls[0]!.url.includes("r2"),
+      true,
+      "must start where the previous process left off, not on the spent pinned relay",
+    );
+  } finally {
+    restore();
+  }
+});
+
 test("the relay that served keeps the head of the list past the preferred window", async () => {
   const realNow = Date.now();
   mock.timers.enable({ apis: ["Date"], now: realNow });
